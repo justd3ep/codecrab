@@ -1,0 +1,30 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# Runtime data and caches
+.crabcode
+.lancedb
+models/
+!models/placeholder.txt
+
+# Dependency directories
+node_modules/
+
+# Compiled output
+dist
+build
+out
+
+# Local env files
+.env
+.env.*
+
+# Local config
+src/config/config.local.ts
+src/config/config.local.js
+
+# OS metadata
+.DS_Store
+Thumbs.db
