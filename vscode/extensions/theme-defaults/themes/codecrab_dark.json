@@ -1,0 +1,45 @@
+{
+	"$schema": "vscode://schemas/color-theme",
+	"name": "CodeCrab Dark",
+	"include": "./2026-dark.json",
+	"type": "dark",
+	"colors": {
+		"editor.background": "#0C0C0C",
+		"sideBar.background": "#111111",
+		"activityBar.background": "#111111",
+		"titleBar.activeBackground": "#111111",
+		"titleBar.inactiveBackground": "#0C0C0C",
+		"panel.background": "#111111",
+		"terminal.background": "#0C0C0C",
+		
+		"list.activeSelectionBackground": "#FF653F33",
+		"list.inactiveSelectionBackground": "#FF653F1A",
+		"list.hoverBackground": "#FFFFFF0D",
+		"editor.selectionBackground": "#FF653F4D",
+		"editor.inactiveSelectionBackground": "#FF653F26",
+		"menu.selectionBackground": "#FF653F",
+		"pickerGroup.border": "#333333",
+		
+		"activityBarBadge.background": "#FF653F",
+		"activityBarBadge.foreground": "#FFFFFF",
+		"button.background": "#FF653F",
+		"button.foreground": "#FFFFFF",
+		"button.hoverBackground": "#FF653FDD",
+		"progressBar.background": "#FF653F",
+		"textLink.foreground": "#FF653F",
+		"focusBorder": "#FF653F",
+		"editorCursor.foreground": "#FFC85C",
+		"editorLineNumber.activeForeground": "#FFC85C",
+		"textLink.activeForeground": "#FFC85C",
+		
+		"sideBar.border": "#222222",
+		"activityBar.border": "#222222",
+		"titleBar.border": "#222222",
+		"panel.border": "#222222",
+		"editorGroupHeader.tabsBorder": "#222222",
+		"tab.border": "#222222",
+		"tab.activeBorderTop": "#FF653F",
+		"tab.activeBackground": "#0C0C0C",
+		"tab.inactiveBackground": "#111111"
+	}
+}

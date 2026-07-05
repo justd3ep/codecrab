@@ -1,0 +1,40 @@
+{
+  "name": "codecrab-stats",
+  "displayName": "CodeCrab Stats",
+  "description": "System telemetry for CodeCrab",
+  "version": "1.0.0",
+  "publisher": "codecrab",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codecrab-stats-container",
+          "title": "Stats",
+          "icon": "$(pulse)"
+        }
+      ]
+    },
+    "views": {
+      "codecrab-stats-container": [
+        {
+          "type": "webview",
+          "id": "codecrab-stats-view",
+          "name": "Task Manager"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/vscode": "^1.80.0",
+    "typescript": "^5.1.3"
+  }
+}
