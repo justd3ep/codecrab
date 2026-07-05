@@ -38,3 +38,6 @@ The router uses a machine-specific configuration file that is deliberately exclu
 ## Model Resolution
 
 You do not need to configure *every* model path. If a specific model is missing from `config.local.ts`, the router will fall back to automatic discovery, searching for matching `.gguf` files in `models/base/` and `models/adapters/`.
+LLM links
+google drive->
+https://drive.google.com/drive/u/1/folders/1vCbjjR-Jc6pch_4q-u4OlQFeuGQ-zUfC
