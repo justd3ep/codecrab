@@ -28,9 +28,17 @@ The router uses a machine-specific configuration file that is deliberately exclu
    };
    ```
 
-3. **Run the server:**
+3. **Run the server and the VS Code wrapper:**
+   From the project root, you can start both components simultaneously using the provided scripts:
+
+   **Linux / macOS:**
    ```bash
-   npx tsx src/index.ts
+   ./start.sh
+   ```
+
+   **Windows:**
+   ```cmd
+   start.bat
    ```
 
 > **Note:** The server will refuse to boot if `config.local.ts` is missing, or if any of the configured models do not physically exist on your disk.
@@ -38,6 +46,6 @@ The router uses a machine-specific configuration file that is deliberately exclu
 ## Model Resolution
 
 You do not need to configure *every* model path. If a specific model is missing from `config.local.ts`, the router will fall back to automatic discovery, searching for matching `.gguf` files in `models/base/` and `models/adapters/`.
-LLM links
-google drive->
-https://drive.google.com/drive/u/1/folders/1vCbjjR-Jc6pch_4q-u4OlQFeuGQ-zUfC
+## LLM Links
+
+- **Google Drive:** [Download Models](https://drive.google.com/drive/u/1/folders/1vCbjjR-Jc6pch_4q-u4OlQFeuGQ-zUfC)
