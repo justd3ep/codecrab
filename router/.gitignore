@@ -6,6 +6,7 @@ npm-debug.log*
 # Runtime data and caches
 .crabcode
 .lancedb
+.rag-cache/
 models/
 !models/placeholder.txt
 

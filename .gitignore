@@ -1,2 +1,9 @@
 backend_repos/
 scratch.js
+router/.rag-cache/
+workspace/
+check_models.js
+start-router.bat
+start-wrapper.bat
+stop.bat
+stop.sh
