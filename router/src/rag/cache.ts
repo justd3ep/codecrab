@@ -6,8 +6,9 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { fileURLToPath } from 'url';
 
-const CACHE_ROOT = path.join(path.dirname(new URL(import.meta.url).pathname), '../../.rag-cache');
+const CACHE_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../.rag-cache');
 
 export function wsHash(workspaceRoot: string): string {
 	return crypto.createHash('sha1').update(workspaceRoot).digest('hex').slice(0, 16);

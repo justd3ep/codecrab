@@ -587,26 +587,47 @@ mm.init().catch(e => console.error('[ModelManager] Init failed:', e));
 // Initialize RAG embedding model on CPU (non-blocking)
 em.init().catch(e => console.error('[EmbeddingManager] Init failed:', e));
 
+// ---------------------------------------------------------------------------
+// Pattern-Based Semantic Classifier Patterns
+// ---------------------------------------------------------------------------
+
+// 1. UI Components, Suffixes & Structure
+export const UI_COMPONENT_PATTERN = /\b(?:board|card|column|view|page|screen|modal|dialog|panel|widget|bar|tab|drawer|menu|carousel|slider|form|table|chart|grid|feed|timeline|sidebar|navbar|header|footer|button|input|dropdown|toast|accordion|avatar|badge|canvas|popup|stepper|breadcrumbs?|tooltip|trello|kanban)s?\b/i;
+
+// 2. Interaction, Visual & Styling Verbs
+export const UI_INTERACTION_PATTERN = /\b(?:drag(?:ging)?(?:\s+and\s+drop)?|drop(?:ped)?|click(?:able)?|hover|render(?:ing)?|display(?:ing)?|style(?:d|s)?|animate(?:d|s|ion)?|preview|layout|visualize|toggle|select|filter|sort|reorder|scroll|zoom|paint|color|draw)\b/i;
+
+// 3. Visual & Design Modifiers
+export const UI_DESIGN_PATTERN = /\b(?:ui|ux|frontend|front-end|gui|theme|dark\s*mode|light\s*mode|responsive|mobile|desktop|css|scss|sass|tailwind|html|svg|icon|palette|typography|look\s+like|clone(?:\s+of)?|style|-style)\b/i;
+
+// 4. Frontend Frameworks & Libraries
+export const UI_FRAMEWORK_PATTERN = /\b(?:react|vue|svelte|angular|next\.?js|nuxt|vite|tailwind(?:css)?|framer|lucide|shadcn|radix|redux|zustand|tanstack|chakra|material-ui|mui|bootstrap)\b/i;
+
+// Backend Patterns (strictly bounded)
+export const BE_DB_PATTERN = /\b(?:sql|postgres(?:ql)?|mysql|sqlite|mongodb?|mongoose|prisma|typeorm|database|db|migration|seed(?:er)?|redis|memcached)\b/i;
+export const BE_SERVER_PATTERN = /\b(?:backend|back-end|api|rest(?:ful)?|graphql|endpoint|route|router|controller|service|middleware|repository|server|express|nestjs|fastify|koa|django|flask|spring)\b/i;
+export const BE_AUTH_INFRA_PATTERN = /\b(?:jwt|bearer|oauth|bcrypt|hash(?:ing)?|auth(?:entication|orization)?|session|cookie|rbac|queue|bullmq|kafka|rabbitmq|cron|worker|microservice|docker)\b/i;
+
 // Helpers for Dynamic Routing
 function detectFrontendIntent(messages: any[]): boolean {
 	if (!messages || messages.length === 0) return false;
-	const lastMessage = messages[messages.length - 1]?.content?.toLowerCase() || '';
-	const frontendKeywords = ['css', 'html', 'tailwind', 'react', 'vue', 'frontend', 'ui', 'component', 'button', 'layout', 'style'];
-	return frontendKeywords.some(kw => lastMessage.includes(kw));
+	const lastMessage = messages[messages.length - 1]?.content || '';
+	return (
+		UI_COMPONENT_PATTERN.test(lastMessage) ||
+		UI_INTERACTION_PATTERN.test(lastMessage) ||
+		UI_DESIGN_PATTERN.test(lastMessage) ||
+		UI_FRAMEWORK_PATTERN.test(lastMessage)
+	);
 }
 
 function detectBackendIntent(messages: any[]): boolean {
 	if (!messages || messages.length === 0) return false;
-	const lastMessage = messages[messages.length - 1]?.content?.toLowerCase() || '';
-	const backendKeywords = [
-		'backend', 'api', 'database', 'sql', 'mongo', 'node', 'express', 'server', 'auth', 'docker', 'router',
-		'jwt', 'oauth', 'rbac', 'authentication', 'authorization', 'refresh tokens', 'sessions',
-		'database design', 'schema design', 'postgresql', 'mongodb', 'repository pattern',
-		'service layer', 'controllers', 'middleware', 'guards', 'nestjs', 'api design', 'openapi',
-		'validation', 'zod', 'joi', 'class-validator', 'queues', 'redis', 'background jobs',
-		'microservices', 'event architecture'
-	];
-	return backendKeywords.some(kw => lastMessage.includes(kw));
+	const lastMessage = messages[messages.length - 1]?.content || '';
+	return (
+		BE_DB_PATTERN.test(lastMessage) ||
+		BE_SERVER_PATTERN.test(lastMessage) ||
+		BE_AUTH_INFRA_PATTERN.test(lastMessage)
+	);
 }
 
 // ---------------------------------------------------------------------------
@@ -987,26 +1008,25 @@ function classifyOpenFile(openFiles: string[] | undefined): 'fe' | 'be' | null {
 }
 
 /**
- * Score keywords in the user message.
+ * Score keywords and patterns in the user message.
  * Returns { feScore, beScore }.
  */
 function scoreKeywords(msg: string): { feScore: number; beScore: number } {
-	const m = msg.toLowerCase();
-	const feKw = [
-		'react', 'tsx', 'tailwind', 'css', 'responsive', 'dark mode', 'modal', 'sidebar',
-		'navbar', 'dashboard', 'table', 'chart', 'animation', 'theme', 'page', 'layout',
-		'drag and drop', 'kanban', 'component', 'form', 'zustand', 'tanstack query',
-		'shadcn',
-	];
-	const beKw = [
-		'jwt', 'refresh token', 'access token', 'oauth', 'passport', 'bcrypt',
-		'controller', 'middleware', 'endpoint', 'route', 'express', 'nestjs', 'service',
-		'repository', 'prisma', 'typeorm', 'mongoose', 'mongodb', 'postgres', 'mysql',
-		'redis', 'cache', 'queue', 'websocket', 'upload', 'bullmq', 'cron', 'validation',
-		'zod', 'class-validator',
-	];
-	const feScore = feKw.filter(k => m.includes(k)).length;
-	const beScore = beKw.filter(k => m.includes(k)).length;
+	let feScore = 0;
+	let beScore = 0;
+
+	if (UI_COMPONENT_PATTERN.test(msg)) feScore += 2;
+	if (UI_INTERACTION_PATTERN.test(msg)) feScore += 1;
+	if (UI_DESIGN_PATTERN.test(msg)) feScore += 2;
+	if (UI_FRAMEWORK_PATTERN.test(msg)) feScore += 2;
+
+	// High-signal UI keywords / phrases
+	if (/\b(?:kanban|trello|drag\s+and\s+drop|dark\s+mode|dashboard|responsive)\b/i.test(msg)) feScore += 2;
+
+	if (BE_DB_PATTERN.test(msg)) beScore += 2;
+	if (BE_SERVER_PATTERN.test(msg)) beScore += 2;
+	if (BE_AUTH_INFRA_PATTERN.test(msg)) beScore += 2;
+
 	return { feScore, beScore };
 }
 
@@ -1024,50 +1044,46 @@ function detectAppType(msg: string): boolean {
 // Cross-Specialist Skip Helpers
 // ---------------------------------------------------------------------------
 
-/** Frontend signal keywords — presence means the prompt requires UI work */
-const FE_SIGNAL_WORDS = [
-	'react', 'ui', 'page', 'screen', 'dashboard', 'component', 'modal',
-	'table', 'chart', 'tailwind', 'form', 'layout', 'drag', 'kanban',
-	'frontend', 'navbar', 'sidebar', 'button', 'style', 'css', 'animation',
-	'carousel', 'accordion', 'dropdown', 'tab', 'toast', 'alert',
-];
-
 /**
  * Returns true if the prompt contains signals that frontend work is required.
  * Used to decide whether the FE specialist should run after the BE phase.
- *
- * Examples:
- *   "Implement JWT auth with refresh tokens" → false
- *   "Implement JWT auth with login page"     → true
- *   "Build a MERN expense tracker"           → true
  */
 function promptNeedsFrontend(prompt: string): boolean {
-	const lower = prompt.toLowerCase();
-	return FE_SIGNAL_WORDS.some(word => lower.includes(word));
+	return (
+		UI_COMPONENT_PATTERN.test(prompt) ||
+		UI_INTERACTION_PATTERN.test(prompt) ||
+		UI_DESIGN_PATTERN.test(prompt) ||
+		UI_FRAMEWORK_PATTERN.test(prompt)
+	);
 }
 
 /**
  * Single hook for deciding whether the FE specialist should run in fullstack mode.
- * Currently uses prompt signals only. Can later incorporate:
- *   - BE output metadata (what files were created)
- *   - Planner results
- *   - Flutter / DevOps specialist awareness
+ * Ensures the Frontend specialist is NEVER skipped when UI work is requested.
  */
 function shouldRunFrontend(opts: {
 	intent: string;
 	prompt: string;
 	beFilesWritten: string[];
 }): boolean {
-	// Only relevant for fullstack execution — should never be called for single-specialist intents
-	if (opts.intent !== 'create_fullstack' && opts.intent !== 'edit_fullstack' && opts.intent !== 'general') {
-		return false;
+	// If the prompt contains any UI signals, we must run the frontend
+	if (promptNeedsFrontend(opts.prompt)) {
+		return true;
 	}
-	return promptNeedsFrontend(opts.prompt);
+	// Fallback for explicitly declared fullstack intents
+	if (opts.intent === 'create_fullstack' || opts.intent === 'edit_fullstack' || opts.intent === 'general') {
+		return true;
+	}
+	return false;
+}
+
+function isCreatePrompt(msg: string): boolean {
+	return /\b(?:create|make|build|scaffold|generate|setup|init|new|develop|implement)\b/i.test(msg);
 }
 
 /**
  * Ensemble Orchestrator.
- * Fuses: advisor(+3), previous route(+2), open file(+2), workspace(+1), keywords(+1).
+ * Fuses: advisor(+3), prompt semantic patterns, open file(+1), workspace(+1).
  * Returns final routing intent.
  */
 function ensembleRoute(
@@ -1078,59 +1094,70 @@ function ensembleRoute(
 	frontendFileCount: number,
 	msg: string,
 ): { intent: 'frontend' | 'backend' | 'general' | 'unknown'; isCreate: boolean } {
-	let feScore = 0;
-	let beScore = 0;
-	let isCreate = false;
+	let isCreate = advisorIntent ? advisorIntent.startsWith('create_') : isCreatePrompt(msg);
 
-	// Priority order: workspace > open file > prev route > keywords > advisor
-
-	// --- Signal 1: Workspace (+2) — strongest heuristic ---
-	if (frontendFileCount > 0 && backendFileCount === 0) feScore += 2;
-	if (backendFileCount > 0 && frontendFileCount === 0) beScore += 2;
-
-	// --- Signal 2: Open file (+2) ---
-	const openFileSignal = classifyOpenFile(openFiles);
-	if (openFileSignal === 'fe') feScore += 2;
-	if (openFileSignal === 'be') beScore += 2;
-
-	// --- Signal 3: Previous route (+2) ---
-	const prevRoute = inferPreviousRoute(messages);
-	if (prevRoute === 'fe') feScore += 2;
-	if (prevRoute === 'be') beScore += 2;
-
-	// --- Signal 4: Keywords (+1 each, cap +3) ---
 	const { feScore: fkw, beScore: bkw } = scoreKeywords(msg);
-	feScore += Math.min(fkw, 3);
-	beScore += Math.min(bkw, 3);
+	console.log(`[Ensemble] Keyword/Pattern scores: FE=${fkw}, BE=${bkw} | advisor=${advisorIntent}`);
 
-	// --- Signal 5: Advisor vote (+2 max, never overrides workspace) ---
-	if (advisorIntent && advisorIntent !== 'unknown') {
-		if (advisorIntent.includes('fe')) feScore += 2;
-		if (advisorIntent.includes('be')) beScore += 2;
-		if (advisorIntent.includes('fullstack')) { feScore += 2; beScore += 2; }
-		isCreate = advisorIntent.startsWith('create_');
+	// --- 1. Pure frontend request (UI patterns present, ZERO backend patterns in prompt) ---
+	if (fkw > 0 && bkw === 0) {
+		console.log(`[Ensemble] Pure frontend request (FE=${fkw}, BE=0) -> routing to frontend`);
+		return { intent: 'frontend', isCreate };
 	}
 
-	console.log(`[Ensemble] scores: FE=${feScore}, BE=${beScore} | advisor=${advisorIntent} | prevRoute=${prevRoute} | openFile=${openFileSignal}`);
-
-	// --- Empty workspace override ---
-	const isEmpty = backendFileCount === 0 && frontendFileCount === 0;
-	if (isEmpty && detectAppType(msg) && feScore === 0 && beScore === 0) {
-		console.log('[Ensemble] Empty workspace + app noun → forcing create_fullstack');
-		return { intent: 'general', isCreate: true };
+	// --- 2. Pure backend request (BE patterns present, ZERO frontend patterns in prompt) ---
+	if (bkw > 0 && fkw === 0) {
+		console.log(`[Ensemble] Pure backend request (BE=${bkw}, FE=0) -> routing to backend`);
+		return { intent: 'backend', isCreate };
 	}
 
-	// --- Final threshold: spec-defined gap rule ---
-	// FE wins only if FE >= BE+2. BE wins only if BE >= FE+2. Otherwise → fullstack.
-	if (feScore >= beScore + 2) return { intent: 'frontend', isCreate };
-	if (beScore >= feScore + 2) return { intent: 'backend', isCreate };
-	if (feScore > 0 || beScore > 0) {
-		// Scores exist but gap < 2 → fullstack
-		console.log('[Ensemble] Gap < 2 → fullstack');
+	// --- 3. Fullstack: Advisor explicitly says fullstack or both domains have strong signals ---
+	if (advisorIntent?.includes('fullstack') || (fkw > 0 && bkw > 0)) {
+		console.log('[Ensemble] Fullstack detected (Advisor=fullstack or FE>0 & BE>0) -> general');
 		return { intent: 'general', isCreate };
 	}
 
-	// Both zero — unknown
+	// --- 4. Mixed / Ambiguous signals -> fuse with Open File & Workspace context ---
+	let feScore = Math.min(fkw, 4);
+	let beScore = Math.min(bkw, 4);
+
+	if (advisorIntent && advisorIntent !== 'unknown') {
+		if (advisorIntent.includes('fe')) feScore += 3;
+		if (advisorIntent.includes('be')) beScore += 3;
+	}
+
+	const openFileSignal = classifyOpenFile(openFiles);
+	if (openFileSignal === 'fe') feScore += 1;
+	if (openFileSignal === 'be') beScore += 1;
+
+	const prevRoute = inferPreviousRoute(messages);
+	if (prevRoute === 'fe') feScore += 1;
+	if (prevRoute === 'be') beScore += 1;
+
+	// Only apply workspace bias if there's no strong prompt signal
+	if (fkw === 0 && bkw === 0) {
+		if (frontendFileCount > 0 && backendFileCount === 0) feScore += 2;
+		if (backendFileCount > 0 && frontendFileCount === 0) beScore += 2;
+	}
+
+	console.log(`[Ensemble] Final fused scores: FE=${feScore}, BE=${beScore}`);
+
+	// Clear gap winner
+	if (feScore >= beScore + 2) return { intent: 'frontend', isCreate };
+	if (beScore >= feScore + 2) return { intent: 'backend', isCreate };
+
+	if (feScore > 0 || beScore > 0) {
+		console.log('[Ensemble] Balanced signals -> fullstack (general)');
+		return { intent: 'general', isCreate };
+	}
+
+	// Empty workspace app fallback
+	const isEmpty = backendFileCount === 0 && frontendFileCount === 0;
+	if (isEmpty && detectAppType(msg)) {
+		console.log('[Ensemble] Empty workspace + app noun -> forcing create_fullstack');
+		return { intent: 'general', isCreate: true };
+	}
+
 	console.warn('[Ensemble] No signal. Returning unknown.');
 	return { intent: 'unknown', isCreate };
 }
@@ -2914,11 +2941,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 					const isFullStack = intent === 'general' || rawAdvisorIntent.includes('fullstack');
 					const runFEAfterIncremental = isFullStack && promptNeedsFrontend(lastUserMsg) && userScope !== 'BACKEND_ONLY';
 
-					if (runFEAfterIncremental && incrResult.committedFiles.length > 0) {
+					if (runFEAfterIncremental) {
 						// FE phase proceeds through the existing FE specialist path
 						// (reuse existing FE loop below by falling through after early-return)
 						// We set up so the code below the incremental block handles FE.
-						console.log('[Router] Incremental BE done — triggering FE phase via existing path.');
+						console.log('[Router] Incremental BE step completed — triggering FE phase via existing path.');
 						// NOTE: We proceed to FE phase using the filesModified list collected above.
 						// The existing FE logic at the bottom of the handler will run.
 					} else {

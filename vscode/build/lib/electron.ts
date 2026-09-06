@@ -230,7 +230,11 @@ function getElectron(arch: string): () => NodeJS.ReadWriteStream {
 
 async function main(arch: string = process.arch): Promise<void> {
 	const electronPath = path.join(root, '.build', 'electron');
-	await util.rimraf(electronPath)();
+	try {
+		await util.rimraf(electronPath)();
+	} catch (err: any) {
+		console.warn('Notice: could not clean electron directory:', err?.message || err);
+	}
 	await util.streamToPromise(getElectron(arch)());
 }
 

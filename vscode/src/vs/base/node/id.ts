@@ -105,10 +105,10 @@ async function getMacMachineId(errorLogger: (error: Error) => void): Promise<str
 const SQM_KEY: string = 'Software\\Microsoft\\SQMClient';
 export async function getSqmMachineId(errorLogger: (error: Error) => void): Promise<string> {
 	if (isWindows) {
-		const Registry = await import('@vscode/windows-registry');
 		try {
+			const Registry = await import('@vscode/windows-registry');
 			return Registry.GetStringRegKey('HKEY_LOCAL_MACHINE', SQM_KEY, 'MachineId') || '';
-		} catch (err) {
+		} catch (err: any) {
 			errorLogger(err);
 			return '';
 		}

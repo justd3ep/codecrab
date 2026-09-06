@@ -660,11 +660,13 @@ function extractNamedImports(content: string): Set<string> {
 	const syms = new Set<string>();
 	const namedRe = /import\s+\{([^}]+)\}\s+from\s+['"][^'"]+['"]/g;
 	const defRe   = /import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]/g;
+	const nsRe    = /import\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]/g;
 	let m: RegExpExecArray | null;
 	while ((m = namedRe.exec(content)) !== null) {
 		m[1]!.split(',').forEach(s => { const name = s.trim().split(/\s+as\s+/).pop()!.trim(); if (name) syms.add(name); });
 	}
 	while ((m = defRe.exec(content)) !== null) if (m[1]) syms.add(m[1]);
+	while ((m = nsRe.exec(content)) !== null) if (m[1]) syms.add(m[1]);
 	return syms;
 }
 
@@ -692,21 +694,39 @@ function pass12UndefinedSymbols(files: GeneratedFile[], workspaceRoot: string, i
 		}
 	}
 
-	const CTRL_RE   = /^(routes?\/|controllers?\/|src\/routes?\/|src\/controllers?\/)/i;
-	const SKIP_SYMS = new Set(['require','import','typeof','next','res','req','err','console','process',
-		'parseInt','parseFloat','JSON','Math','Promise','setTimeout','setInterval','data','result']);
+	const CTRL_RE = /(?:^|[\\/])(?:routes?|controllers?|services?|middlewares?|models?|validators?)[\\/]/i;
+	const SKIP_SYMS = new Set([
+		'require', 'import', 'typeof', 'next', 'res', 'req', 'err', 'error', 'console', 'process',
+		'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'encodeURI', 'decodeURI', 'encodeURIComponent', 'decodeURIComponent',
+		'JSON', 'Math', 'Promise', 'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+		'data', 'result', 'Date', 'RegExp', 'Array', 'Object', 'String', 'Number', 'Boolean',
+		'Symbol', 'BigInt', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Error', 'TypeError', 'RangeError',
+		'SyntaxError', 'Buffer', 'URL', 'URLSearchParams', 'fetch', 'Headers', 'Request', 'Response',
+		'FormData', 'AbortController', 'Blob'
+	]);
 
 	for (const f of files) {
 		if (!CTRL_RE.test(f.path)) continue;
 		const fExt = path.extname(f.path).toLowerCase();
 		if (!['.ts', '.js'].includes(fExt)) continue;
 		const localImports = extractNamedImports(f.content);
-		const callRe = /\bawait\s+([a-z][A-Za-z0-9]+)\s*\(/g;
+		const localDefined = extractDefinedSymbols(f.content);
+
+		// 1. Calls: await someFunc() or await SomeClass.someFunc() or someFunc()
+		const callRe = /\b(?:await\s+)?([A-Za-z_$][A-Za-z0-9_$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\(/g;
 		let m: RegExpExecArray | null;
 		while ((m = callRe.exec(f.content)) !== null) {
 			const sym = m[1]!;
-			if (SKIP_SYMS.has(sym) || localImports.has(sym) || globalSymbols.has(sym)) continue;
-			issues.push({ kind: 'undefined_symbol', file: f.path, message: `"${sym}()" called but not defined or imported`, severity: 'error' });
+			if (SKIP_SYMS.has(sym) || localImports.has(sym) || localDefined.has(sym) || globalSymbols.has(sym)) continue;
+			issues.push({ kind: 'undefined_symbol', file: f.path, message: `"${sym}" called or referenced but not defined or imported`, severity: 'error' });
+		}
+
+		// 2. New instantiations: new SomeClass() or new somePackage.SomeClass()
+		const newRe = /\bnew\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\(/g;
+		while ((m = newRe.exec(f.content)) !== null) {
+			const sym = m[1]!;
+			if (SKIP_SYMS.has(sym) || localImports.has(sym) || localDefined.has(sym) || globalSymbols.has(sym)) continue;
+			issues.push({ kind: 'undefined_symbol', file: f.path, message: `"${sym}" instantiated with new but not defined or imported`, severity: 'error' });
 		}
 	}
 }

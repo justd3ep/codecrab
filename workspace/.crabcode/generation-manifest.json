@@ -1,0 +1,16 @@
+{
+  "expectedFiles": 10,
+  "generatedFiles": 0,
+  "remaining": 10,
+  "failedFiles": [],
+  "skippedFiles": [],
+  "committedFiles": [],
+  "architecture": "repository",
+  "framework": "express",
+  "modules": [
+    "users"
+  ],
+  "status": "running",
+  "startedAt": "2026-09-05T08:04:28.619Z",
+  "updatedAt": "2026-09-05T08:04:28.623Z"
+}

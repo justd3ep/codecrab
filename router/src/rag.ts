@@ -20,8 +20,9 @@ const INDEXABLE_EXTS = new Set([
 ]);
 
 const RAG_SKIP_DIRS = new Set([
-	'node_modules', '.git', '.next', 'dist', 'build', 'out',
+	'node_modules', '.git', '.next', 'dist', 'build', '.build', 'out',
 	'__pycache__', '.cache', '.svelte-kit', '.turbo', 'coverage', '.lancedb',
+	'.rag-cache', '.codecrab', '.codecrab-shared', 'models',
 ]);
 
 export const CHUNK_SIZE    = 1000;   // characters per chunk

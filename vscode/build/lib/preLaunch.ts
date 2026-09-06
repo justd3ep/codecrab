@@ -33,7 +33,10 @@ async function ensureNodeModules() {
 }
 
 async function getElectron() {
-	await runProcess(npm, ['run', 'electron']);
+	const exeName = process.platform === 'win32' ? 'CodeCrab.exe' : (process.platform === 'darwin' ? 'CodeCrab.app' : 'code-oss');
+	if (!(await exists(path.join('.build', 'electron', exeName)))) {
+		await runProcess(npm, ['run', 'electron']);
+	}
 }
 
 async function ensureCompiled() {
