@@ -319,7 +319,7 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 		let generatedFile: GeneratedFile | null = null;
 
 		try {
-			context = await model.createContext({ contextSize: 4096 });
+			context = await model.createContext({ contextSize: 8192 });
 			const session = new LlamaChatSession({ contextSequence: context.getSequence(), systemPrompt });
 
 			const filePrompt = buildSingleFilePrompt(node, graph, symbolIndex, promptCache, userRequest);
@@ -392,7 +392,7 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 
 			let repairCtx: import('node-llama-cpp').LlamaContext | null = null;
 			try {
-				repairCtx = await model.createContext({ contextSize: 4096 });
+				repairCtx = await model.createContext({ contextSize: 8192 });
 				const repairSession = new LlamaChatSession({ contextSequence: repairCtx.getSequence(), systemPrompt });
 				const depCtx = node.dependencies.map((d: DependencyEdge) => symbolIndex.getSignature(d.path)).filter(Boolean);
 

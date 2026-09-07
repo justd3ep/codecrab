@@ -6,7 +6,7 @@ echo ========================================================
 
 :: 1. Stop LLM Router process listening on port 3141
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":3141" ^| findstr "LISTENING"') do (
-    echo Terminating LLM Router (PID %%a) and freeing VRAM...
+    echo Terminating LLM Router [PID %%a] and freeing VRAM...
     taskkill /F /PID %%a /T >nul 2>&1
 )
 

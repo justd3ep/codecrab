@@ -16,7 +16,7 @@ import config from '@/config/index.js';
 
 const INDEXABLE_EXTS = new Set([
 	'.ts', '.tsx', '.js', '.jsx', '.py', '.css', '.html', '.vue',
-	'.svelte', '.go', '.rs', '.json', '.md', '.yaml', '.yml', '.sql', '.sh',
+	'.svelte', '.go', '.rs', '.json', '.md', '.yaml', '.yml', '.sql', '.sh', '.txt',
 ]);
 
 const RAG_SKIP_DIRS = new Set([

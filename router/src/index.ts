@@ -28,6 +28,9 @@ import { RecoveryManager }  from './jobs/recoveryManager.js';
 import { makeJobRoutes }    from './router/jobRoutes.js';
 import { makeHealthRoutes } from './router/healthRoutes.js';
 import config               from '@/config/index.js';
+import { activeContextUsage, updateContextUsage, DEFAULT_CONTEXT_SIZE } from './telemetry/contextUsage.js';
+import { ensureFrontendScaffold } from './frontendScaffold.js';
+import { runAdvisorProjectSummary } from './routing/intentClassifier.js';
 
 // ---------------------------------------------------------------------------
 // Constraint Parser — runs BEFORE advisor, highest priority
@@ -787,11 +790,17 @@ app.get('/stats', async (req, res) => {
 			cpu: { percent: cpuUsagePercent.toFixed(1) },
 			ram: { percent: ramUsagePercent.toFixed(1), usedGb: ramUsedGb.toFixed(1), totalGb: ramTotalGb.toFixed(1) },
 			storage: { percent: storageUsagePercent.toFixed(1), usedGb: storageUsedGb.toFixed(1), totalGb: storageTotalGb.toFixed(1) },
-			gpu: { hasGpu, percent: vramUsagePercent.toFixed(1), usedGb: vramUsedGb.toFixed(1), totalGb: vramTotalGb.toFixed(1) }
+			gpu: { hasGpu, percent: vramUsagePercent.toFixed(1), usedGb: vramUsedGb.toFixed(1), totalGb: vramTotalGb.toFixed(1) },
+			context: activeContextUsage
 		});
 	} catch (error) {
 		res.status(500).json({ error: 'Failed to fetch stats' });
 	}
+});
+
+// Live Context Usage Endpoint
+app.get('/context-usage', (_req, res) => {
+	res.json(activeContextUsage);
 });
 
 // List Models
@@ -1408,6 +1417,83 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		console.log('[PromptRouter] Validator instruction injected (React project)');
 	}
 
+	// ── 9. Workspace Dependency Constraints ──────────────────────────────────
+	let installedPkgs: string[] = [];
+	let rawPkg = packageJson;
+	if (!rawPkg && workspaceRoot) {
+		const pkgPath = path.join(workspaceRoot, 'package.json');
+		try {
+			if (fs.existsSync(pkgPath)) rawPkg = fs.readFileSync(pkgPath, 'utf-8');
+		} catch { /* ignore */ }
+	}
+	if (rawPkg) {
+		try {
+			const parsed = JSON.parse(rawPkg);
+			const deps = Object.keys(parsed.dependencies || {});
+			const devDeps = Object.keys(parsed.devDependencies || {});
+			installedPkgs = Array.from(new Set([...deps, ...devDeps]));
+		} catch { /* ignore */ }
+	}
+
+	if (installedPkgs.length > 0) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'WORKSPACE DEPENDENCY CONSTRAINTS (package.json)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			`Installed packages: ${installedPkgs.join(', ')}`,
+			'CRITICAL BOUNDARIES:',
+			'1. ONLY import third-party packages from the installed list above, or standard React ("react", "react/jsx-runtime").',
+			'2. NEVER import uninstalled packages (e.g. recharts, react-hook-form, zod, formik, axios, framer-motion) unless explicitly listed above.',
+			'3. For forms: Use standard React useState with controlled inputs unless react-hook-form is listed above.',
+			'4. For charts/metrics: Use clean SVG or Tailwind CSS elements unless recharts is listed above.',
+			'5. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
+		].join('\n'));
+	} else {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'WORKSPACE DEPENDENCY CONSTRAINTS',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'No external third-party dependencies detected.',
+			'CRITICAL BOUNDARIES:',
+			'1. ONLY import standard React ("react") or local relative files ("./...").',
+			'2. NEVER import third-party packages (e.g. recharts, react-hook-form, zod, axios, framer-motion).',
+			'3. Implement all UI, forms, and charts using standard React useState and Tailwind CSS.',
+			'4. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
+		].join('\n'));
+	}
+
+	// ── 10. Scope-Adaptive Architecture Rules ────────────────────────────────
+	const asksForSingleFile = /keep all state in src\/app\.tsx|single page|single file|simple|widget/i.test(userMessage);
+	if (asksForSingleFile) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'COMPONENT ARCHITECTURE (SINGLE-FILE HUB RULE)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'For this application, implement the entire solution self-contained inside `src/App.tsx`.',
+			'1. Declare all TypeScript interfaces directly inside `src/App.tsx`.',
+			'2. Declare all state variables and action handlers (add, delete, toggle, filter) using native React useState.',
+			'3. Helper subcomponents may be defined in the same file `src/App.tsx`.',
+			'4. Do NOT generate separate files in `src/components/` unless modular separation is explicitly demanded.',
+			'5. Every button MUST have an active onClick handler; every form MUST have an active onSubmit handler.',
+			'6. Ensure 100% of the user requirements are fully implemented with real state logic.',
+		].join('\n'));
+	} else {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'MODULAR ARCHITECTURE & STRICT CLOSURE RULES',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'1. 100% IMPORT CLOSURE: If you write `import Foo from "./components/Foo"`, you MUST generate `<file path="src/components/Foo.tsx">` in this exact same response.',
+			'2. PROP ALIGNMENT: Child components must accept typed props matching what the parent passes. Container components (lists, grids) MUST map over array props (`items.map(...)`).',
+			'3. ZERO ORPHANS: Every file emitted in `src/components/` MUST be imported and rendered in the component tree.',
+			'4. FILENAME PARITY: The exported component name MUST match the filename (e.g. `src/components/HabitCard.tsx` exports `export function HabitCard`).',
+			'5. FULL REQUIREMENT COVERAGE: Every requirement requested by the user must be implemented with real interactive state and handlers.',
+		].join('\n'));
+	}
+
 	// ── Debug log ────────────────────────────────────────────────────────────
 	console.log('\nPROMPTS LOADED:');
 	console.log(JSON.stringify(loaded.map(l => l.name), null, 2));
@@ -1559,16 +1645,38 @@ interface FallbackEdit {
 	content: string;
 }
 
-function cleanCodeBlock(content: string): string {
+function cleanCodeBlock(content: string, filePath?: string): string {
 	content = content.trim();
 	const match = content.match(/^```\w*\r?\n([\s\S]*?)\r?\n```$/);
 	if (match) {
-		return match[1]!.trim();
+		content = match[1]!.trim();
 	}
+
+	// Deterministic Next.js directive cleaner
+	content = content.replace(/["']use client["'];?\r?\n?/g, '');
+
+	// Harmonize exported component name with filename if in components directory
+	if (filePath && (filePath.includes('components/') || filePath.includes('components\\'))) {
+		const baseName = path.basename(filePath, path.extname(filePath));
+		if (/^[A-Z][A-Za-z0-9]+$/.test(baseName)) {
+			// If file is HabitCard.tsx and exports 'export default function Habit(' or 'export function Habit('
+			content = content.replace(
+				new RegExp(`(export\\s+(?:default\\s+)?function\\s+)([A-Z][A-Za-z0-9]*)(\\s*\\()`, 'g'),
+				(full, prefix, currName, suffix) => {
+					if (currName !== baseName && (currName.length < baseName.length || baseName.includes(currName))) {
+						console.log(`[Harmonizer] Harmonized export function "${currName}" → "${baseName}" in ${filePath}`);
+						return `${prefix}${baseName}${suffix}`;
+					}
+					return full;
+				}
+			);
+		}
+	}
+
 	return content;
 }
 
-function extractFallbackEdits(text: string, openFiles?: string[], workspaceRoot?: string, userPrompt?: string, mode?: AgentMode): FallbackEdit[] {
+function extractFallbackEdits(text: string, openFiles?: string[], workspaceRoot?: string, userPrompt?: string, mode?: AgentMode, onlyClosed: boolean = false): FallbackEdit[] {
 	const edits: FallbackEdit[] = [];
 	const seenPaths = new Set<string>();
 
@@ -1605,17 +1713,24 @@ function extractFallbackEdits(text: string, openFiles?: string[], workspaceRoot?
 			const closeMatch = remainingText.match(/<\/file>/i);
 			const nextOpenMatch = i + 1 < openTags.length ? openTags[i + 1]!.startIndex : text.length;
 
+			let hasClosingTag = false;
 			if (closeMatch && (afterTag + closeMatch.index!) < nextOpenMatch) {
 				// Found a </file> that belongs to this block
 				endIndex = afterTag + closeMatch.index!;
+				hasClosingTag = true;
 			} else {
 				// No </file> found before next block or end — truncated
 				endIndex = nextOpenMatch;
 			}
 
+			if (onlyClosed && !hasClosingTag) {
+				console.log(`[Router] Pattern 0: skipping unclosed/truncated file "${tag.path}" during compaction harvest`);
+				continue;
+			}
+
 			let content = text.substring(afterTag, endIndex).trim();
 			content = content.replace(/<\/file>\s*$/i, '').trim();
-			content = cleanCodeBlock(content);
+			content = cleanCodeBlock(content, tag.path);
 
 			if (tag.path && content && content.length > 5 && !seenPaths.has(tag.path)) {
 				seenPaths.add(tag.path);
@@ -1628,6 +1743,9 @@ function extractFallbackEdits(text: string, openFiles?: string[], workspaceRoot?
 	// If Pattern 0 found any edits, return immediately — skip all other fallback patterns
 	if (edits.length > 0) {
 		console.log(`[Router] Pattern 0: ${edits.length} file block(s) extracted. Bypassing P1–P4.`);
+		return edits;
+	}
+	if (onlyClosed) {
 		return edits;
 	}
 	console.log(`[Router] Pattern 0: no <file> blocks detected. Falling through to P1–P4.`);
@@ -1696,8 +1814,10 @@ function extractFallbackEdits(text: string, openFiles?: string[], workspaceRoot?
 interface JsxSymbolIssue {
 	file: string;
 	component: string;
-	kind: 'missing_import' | 'missing_file';
+	kind: 'missing_import' | 'missing_file' | 'missing_function' | 'orphan_file' | 'prop_mismatch' | 'missing_map';
 	importPath?: string;
+	missingFileTarget?: string;
+	functionName?: string;
 }
 
 function validateJsxSymbols(
@@ -1706,8 +1826,8 @@ function validateJsxSymbols(
 ): JsxSymbolIssue[] {
 	const issues: JsxSymbolIssue[] = [];
 
-	// All relative paths available in this response
-	const responsePathsRel = new Set(generatedFiles.map(f => f.path));
+	// All relative paths available in this response (normalized to forward slashes)
+	const responsePathsRel = new Set(generatedFiles.map(f => f.path.replace(/\\/g, '/')));
 
 	// React built-in component names — never need an explicit import
 	const REACT_BUILTINS = new Set([
@@ -1718,6 +1838,19 @@ function validateJsxSymbols(
 		'', '.tsx', '.jsx', '.ts', '.js',
 		'/index.tsx', '/index.jsx', '/index.ts', '/index.js',
 	];
+
+	const JS_KEYWORDS = new Set([
+		'if', 'for', 'while', 'switch', 'catch', 'return', 'typeof', 'instanceof', 'import', 'super', 'new', 'export', 'default'
+	]);
+	const COMMON_BUILTINS = new Set([
+		'useState', 'useEffect', 'useRef', 'useCallback', 'useMemo', 'useContext', 'useReducer',
+		'React', 'console', 'window', 'document', 'localStorage', 'sessionStorage',
+		'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+		'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'Math', 'Date', 'JSON',
+		'Array', 'Object', 'String', 'Number', 'Boolean', 'RegExp', 'Map', 'Set',
+		'Promise', 'Error', 'TypeError', 'fetch', 'alert', 'confirm', 'prompt',
+		'encodeURIComponent', 'decodeURIComponent', 'btoa', 'atob',
+	]);
 
 	for (const { path: filePath, content } of generatedFiles) {
 		const ext = path.extname(filePath).toLowerCase();
@@ -1730,7 +1863,6 @@ function validateJsxSymbols(
 		while ((m = jsxTagRe.exec(content)) !== null) {
 			if (m[1]) usedComponents.add(m[1]);
 		}
-		if (usedComponents.size === 0) continue;
 
 		// ── Extract imported symbols → importPath ───────────────────────────
 		const importedSymbols = new Map<string, string>(); // symbol → raw import path
@@ -1769,8 +1901,8 @@ function validateJsxSymbols(
 			const importPath = importedSymbols.get(comp)!;
 			if (!importPath.startsWith('.')) continue; // skip node_modules
 
-			const fileDir = path.dirname(filePath);
-			const resolvedBase = path.normalize(path.join(fileDir, importPath));
+			const fileDir = path.dirname(filePath).replace(/\\/g, '/');
+			const resolvedBase = path.normalize(path.join(fileDir, importPath)).replace(/\\/g, '/');
 
 			const existsInResponse = RESOLVE_EXTS.some(e =>
 				responsePathsRel.has(resolvedBase + e) || responsePathsRel.has(resolvedBase),
@@ -1783,8 +1915,137 @@ function validateJsxSymbols(
 			});
 
 			if (!existsInResponse && !existsOnDisk) {
+				const targetExt = path.extname(resolvedBase) ? '' : '.tsx';
+				const missingFileTarget = resolvedBase + targetExt;
 				console.log(`[Validator] missing file: ${resolvedBase} (import "${importPath}" → <${comp} /> in ${filePath})`);
-				issues.push({ file: filePath, component: comp, kind: 'missing_file', importPath });
+				issues.push({ file: filePath, component: comp, kind: 'missing_file', importPath, missingFileTarget });
+			}
+		}
+
+		// ── Check for undeclared standalone function calls ─────────────────
+		const declaredSymbols = new Set<string>(['React']);
+		for (const name of importedSymbols.keys()) declaredSymbols.add(name);
+
+		const funcDeclRe = /(?:function|const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:=|:[^=]+=\s*)?(?:\(|=)/g;
+		while ((m = funcDeclRe.exec(content)) !== null) declaredSymbols.add(m[1]!);
+
+		const arrDestructRe = /(?:const|let|var)\s*\[\s*([A-Za-z0-9_$,\s]+)\s*\]/g;
+		while ((m = arrDestructRe.exec(content)) !== null) {
+			for (const part of m[1]!.split(',')) {
+				const sym = part.trim();
+				if (sym) declaredSymbols.add(sym);
+			}
+		}
+
+		const objDestructRe = /(?:const|let|var)\s*\{\s*([A-Za-z0-9_$,\s:]+)\s*\}\s*=/g;
+		while ((m = objDestructRe.exec(content)) !== null) {
+			for (const part of m[1]!.split(',')) {
+				const sym = part.trim().split(':')[0]?.trim();
+				if (sym) declaredSymbols.add(sym);
+			}
+		}
+
+		const cleanCode = content
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.replace(/\/\/.*/g, '')
+			.replace(/'(?:\\.|[^'\\])*'/g, "''")
+			.replace(/"(?:\\.|[^"\\])*"/g, '""');
+
+		const callRe = /(?:^|[^.\w$])([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+		const seenMissingFuncs = new Set<string>();
+		while ((m = callRe.exec(cleanCode)) !== null) {
+			const sym = m[1]!;
+			if (JS_KEYWORDS.has(sym) || COMMON_BUILTINS.has(sym) || declaredSymbols.has(sym) || seenMissingFuncs.has(sym)) continue;
+			seenMissingFuncs.add(sym);
+			console.log(`[Validator] undeclared function call "${sym}()" in ${filePath}`);
+			issues.push({ file: filePath, component: sym, kind: 'missing_function', functionName: sym });
+		}
+	}
+
+	// ── Check 4: Orphan component detection ────────────────────────────────
+	const allImportedPaths = new Set<string>();
+	for (const { path: fp, content: fc } of generatedFiles) {
+		const fDir = path.dirname(fp).replace(/\\/g, '/');
+		const impMatchRe = /import\s+[\s\S]*?from\s+['"]([^'"]+)['"]/g;
+		let im: RegExpExecArray | null;
+		while ((im = impMatchRe.exec(fc)) !== null) {
+			const rawPath = im[1]!;
+			if (rawPath.startsWith('.')) {
+				const normTarget = path.normalize(path.join(fDir, rawPath)).replace(/\\/g, '/');
+				allImportedPaths.add(normTarget);
+				for (const ext of RESOLVE_EXTS) allImportedPaths.add(normTarget + ext);
+			}
+		}
+	}
+
+	for (const { path: filePath } of generatedFiles) {
+		const normFp = filePath.replace(/\\/g, '/');
+		if (normFp.includes('/components/') && (normFp.endsWith('.tsx') || normFp.endsWith('.jsx'))) {
+			const noExt = normFp.replace(/\.[^/.]+$/, '');
+			const isImported = allImportedPaths.has(normFp) || allImportedPaths.has(noExt);
+			if (!isImported) {
+				console.log(`[Validator] orphan component detected: ${normFp} is never imported in App.tsx or parent components`);
+				issues.push({
+					file: filePath,
+					component: path.basename(filePath, path.extname(filePath)),
+					kind: 'orphan_file',
+					missingFileTarget: filePath
+				});
+			}
+		}
+	}
+
+	// ── Check 5: Prop contract & array mapping validation ──────────────────
+	const fileMap = new Map<string, string>();
+	for (const f of generatedFiles) {
+		fileMap.set(f.path.replace(/\\/g, '/'), f.content);
+	}
+
+	for (const { path: parentPath, content: parentContent } of generatedFiles) {
+		const pDir = path.dirname(parentPath).replace(/\\/g, '/');
+		const compCallRe = /<([A-Z][A-Za-z0-9]*)\s+([^>]*?)(?:\/?>)/g;
+		let cm: RegExpExecArray | null;
+		while ((cm = compCallRe.exec(parentContent)) !== null) {
+			const compName = cm[1]!;
+			const rawPropsStr = cm[2]!;
+			if (REACT_BUILTINS.has(compName)) continue;
+
+			const passedPropMatches = rawPropsStr.matchAll(/([a-zA-Z_$][a-zA-Z0-9_$]*)(?:=|\s)/g);
+			const passedProps = Array.from(passedPropMatches).map(p => p[1]!).filter(p => p !== 'key' && p !== 'className');
+			if (passedProps.length === 0) continue;
+
+			for (const ext of RESOLVE_EXTS) {
+				const candidatePath = path.normalize(path.join(pDir, 'components', compName + ext)).replace(/\\/g, '/');
+				const candidateDirect = path.normalize(path.join(pDir, compName + ext)).replace(/\\/g, '/');
+				const targetPath = fileMap.has(candidatePath) ? candidatePath : fileMap.has(candidateDirect) ? candidateDirect : null;
+				if (targetPath) {
+					const childContent = fileMap.get(targetPath)!;
+					for (const p of passedProps) {
+						const hasProp = new RegExp(`\\b${p}\\b`).test(childContent);
+						if (!hasProp) {
+							console.log(`[Validator] prop mismatch: <${compName}> passed "${p}", but ${targetPath} does not declare it.`);
+							issues.push({
+								file: targetPath,
+								component: compName,
+								kind: 'prop_mismatch',
+								functionName: p,
+								missingFileTarget: targetPath
+							});
+						} else if (/^(?:habits|tasks|items|bookmarks|todos|transactions|rows|products|cards|records|elements)$/i.test(p)) {
+							if (!childContent.includes('.map(') && !childContent.includes('.forEach(')) {
+								console.log(`[Validator] missing array mapping: ${targetPath} receives array "${p}" but contains no .map()`);
+								issues.push({
+									file: targetPath,
+									component: compName,
+									kind: 'missing_map',
+									functionName: p,
+									missingFileTarget: targetPath
+								});
+							}
+						}
+					}
+					break;
+				}
 			}
 		}
 	}
@@ -1801,33 +2062,51 @@ function buildJsxRepairPrompt(issues: JsxSymbolIssue[]): string {
 		byFile.get(iss.file)!.push(iss);
 	}
 
+	const missingFilesToGenerate = new Set<string>();
+
 	const lines: string[] = [
 		'<validation_errors>',
-		'JSX symbol validation failed. The following components are broken:',
+		'Frontend code validation failed with the following critical errors:',
 		'',
 	];
 	for (const [file, fileIssues] of byFile) {
 		lines.push(`File: ${file}`);
 		for (const iss of fileIssues) {
 			if (iss.kind === 'missing_import') {
-				lines.push(`  - <${iss.component} /> used but NOT imported.`);
+				lines.push(`  - Component <${iss.component} /> used but NOT imported.`);
 				lines.push(`    Fix: add  import ${iss.component} from "./${iss.component}";`);
-			} else {
-				lines.push(`  - <${iss.component} /> import path "${iss.importPath}" → file does not exist.`);
-				lines.push(`    Fix: create the missing file OR correct the import path.`);
+			} else if (iss.kind === 'missing_file') {
+				lines.push(`  - Component <${iss.component} /> was imported from "${iss.importPath}", but "${iss.missingFileTarget || iss.importPath}" was NEVER generated!`);
+				if (iss.missingFileTarget) missingFilesToGenerate.add(iss.missingFileTarget);
+			} else if (iss.kind === 'missing_function') {
+				lines.push(`  - Function "${iss.functionName}()" is called, but it is NEVER declared, defined, or imported.`);
+				lines.push(`    Fix: define "const ${iss.functionName} = ..." or import it.`);
+			} else if (iss.kind === 'orphan_file') {
+				lines.push(`  - Component file "${iss.file}" was generated, but it is NEVER imported or rendered anywhere.`);
+				lines.push(`    Fix: import and render <${iss.component} /> in its parent container or src/App.tsx, or delete it.`);
+			} else if (iss.kind === 'prop_mismatch') {
+				lines.push(`  - Component <${iss.component} /> is passed prop "${iss.functionName}", but "${iss.file}" does NOT declare "${iss.functionName}" in its props interface.`);
+				lines.push(`    Fix: update ${iss.file} props interface to accept "${iss.functionName}".`);
+			} else if (iss.kind === 'missing_map') {
+				lines.push(`  - Component <${iss.component} /> in "${iss.file}" receives array prop "${iss.functionName}", but does NOT map over it.`);
+				lines.push(`    Fix: update ${iss.file} to map over "${iss.functionName}" (e.g. {${iss.functionName}.map(...)}) to render the child items.`);
 			}
 		}
 		lines.push('');
 	}
-	lines.push(
-		'Rules:',
-		'  1. Every JSX component must be imported before use.',
-		'  2. Every import path must resolve to a file in this response or the workspace.',
-		'  3. Re-emit ALL corrected files using <file path="...">...</file> format.',
-		'</validation_errors>',
-		'',
-		'[Validator] repairing — output the fixed files now.',
-	);
+
+	lines.push('Requirements for resolution:');
+	if (missingFilesToGenerate.size > 0) {
+		lines.push(`  1. You MUST generate the following missing component file(s) right now:`);
+		for (const mf of missingFilesToGenerate) {
+			lines.push(`     <file path="${mf}">\n     // Complete working React implementation\n     </file>`);
+		}
+	}
+	lines.push('  2. Ensure all referenced helper functions, props, and state variables are declared in the component where they are used.');
+	lines.push('  3. Output ONLY the missing or corrected files as valid <file path="...">...</file> blocks.');
+	lines.push('</validation_errors>');
+	lines.push('');
+	lines.push('[Validator] output the required files now.');
 	return lines.join('\n');
 }
 
@@ -2432,15 +2711,22 @@ function streamChunk(res: express.Response, content: string) {
 // ---------------------------------------------------------------------------
 
 interface PipelineEvent {
-	type: 'progress' | 'success' | 'warning' | 'error' | 'info';
-	stage: 'read' | 'plan' | 'generate' | 'write' | 'validate' | 'repair' | 'complete';
-	message: string;
+	type: 'progress' | 'success' | 'warning' | 'error' | 'info' | 'context_usage';
+	stage?: 'read' | 'plan' | 'generate' | 'write' | 'validate' | 'repair' | 'complete';
+	message?: string;
 	file?: string;
+	used?: number;
+	total?: number;
+	percent?: number;
 }
 
 /** Emit a structured progress event. Renders as markdown in existing chat UI;
  *  also carries typed `event` metadata for future frontend parsing. */
 function streamEvent(res: express.Response, evt: PipelineEvent): void {
+	if (evt.type === 'context_usage') {
+		res.write(JSON.stringify({ type: 'context_usage', used: evt.used, total: evt.total, percent: evt.percent }) + '\n');
+		return;
+	}
 	const icon =
 		evt.type === 'success' ? '✅'
 			: evt.type === 'error' ? '❌'
@@ -3061,7 +3347,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 		// Scope mask: BACKEND_ONLY hard-disables FE phase.
 		const needsFrontend = userScope !== 'BACKEND_ONLY' && promptNeedsFrontend(lastUserMsg);
 
-		const activeModel = await mm.acquire(intent);
+		let activeModel = await mm.acquire(intent);
 		console.log(`[Router] Intent: ${intent} (raw: ${rawAdvisorIntent}) scope: ${userScope}. needsFrontend=${needsFrontend}. Model: ${mm.status.activeKey}`);
 
 		// Derive currentSpecialist from intent.
@@ -3072,16 +3358,33 @@ app.post('/v1/chat/completions', async (req, res) => {
 		// Compute mode for this specialist independently
 		let mode = determineMode(lastUserMsg, currentSpecialist, backendFileCount, frontendFileCount);
 
+		// Auto-scaffold frontend foundation files on create mode (package.json, index.html, init.sh, features.json, progress.txt)
+		let bootstrappedCount = 0;
+		if (workspaceRoot && (mode === 'create' || advisorSaysCreate) && (intent === 'frontend' || (intent === 'general' && promptNeedsFrontend(lastUserMsg)))) {
+			const bootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
+			bootstrappedCount = bootstrapped.length;
+			if (bootstrapped.length > 0) {
+				for (const f of bootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+				if (!pkgContent) {
+					try {
+						pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8');
+					} catch { /* ignore */ }
+				}
+				console.log(`[Router] Initializer bootstrapped ${bootstrapped.length} frontend foundation files.`);
+			}
+		}
+
 		console.log(`[Router] Phase 1 Specialist=${currentSpecialist}, Mode=${mode}`);
 
 		const activeFile = openFiles && openFiles.length > 0 ? openFiles[0] : undefined;
 		let systemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, currentSpecialist, activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
 
-		context = await activeModel.createContext({ contextSize: 4096 });
+		context = await activeModel.createContext({ contextSize: 8192 });
 		let session = new LlamaChatSession({
 			contextSequence: context.getSequence(),
 			systemPrompt: systemPrompt,
 		});
+		const activeContextSize = (context as any)?.contextSize || 8192;
 
 		// Load prior conversation history
 		const history: Array<{ type: 'user'; text: string } | { type: 'model'; response: string[] }> = [];
@@ -3103,6 +3406,22 @@ app.post('/v1/chat/completions', async (req, res) => {
 		res.setHeader('Content-Type', 'text/event-stream');
 		res.setHeader('Cache-Control', 'no-cache');
 		res.setHeader('Connection', 'keep-alive');
+
+		// Emit initial context usage baseline
+		try {
+			const promptTokens = activeModel ? activeModel.tokenize(systemPrompt + '\n' + enrichedLastMessage).length : 0;
+			const initialTokens = Math.max(session?.sequence?.nextTokenIndex || 0, promptTokens);
+			updateContextUsage(initialTokens, activeContextSize, currentSpecialist);
+			streamEvent(res, {
+				type: 'context_usage',
+				used: initialTokens,
+				total: activeContextSize,
+				percent: Math.min(100, Math.round((initialTokens / activeContextSize) * 100))
+			});
+			console.log(`[Router] Initial context usage: ${initialTokens}/${activeContextSize} tokens (${Math.round((initialTokens / activeContextSize) * 100)}%)`);
+		} catch (e) {
+			console.warn('[Router] Failed to emit initial context usage:', e);
+		}
 
 		const modelNames: Record<string, string> = { be: 'Backend Specialist', fe: 'Frontend Specialist' };
 		const activeName = modelNames[mm.status.activeKey || ''] || 'Base Model';
@@ -3156,7 +3475,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 			].join('\n\n')
 			: enrichedLastMessage;
 		const originalUserRequest = enrichedLastMessage;
-
+		let justCompacted = false;
+		let compactionRetryDone = false;
 
 		for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
 			console.log(`[Router] --- Agentic iteration ${iteration + 1} ---`);
@@ -3175,6 +3495,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 			let fullResponse = '';
 			let loopDetected = false;
 			let loopReason = '';
+			let chunkCount = 0;
+			let compactionTriggered = false;
+
+			const iterController = new AbortController();
+			const onGlobalAbort = () => iterController.abort();
+			controller.signal.addEventListener('abort', onGlobalAbort);
 
 			await session.prompt(currentPrompt, {
 				maxTokens: MAX_TOKENS,
@@ -3183,27 +3509,150 @@ app.post('/v1/chat/completions', async (req, res) => {
 					lastTokens: REPEAT_PENALTY_TOKENS,
 					penalizeNewLine: false
 				},
-				signal: controller.signal,
+				signal: iterController.signal,
 				stopOnAbortSignal: true,
 				onTextChunk(chunk) {
 					// Buffer internally; emit raw only when user explicitly requested code
 					fullResponse += chunk;
 					if (showRawOutput) streamChunk(res, chunk);
 
+					// Stream live context usage updates
+					chunkCount++;
+					if (chunkCount % 12 === 0) {
+						try {
+							const liveTokens = session?.sequence?.nextTokenIndex || 0;
+							if (liveTokens > 0) {
+								updateContextUsage(liveTokens, activeContextSize, currentSpecialist);
+								streamEvent(res, {
+									type: 'context_usage',
+									used: liveTokens,
+									total: activeContextSize,
+									percent: Math.min(100, Math.round((liveTokens / activeContextSize) * 100))
+								});
+
+								// Check 75% cutoff threshold
+								const COMPACTION_THRESHOLD = Math.round(activeContextSize * 0.75); // 6,144 tokens
+								if (liveTokens >= COMPACTION_THRESHOLD && !compactionTriggered && iteration < MAX_AGENT_ITERATIONS - 1) {
+									compactionTriggered = true;
+									console.log(`[Router] 75% cutoff reached (${liveTokens}/${activeContextSize} tokens). Halting 3B generator for auto-compaction.`);
+									iterController.abort();
+								}
+							}
+						} catch (e) { }
+					}
+
 					// Run repetition detector on every chunk
 					const check = detectRepetitionLoop(fullResponse);
 					if (check.detected) {
 						loopDetected = true;
 						loopReason = check.reason || 'Unknown repetition pattern';
-						controller.abort();
+						iterController.abort();
 					}
 				}
 			});
+
+			controller.signal.removeEventListener('abort', onGlobalAbort);
+
+			try {
+				const currentTokens = session?.sequence?.nextTokenIndex || 0;
+				if (currentTokens > 0) {
+					updateContextUsage(currentTokens, activeContextSize, currentSpecialist);
+					streamEvent(res, {
+						type: 'context_usage',
+						used: currentTokens,
+						total: activeContextSize,
+						percent: Math.min(100, Math.round((currentTokens / activeContextSize) * 100))
+					});
+				}
+			} catch (e) { }
 
 			if (loopDetected) {
 				console.warn(`[Router] Loop detected: ${loopReason}. Aborting generation.`);
 				streamChunk(res, `\n\n⚠️ **Generation stopped:** ${loopReason}\n`);
 				throw new Error(`Infinite loop detected: ${loopReason}`);
+			}
+
+			if (compactionTriggered) {
+				console.log('[Router] Auto-compaction triggered at 75% cutoff.');
+				streamEvent(res, {
+					type: 'info',
+					stage: 'plan',
+					message: '75% context cutoff reached. Flushing KV cache & condensing context with Advisor...'
+				});
+
+				// Harvest only fully complete files generated so far before cutoff
+				if (workspaceRoot && fullResponse.length > 0) {
+					const completedEdits = extractFallbackEdits(fullResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
+					for (const edit of completedEdits) {
+						const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode);
+						if (wr.success && !filesModified.includes(edit.path)) {
+							filesModified.push(edit.path);
+							streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
+							if (wr.diffMsg) streamChunk(res, wr.diffMsg);
+						}
+					}
+				}
+
+				// Run Advisor (0.6B) to generate a concise project state summary
+				let projectSummary = '';
+				try {
+					const advisorModel = await mm.acquire('advisor');
+					projectSummary = await runAdvisorProjectSummary(advisorModel, {
+						userRequest: originalUserRequest,
+						filesWritten: filesModified,
+						partialSnippet: fullResponse.slice(-400),
+					});
+				} catch (e: any) {
+					console.warn('[Advisor] Summary pass failed, using fallback summary:', e.message);
+					projectSummary = `Files completed: ${filesModified.join(', ') || 'None'}. Continue generating the remaining requested components.`;
+				}
+
+				// Flush bloated KV cache
+				if (context) {
+					await context.dispose();
+					context = null;
+				}
+
+				// Re-acquire specialist model in VRAM (since Advisor pass swapped it)
+				activeModel = await mm.acquire(intent);
+
+				// Re-arm context with fresh 8K sequence retaining the ~20% baseline prompts
+				context = await activeModel.createContext({ contextSize: activeContextSize });
+				session = new LlamaChatSession({
+					contextSequence: context.getSequence(),
+					systemPrompt: systemPrompt,
+				});
+
+				// Reconstruct next prompt with constructive completion instructions
+				currentPrompt = [
+					`--- Project State (After 75% Context Compaction) ---`,
+					`Advisor Project Summary:\n${projectSummary}`,
+					`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+					`--- Original User Request ---`,
+					originalUserRequest,
+					`--- Required Action ---`,
+					`The generator was paused due to token limits and has now been given a fresh context sequence.`,
+					`1. Inspect the original request against the files written so far.`,
+					`2. If any requested component, modal, action handler, filter, or stat card is still missing or incomplete, generate it now.`,
+					`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now.`,
+					`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+				].join('\n\n');
+
+				// Compute and emit new ~20% baseline context usage
+				const freshTokens = activeModel ? activeModel.tokenize(systemPrompt + '\n' + currentPrompt).length : 0;
+				const newBaseline = Math.max(session.sequence?.nextTokenIndex || 0, freshTokens);
+				updateContextUsage(newBaseline, activeContextSize, currentSpecialist);
+				streamEvent(res, {
+					type: 'context_usage',
+					used: newBaseline,
+					total: activeContextSize,
+					percent: Math.min(100, Math.round((newBaseline / activeContextSize) * 100))
+				});
+				console.log(`[Router] Context flushed and re-armed at ~20% baseline: ${newBaseline}/${activeContextSize} tokens (${Math.round((newBaseline / activeContextSize) * 100)}%)`);
+
+				compactionTriggered = false;
+				justCompacted = true;
+				continue;
 			}
 
 			if (controller.signal.aborted) {
@@ -3214,9 +3663,17 @@ app.post('/v1/chat/completions', async (req, res) => {
 			console.log(`[Router] Iteration ${iteration + 1} complete. Tokens generated: ${responseTokenCount}`);
 
 			if (responseTokenCount < 30) {
+				if (justCompacted && !compactionRetryDone) {
+					compactionRetryDone = true;
+					justCompacted = false;
+					console.log("[Router] Model produced empty response after compaction. Sending targeted completion directive...");
+					currentPrompt = `<validation_repair>\nYou did not emit any code after compaction.\nBased on the request: "${originalUserRequest.slice(0, 300)}..."\nYou MUST output the complete, working <file path="src/App.tsx"> that imports all components, implements all state (useState) and action handlers, and renders the user interface. Output <file path="src/App.tsx"> now.\n</validation_repair>`;
+					continue;
+				}
 				console.log("[Router] Tiny response detected. Aborting to prevent infinite loop.");
 				break;
 			}
+			justCompacted = false;
 
 			// Check for identical responses (identical-response detection)
 			const trimmedResponse = fullResponse.trim();
@@ -3522,7 +3979,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 
 			// Load FE model fresh — BE is fully unloaded first by mm.acquire
 			intent = 'frontend';
-			const feModel = await mm.acquire('frontend');
+			let feModel = await mm.acquire('frontend');
 			console.log('[Router] FE model acquired. Creating fresh context...');
 
 			currentSpecialist = 'fe';
@@ -3530,15 +3987,27 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			mode = determineMode(lastUserMsg, currentSpecialist, backendFileCount, frontendFileCount);
 			console.log(`[Router] Phase 2 Specialist=${currentSpecialist}, Mode=${mode}`);
 
+			if (workspaceRoot && (mode === 'create' || advisorSaysCreate)) {
+				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
+				if (feBootstrapped.length > 0) {
+					for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+					if (!pkgContent) {
+						try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
+					}
+					console.log(`[Router] Initializer bootstrapped ${feBootstrapped.length} frontend foundation files for FE phase.`);
+				}
+			}
+
 			// Build FE system prompt with FE specialist mode
 			const feSystemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, 'fe', activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
 
 			// Fresh context — no shared state with BE session
-			context = await feModel.createContext({ contextSize: 4096 });
-			const feSession = new LlamaChatSession({
+			context = await feModel.createContext({ contextSize: 8192 });
+			let feSession = new LlamaChatSession({
 				contextSequence: context.getSequence(),
 				systemPrompt: feSystemPrompt,
 			});
+			const feContextSize = (context as any)?.contextSize || 8192;
 
 			// Pass BE artifact context + Tier-2 RAG context to FE.
 			// Artifact ensures FE knows real API endpoints/symbols without hallucinating.
@@ -3579,10 +4048,26 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			feContextBlocks.push(`--- Original Request ---\n${originalUserRequest}`);
 
 			let fePrompt = feContextBlocks.join('\n\n');
+
+			// Emit initial FE context usage
+			try {
+				const fePromptTokens = feModel ? feModel.tokenize(feSystemPrompt + '\n' + fePrompt).length : 0;
+				const feInitialTokens = Math.max(feSession?.sequence?.nextTokenIndex || 0, fePromptTokens);
+				updateContextUsage(feInitialTokens, feContextSize, 'frontend');
+				streamEvent(res, {
+					type: 'context_usage',
+					used: feInitialTokens,
+					total: feContextSize,
+					percent: Math.min(100, Math.round((feInitialTokens / feContextSize) * 100))
+				});
+				console.log(`[Router] Initial FE context usage: ${feInitialTokens}/${feContextSize} tokens (${Math.round((feInitialTokens / feContextSize) * 100)}%)`);
+			} catch (e) { }
+
 			const feResponseHistory: string[] = [];
 			const feInitialFilesCount = filesModified.length;
 			let feJsxRepairDone = false; // allow one JSX repair pass in FE loop
-			// streamEvent(res, { type: 'progress', stage: 'generate', message: 'Generating frontend files...' });
+			let feJustCompacted = false;
+			let feCompactionRetryDone = false;
 
 			for (let feIter = 0; feIter < MAX_AGENT_ITERATIONS; feIter++) {
 				console.log(`[Router] --- FE iteration ${feIter + 1} ---`);
@@ -3591,23 +4076,145 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 				let feResponse = '';
 				let feLoopDetected = false;
 				let feLoopReason = '';
+				let feChunkCount = 0;
+				let feCompactionTriggered = false;
+
+				const feIterController = new AbortController();
+				const onFeGlobalAbort = () => feIterController.abort();
+				controller.signal.addEventListener('abort', onFeGlobalAbort);
 
 				await feSession.prompt(fePrompt, {
 					maxTokens: MAX_TOKENS,
 					repeatPenalty: { penalty: REPEAT_PENALTY, lastTokens: REPEAT_PENALTY_TOKENS, penalizeNewLine: false },
-					signal: controller.signal,
+					signal: feIterController.signal,
 					stopOnAbortSignal: true,
 					onTextChunk(chunk) {
 						// Buffer internally — raw model tokens are never sent to chat
 						feResponse += chunk;
+
+						feChunkCount++;
+						if (feChunkCount % 12 === 0) {
+							try {
+								const liveTokens = feSession?.sequence?.nextTokenIndex || 0;
+								if (liveTokens > 0) {
+									updateContextUsage(liveTokens, feContextSize, 'frontend');
+									streamEvent(res, {
+										type: 'context_usage',
+										used: liveTokens,
+										total: feContextSize,
+										percent: Math.min(100, Math.round((liveTokens / feContextSize) * 100))
+									});
+
+									// Check 75% cutoff threshold
+									const COMPACTION_THRESHOLD = Math.round(feContextSize * 0.75); // 6,144 tokens
+									if (liveTokens >= COMPACTION_THRESHOLD && !feCompactionTriggered && feIter < MAX_AGENT_ITERATIONS - 1) {
+										feCompactionTriggered = true;
+										console.log(`[Router] FE 75% cutoff reached (${liveTokens}/${feContextSize} tokens). Halting for auto-compaction.`);
+										feIterController.abort();
+									}
+								}
+							} catch { /* ignore */ }
+						}
+
 						const check = detectRepetitionLoop(feResponse);
-						if (check.detected) { feLoopDetected = true; feLoopReason = check.reason || 'Unknown'; controller.abort(); }
+						if (check.detected) { feLoopDetected = true; feLoopReason = check.reason || 'Unknown'; feIterController.abort(); }
 					},
 				});
+
+				controller.signal.removeEventListener('abort', onFeGlobalAbort);
+
+				try {
+					const currentFeTokens = feSession?.sequence?.nextTokenIndex || 0;
+					if (currentFeTokens > 0) {
+						updateContextUsage(currentFeTokens, feContextSize, 'frontend');
+						streamEvent(res, {
+							type: 'context_usage',
+							used: currentFeTokens,
+							total: feContextSize,
+							percent: Math.min(100, Math.round((currentFeTokens / feContextSize) * 100))
+						});
+					}
+				} catch (e) { }
 
 				if (feLoopDetected) {
 					streamEvent(res, { type: 'warning', stage: 'generate', message: `FE generation stopped: ${feLoopReason}` });
 					throw new Error(`FE loop: ${feLoopReason}`);
+				}
+
+				if (feCompactionTriggered) {
+					console.log('[Router] FE Auto-compaction triggered at 75% cutoff.');
+					streamEvent(res, {
+						type: 'info',
+						stage: 'plan',
+						message: '75% context cutoff reached. Flushing KV cache & condensing context with Advisor...'
+					});
+
+					// Harvest only fully complete files generated so far before cutoff
+					if (workspaceRoot && feResponse.length > 0) {
+						const completedEdits = extractFallbackEdits(feResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
+						for (const edit of completedEdits) {
+							const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode);
+							if (wr.success && !filesModified.includes(edit.path)) {
+								filesModified.push(edit.path);
+								streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
+								if (wr.diffMsg) streamChunk(res, wr.diffMsg);
+							}
+						}
+					}
+
+					let projectSummary = '';
+					try {
+						const advisorModel = await mm.acquire('advisor');
+						projectSummary = await runAdvisorProjectSummary(advisorModel, {
+							userRequest: originalUserRequest,
+							filesWritten: filesModified,
+							partialSnippet: feResponse.slice(-400),
+						});
+					} catch (e: any) {
+						console.warn('[Advisor] FE Summary pass failed, using fallback:', e.message);
+						projectSummary = `Files completed: ${filesModified.join(', ') || 'None'}. Continue generating the remaining requested components.`;
+					}
+
+					if (context) {
+						await context.dispose();
+						context = null;
+					}
+
+					feModel = await mm.acquire('frontend');
+					context = await feModel.createContext({ contextSize: 8192 });
+					feSession = new LlamaChatSession({
+						contextSequence: context.getSequence(),
+						systemPrompt: feSystemPrompt,
+					});
+
+					fePrompt = [
+						`--- Project State (After 75% Context Compaction) ---`,
+						`Advisor Project Summary:\n${projectSummary}`,
+						`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+						`--- Original User Request ---`,
+						originalUserRequest,
+						`--- Required Action ---`,
+						`The generator was paused due to token limits and has now been given a fresh context sequence.`,
+						`1. Inspect the original request against the files written so far.`,
+						`2. If any requested component, modal, action handler, filter, or stat card is still missing or incomplete, generate it now.`,
+						`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now.`,
+						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+					].join('\n\n');
+
+					const freshTokens = feModel ? feModel.tokenize(feSystemPrompt + '\n' + fePrompt).length : 0;
+					const newBaseline = Math.max(feSession.sequence?.nextTokenIndex || 0, freshTokens);
+					updateContextUsage(newBaseline, feContextSize, 'frontend');
+					streamEvent(res, {
+						type: 'context_usage',
+						used: newBaseline,
+						total: feContextSize,
+						percent: Math.min(100, Math.round((newBaseline / feContextSize) * 100))
+					});
+					console.log(`[Router] FE Context flushed and re-armed at ~20% baseline: ${newBaseline}/${feContextSize} tokens (${Math.round((newBaseline / feContextSize) * 100)}%)`);
+
+					feCompactionTriggered = false;
+					feJustCompacted = true;
+					continue;
 				}
 
 				const feResponseTokenCount = feModel ? feModel.tokenize(feResponse).length : 0;
@@ -3615,9 +4222,17 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 				console.log(`[RAW RESPONSE]\n${JSON.stringify(feResponse)}`);
 
 				if (feResponseTokenCount < 30) {
+					if (feJustCompacted && !feCompactionRetryDone) {
+						feCompactionRetryDone = true;
+						feJustCompacted = false;
+						console.log("[Router] FE Model produced empty response after compaction. Sending targeted completion directive...");
+						fePrompt = `<validation_repair>\nYou did not emit any code after compaction.\nBased on the request: "${originalUserRequest.slice(0, 300)}..."\nYou MUST output the complete, working <file path="src/App.tsx"> that imports all components, implements all state (useState) and action handlers, and renders the user interface. Output <file path="src/App.tsx"> now.\n</validation_repair>`;
+						continue;
+					}
 					console.log("[Router] Tiny response detected. Aborting to prevent infinite loop.");
 					break;
 				}
+				feJustCompacted = false;
 
 				const trimmedFe = feResponse.trim();
 				if (feResponseHistory.includes(trimmedFe)) throw new Error('FE: identical response across iterations.');

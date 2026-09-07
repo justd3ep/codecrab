@@ -217,6 +217,154 @@ function pass2RemoveDuplicates(files: GeneratedFile[]): GeneratedFile[] {
 }
 
 // ---------------------------------------------------------------------------
+// PASS 2B — Duplicate Identifier & Collision Sanitizer (Zero-Token TS2440 repair)
+// ---------------------------------------------------------------------------
+
+function passDuplicateIdentifierSanitizer(files: GeneratedFile[]): GeneratedFile[] {
+	return files.map(f => {
+		const ext = path.extname(f.path).toLowerCase();
+		if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext)) return f;
+
+		const content = f.content;
+		let modified = false;
+
+		// 1. Find all local declarations in the file (excluding imports)
+		// Matches: function Foo, const Foo, let Foo, class Foo, interface Foo, type Foo
+		const localDeclRegex = /(?:^|\n)\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function|class|const|let|var|interface|type)\s+([A-Za-z0-9_$]+)\b/g;
+		const localDecls = new Set<string>();
+		let declMatch: RegExpExecArray | null;
+		while ((declMatch = localDeclRegex.exec(content)) !== null) {
+			if (declMatch[1]) localDecls.add(declMatch[1]);
+		}
+
+		if (localDecls.size === 0) return f;
+
+		// 2. Scan import statements and check for collisions
+		const lines = content.split('\n');
+		const newLines: string[] = [];
+
+		for (const line of lines) {
+			const trimmed = line.trim();
+			// Check if line is an import statement
+			if (/^import\s+/.test(trimmed) && /from\s+['"][^'"]+['"]/.test(trimmed)) {
+				// Check named imports: import { A, B } from '...'
+				const namedMatch = trimmed.match(/^import\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/);
+				if (namedMatch && namedMatch[1]) {
+					const importList = namedMatch[1];
+					const specifiers = importList.split(',').map(s => s.trim()).filter(Boolean);
+					const keptSpecifiers = specifiers.filter(spec => {
+						const parts = spec.split(/\s+as\s+/);
+						const importedName = (parts[1] || parts[0] || '').trim();
+						if (importedName && localDecls.has(importedName)) {
+							log(`Sanitizer: Removed conflicting import "${importedName}" from ${f.path} (locally declared in same file)`);
+							modified = true;
+							return false;
+						}
+						return true;
+					});
+
+					if (keptSpecifiers.length === 0) {
+						// All imports in this statement were locally declared; drop the entire line!
+						continue;
+					} else if (keptSpecifiers.length < specifiers.length) {
+						// Reconstruct import statement with remaining specifiers
+						newLines.push(line.replace(/\{[^}]+\}/, `{ ${keptSpecifiers.join(', ')} }`));
+						continue;
+					}
+				}
+
+				// Check default import: import Foo from '...'
+				const defaultMatch = trimmed.match(/^import\s+([A-Za-z0-9_$]+)\s+from\s+['"]([^'"]+)['"]/);
+				if (defaultMatch && defaultMatch[1]) {
+					const defaultName = defaultMatch[1];
+					if (localDecls.has(defaultName)) {
+						log(`Sanitizer: Removed conflicting default import "${defaultName}" from ${f.path} (locally declared in same file)`);
+						modified = true;
+						continue; // drop the entire line
+					}
+				}
+			}
+
+			newLines.push(line);
+		}
+
+		return modified ? { ...f, content: newLines.join('\n') } : f;
+	});
+}
+
+// ---------------------------------------------------------------------------
+// PASS 2C — Export Harmonizer (Zero-Token TS2613/TS2614 default vs named repair)
+// ---------------------------------------------------------------------------
+
+function passHarmonizeExports(files: GeneratedFile[], workspaceRoot: string): GeneratedFile[] {
+	const fileMap = new Map<string, string>();
+	for (const f of files) {
+		fileMap.set(path.normalize(f.path).replace(/\\/g, '/'), f.content);
+	}
+
+	const getTargetContent = (relPath: string, currentFile: string): string | null => {
+		const dir = path.dirname(currentFile);
+		const targetNorm = path.normalize(path.join(dir, relPath)).replace(/\\/g, '/');
+		for (const ext of ['', '.tsx', '.ts', '.jsx', '.js', '/index.tsx', '/index.ts']) {
+			const candidate = targetNorm + ext;
+			if (fileMap.has(candidate)) return fileMap.get(candidate)!;
+			const diskPath = path.join(workspaceRoot, candidate);
+			if (fs.existsSync(diskPath)) {
+				try { return fs.readFileSync(diskPath, 'utf-8'); } catch { /* ignore */ }
+			}
+		}
+		return null;
+	};
+
+	return files.map(f => {
+		const ext = path.extname(f.path).toLowerCase();
+		if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext)) return f;
+
+		let content = f.content;
+		let modified = false;
+
+		// 1. Fix default import when target only has named export
+		// e.g. import Foo from './Foo' where Foo.tsx has 'export function Foo' and no 'export default'
+		const defaultImportRegex = /^import\s+([A-Za-z0-9_$]+)\s+from\s+['"](\.[^'"]+)['"]/gm;
+		content = content.replace(defaultImportRegex, (fullMatch, importedName, modulePath) => {
+			if (importedName === 'React') return fullMatch;
+			const targetContent = getTargetContent(modulePath, f.path);
+			if (!targetContent) return fullMatch;
+
+			const hasDefault = /export\s+default\b/.test(targetContent);
+			const hasNamed = new RegExp(`export\\s+(?:async\\s+)?(?:function|class|const|let|var|type|interface)\\s+${importedName}\\b|export\\s*\\{[^}]*\\b${importedName}\\b`).test(targetContent);
+
+			if (!hasDefault && hasNamed) {
+				log(`Harmonizer: Converted default import "${importedName}" → named "{ ${importedName} }" in ${f.path}`);
+				modified = true;
+				return fullMatch.replace(`import ${importedName} from`, `import { ${importedName} } from`);
+			}
+			return fullMatch;
+		});
+
+		// 2. Fix named import when target only has default export
+		// e.g. import { Foo } from './Foo' where Foo.tsx has 'export default Foo' and no named export
+		const namedImportRegex = /^import\s+\{\s*([A-Za-z0-9_$]+)\s*\}\s+from\s+['"](\.[^'"]+)['"]/gm;
+		content = content.replace(namedImportRegex, (fullMatch, importedName, modulePath) => {
+			const targetContent = getTargetContent(modulePath, f.path);
+			if (!targetContent) return fullMatch;
+
+			const hasDefault = /export\s+default\b/.test(targetContent);
+			const hasNamed = new RegExp(`export\\s+(?:async\\s+)?(?:function|class|const|let|var|type|interface)\\s+${importedName}\\b|export\\s*\\{[^}]*\\b${importedName}\\b`).test(targetContent);
+
+			if (hasDefault && !hasNamed) {
+				log(`Harmonizer: Converted named import "{ ${importedName} }" → default "${importedName}" in ${f.path}`);
+				modified = true;
+				return fullMatch.replace(`import { ${importedName} } from`, `import ${importedName} from`);
+			}
+			return fullMatch;
+		});
+
+		return modified ? { ...f, content } : f;
+	});
+}
+
+// ---------------------------------------------------------------------------
 // PASS 3 — Scope Validator
 // ---------------------------------------------------------------------------
 
@@ -998,7 +1146,18 @@ function pass16HtmlCssValidation(files: GeneratedFile[], framework: Framework): 
 // ---------------------------------------------------------------------------
 
 async function pass17CompileValidation(files: GeneratedFile[], workspaceRoot: string, issues: ValidationIssue[]): Promise<void> {
-	const tscBin = path.join(workspaceRoot, 'node_modules', '.bin', 'tsc');
+	let tscBin = path.join(workspaceRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
+	if (!fs.existsSync(tscBin)) {
+		tscBin = path.join(workspaceRoot, 'node_modules', '.bin', 'tsc');
+	}
+	if (!fs.existsSync(tscBin)) {
+		// Fallback to router's own tsc binary
+		const routerTsc = path.join(process.cwd(), 'node_modules', '.bin', process.platform === 'win32' ? 'tsc.cmd' : 'tsc');
+		if (fs.existsSync(routerTsc)) {
+			tscBin = routerTsc;
+			log(`pass17: using router fallback tsc binary: ${routerTsc}`);
+		}
+	}
 	if (!fs.existsSync(tscBin) || !fs.existsSync(path.join(workspaceRoot, 'tsconfig.json'))) {
 		log('pass17: tsc/tsconfig not found — skipped'); return;
 	}
@@ -1015,7 +1174,11 @@ async function pass17CompileValidation(files: GeneratedFile[], workspaceRoot: st
 		}
 		const nmSrc = path.join(workspaceRoot, 'node_modules');
 		const nmDest = path.join(tmpDir, 'node_modules');
-		if (fs.existsSync(nmSrc) && !fs.existsSync(nmDest)) fs.symlinkSync(nmSrc, nmDest, 'dir');
+		if (fs.existsSync(nmSrc) && !fs.existsSync(nmDest)) {
+			try {
+				fs.symlinkSync(nmSrc, nmDest, process.platform === 'win32' ? 'junction' : 'dir');
+			} catch { /* junction fallback non-fatal */ }
+		}
 
 		const genSet = new Set(tsFiles.map(f => f.path));
 		for (const f of tsFiles) {
@@ -1052,11 +1215,31 @@ async function pass17CompileValidation(files: GeneratedFile[], workspaceRoot: st
 		if (!tscOut) { log('pass17: tsc clean'); return; }
 		const errRe = /^(.+?)\((\d+),(\d+)\):\s+error\s+(TS\d+):\s+(.+)$/gm;
 		let em: RegExpExecArray | null;
-		const pfx = tmpDir + path.sep;
+		const normTmp = path.normalize(tmpDir).replace(/\\/g, '/');
 		while ((em = errRe.exec(tscOut)) !== null) {
-			const [, fp, , , code, msg] = em;
+			const [, fp, , , code, rawMsg] = em;
 			if (!fp || fp.includes('node_modules')) continue;
-			const rel = fp.startsWith(pfx) ? fp.slice(pfx.length) : fp;
+			const normFp = path.normalize(fp).replace(/\\/g, '/');
+			const rel = normFp.startsWith(normTmp + '/') ? normFp.slice(normTmp.length + 1) : normFp;
+			let msg = (rawMsg || '').replace(new RegExp(normTmp.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '[/\\\\]?', 'g'), '');
+
+			// If error is a missing local module (e.g. TS2307: Cannot find module './components/KanbanBoard'),
+			// convert to a concrete missing_coverage issue targeting the missing file!
+			if (code === 'TS2307') {
+				const missingModMatch = msg.match(/Cannot find module ['"](\.[^'"]+)['"]/);
+				if (missingModMatch && missingModMatch[1]) {
+					const missingRel = path.normalize(path.join(path.dirname(rel), missingModMatch[1])).replace(/\\/g, '/');
+					const missingCandidate = missingRel + (path.extname(missingRel) ? '' : '.tsx');
+					issues.push({
+						kind: 'missing_coverage',
+						file: missingCandidate,
+						message: `Missing component file: ${missingCandidate} (imported by ${rel}). You MUST generate <file path="${missingCandidate}">`,
+						severity: 'error',
+					});
+					continue;
+				}
+			}
+
 			issues.push({ kind: 'compile_error', file: rel, message: `${code}: ${msg}`, severity: 'error' });
 		}
 	} finally {
@@ -1102,6 +1285,8 @@ export async function runPostGenerationValidator(
 	// ── Repair passes (no issues yet) ─────────────────────────────────────────
 	result = pass1NormalizePaths(result);
 	result = pass2RemoveDuplicates(result);
+	result = passDuplicateIdentifierSanitizer(result);
+	result = passHarmonizeExports(result, workspaceRoot);
 	result = pass3ScopeValidator(result, contract, issues);     // error
 	result = pass4FrameworkValidation(result);
 	const framework = detectFramework(result);
@@ -1183,6 +1368,8 @@ export async function runLocalFileValidator(
 	// ── Repair passes ─────────────────────────────────────────────────────────
 	files = pass1NormalizePaths(files);
 	files = pass2RemoveDuplicates(files);
+	files = passDuplicateIdentifierSanitizer(files);
+	files = passHarmonizeExports(files, workspaceRoot);
 	files = pass3ScopeValidator(files, contract, issues);      // scope_violation errors
 	files = pass4FrameworkValidation(files);                   // framework repair
 	files = pass5PackageValidation(files, workspaceRoot);      // remove bad imports

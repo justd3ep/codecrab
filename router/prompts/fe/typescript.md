@@ -21,8 +21,10 @@ function Button(props: ButtonProps) {
     ...
 }
 Imports:
-- Use relative imports.
-- Every import must resolve.
+- Always import React and used hooks at the top of every file: import React, { useState, useEffect } from 'react';
+- Use relative imports for local components.
+- Every import must resolve to a real file.
+- Never use undeclared variables or unimported packages (e.g. uuid, lodash, mock arrays). Define mock data in the file if needed.
 - Never import symbols that do not exist.
 
 State:
@@ -41,6 +43,8 @@ API:
 - Use interfaces for DTOs.
 
 Self-check before output:
+✓ import React, { useState, ... } from 'react' is present at top of every file using hooks.
+✓ All referenced data arrays, variables, and IDs are defined or imported.
 ✓ No any.
 ✓ No unresolved imports.
 ✓ Interfaces defined.

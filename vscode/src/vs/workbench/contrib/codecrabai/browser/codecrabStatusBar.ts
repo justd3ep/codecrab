@@ -13,6 +13,18 @@ import { IWorkbenchContributionsRegistry, Extensions as WorkbenchExtensions, IWo
 import { LifecyclePhase } from '../../../services/lifecycle/common/lifecycle.js';
 
 const STATUS_BAR_ENTRY_ID = 'codecrab.statusBar.activeModel';
+const CONTEXT_STATUS_BAR_ENTRY_ID = 'codecrab.statusBar.contextUsage';
+
+function renderContextBar(used: number, total: number): string {
+	const effectiveTotal = total > 0 ? total : 8192;
+	const pct = Math.min(100, Math.max(0, Math.round((used / effectiveTotal) * 100)));
+	const totalBlocks = 8;
+	const filled = Math.min(totalBlocks, Math.round((pct / 100) * totalBlocks));
+	const empty = totalBlocks - filled;
+	const bar = '█'.repeat(filled) + '░'.repeat(empty);
+	return `$(database) [${bar}] ${used.toLocaleString()} / ${effectiveTotal.toLocaleString()} (${pct}%)`;
+}
+
 // @ts-ignore
 const OLLAMA_CHECK_INTERVAL_MS = 30_000; // 30 seconds
 const ROUTER_CHECK_INTERVAL_MS = 30_000;
@@ -22,6 +34,7 @@ export class CodeCrabStatusBarItem extends Disposable implements IWorkbenchContr
 	static readonly ID = 'workbench.contrib.codecrabStatusBar';
 
 	private _statusBarEntry: IStatusbarEntryAccessor | undefined;
+	private _contextStatusBarEntry: IStatusbarEntryAccessor | undefined;
 	private _routerCheckTimer: ReturnType<typeof setInterval> | undefined;
 
 	constructor(
@@ -32,8 +45,12 @@ export class CodeCrabStatusBarItem extends Disposable implements IWorkbenchContr
 	) {
 		super();
 		this._createStatusBarEntry();
+		this._createContextStatusBarEntry();
 		this._startRouterCheck();
 		this._register(this._aiService.onDidChangeActiveModel(() => this._updateStatusBar()));
+		this._register(this._aiService.onDidChangeContextUsage((usage) => {
+			this._updateContextBar(usage.used, usage.total, usage.percent);
+		}));
 	}
 
 	// -------------------------------------------------------------------------
@@ -99,6 +116,59 @@ export class CodeCrabStatusBarItem extends Disposable implements IWorkbenchContr
 		].join('\n');
 	}
 
+	private _createContextStatusBarEntry(): void {
+		this._contextStatusBarEntry = this._register(
+			this._statusbarService.addEntry(
+				{
+					name: 'CodeCrab Context Usage',
+					text: renderContextBar(0, 8192),
+					tooltip: this._buildContextTooltip(0, 8192),
+					ariaLabel: 'CodeCrab Context Usage: 0 of 8,192 tokens',
+				},
+				CONTEXT_STATUS_BAR_ENTRY_ID,
+				StatusbarAlignment.LEFT,
+				// Priority: placed right next to problems and git branch in bottom-left
+				45
+			)
+		);
+	}
+
+	private _updateContextBar(used: number, total: number, percent?: number): void {
+		if (!this._contextStatusBarEntry) { return; }
+		const effectiveTotal = total > 0 ? total : 8192;
+		const pct = percent ?? Math.min(100, Math.max(0, Math.round((used / effectiveTotal) * 100)));
+
+		let text = renderContextBar(used, effectiveTotal);
+		if (pct >= 75) {
+			text += ' [75% compact threshold]';
+		}
+
+		this._contextStatusBarEntry.update({
+			name: 'CodeCrab Context Usage',
+			text,
+			tooltip: this._buildContextTooltip(used, effectiveTotal),
+			ariaLabel: `CodeCrab Context Usage: ${used} of ${effectiveTotal} tokens (${pct}%)`,
+		});
+	}
+
+	private _buildContextTooltip(used: number, total: number): string {
+		const effectiveTotal = total > 0 ? total : 8192;
+		const pct = ((used / effectiveTotal) * 100).toFixed(1);
+		const headroom = Math.max(0, effectiveTotal - used);
+		const compactThreshold = Math.round(effectiveTotal * 0.75);
+		const status = used >= compactThreshold ? 'Compaction Threshold Reached (75%)' : 'Optimal Attention Zone (<75%)';
+
+		return [
+			'CodeCrab Context Usage',
+			'-----------------------------------------',
+			`Tokens Used:   ${used.toLocaleString()} / ${effectiveTotal.toLocaleString()} (${pct}%)`,
+			`Free Headroom: ${headroom.toLocaleString()} tokens`,
+			`Hardware:      NVIDIA GeForce RTX 4060 (8 GB VRAM)`,
+			`Auto-Compact:  Triggers at 75% (${compactThreshold.toLocaleString()} tokens)`,
+			`Status:        ${status}`,
+		].join('\n');
+	}
+
 	// -------------------------------------------------------------------------
 	// Ollama connectivity polling
 	// -------------------------------------------------------------------------
@@ -113,6 +183,12 @@ export class CodeCrabStatusBarItem extends Disposable implements IWorkbenchContr
 	private async _checkRouter(): Promise<void> {
 		const available = await this._aiService.isRouterAvailable();
 		this._updateStatusBar(available);
+		if (available) {
+			const usage = await this._aiService.getContextUsage();
+			if (usage) {
+				this._updateContextBar(usage.used, usage.total, usage.percent);
+			}
+		}
 	}
 
 	override dispose(): void {

@@ -10,7 +10,7 @@ import { Event, Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
-import { ICodeCrabRouterClient, IRouterChatRequest, IRouterCompletionRequest } from './codecrabRouterClient.js';
+import { ICodeCrabRouterClient, IRouterChatRequest, IRouterCompletionRequest, IContextUsageData } from './codecrabRouterClient.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -96,6 +96,12 @@ export interface ICodeCrabAiService {
 
 	/** Returns true if Ollama is running and reachable. */
 	isOllamaAvailable(): Promise<boolean>;
+
+	/** Fired when active model context usage changes. */
+	readonly onDidChangeContextUsage: Event<IContextUsageData>;
+
+	/** Fetch current context usage from router. */
+	getContextUsage(): Promise<IContextUsageData | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -234,6 +240,14 @@ export class CodeCrabAiService extends Disposable implements ICodeCrabAiService 
 	async isOllamaAvailable(): Promise<boolean> {
 		const health = await this._routerClient.checkHealth();
 		return health !== null && health.ollama === 'connected';
+	}
+
+	get onDidChangeContextUsage(): Event<IContextUsageData> {
+		return this._routerClient.onDidChangeContextUsage;
+	}
+
+	getContextUsage(): Promise<IContextUsageData | null> {
+		return this._routerClient.getContextUsage();
 	}
 }
 

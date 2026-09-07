@@ -7,9 +7,17 @@
 
 import { CancellationToken } from '../../../../base/common/cancellation.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
+import { Emitter, Event } from '../../../../base/common/event.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
 import { IChatMessage, IFileContext, ISpecialistModel } from './codecrabAiService.js';
+
+export interface IContextUsageData {
+	used: number;
+	total: number;
+	percent: number;
+	model?: string;
+}
 
 // ---------------------------------------------------------------------------
 // Router response types (OpenAI-compatible)
@@ -44,6 +52,7 @@ export interface IRouterHealthResponse {
 	router: 'ok' | 'error';
 	ollama: 'connected' | 'disconnected';
 	activeKey?: string;
+	context?: IContextUsageData;
 	models: IRouterModelInfo[];
 }
 
@@ -59,11 +68,19 @@ export interface ICodeCrabRouterClient {
 	/** Base URL of the Model Router, e.g. http://localhost:3141 */
 	readonly routerUrl: string;
 
+	/** Fired when active model context usage changes. */
+	readonly onDidChangeContextUsage: Event<IContextUsageData>;
+
 	/**
 	 * Check if the router is reachable.
 	 * Phase 1: always returns false.
 	 */
 	checkHealth(): Promise<IRouterHealthResponse | null>;
+
+	/**
+	 * Fetch current context usage telemetry from the router.
+	 */
+	getContextUsage(): Promise<IContextUsageData | null>;
 
 	/**
 	 * Stream a chat response from the router.
@@ -144,6 +161,9 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 	 */
 	readonly routerUrl = 'http://localhost:3141';
 
+	private readonly _onDidChangeContextUsage = this._register(new Emitter<IContextUsageData>());
+	readonly onDidChangeContextUsage: Event<IContextUsageData> = this._onDidChangeContextUsage.event;
+
 	constructor() {
 		super();
 	}
@@ -156,7 +176,26 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 			const response = await fetch(`${this.routerUrl}/health`, { signal: controller.signal });
 			clearTimeout(timeoutId);
 			if (!response.ok) { return null; }
-			return await response.json() as IRouterHealthResponse;
+			const result = await response.json() as IRouterHealthResponse;
+			if (result.context) {
+				this._onDidChangeContextUsage.fire(result.context);
+			}
+			return result;
+		} catch {
+			return null;
+		}
+	}
+
+	async getContextUsage(): Promise<IContextUsageData | null> {
+		try {
+			const controller = new AbortController();
+			const timeoutId = setTimeout(() => controller.abort(), 2000);
+			const response = await fetch(`${this.routerUrl}/context-usage`, { signal: controller.signal });
+			clearTimeout(timeoutId);
+			if (!response.ok) { return null; }
+			const data = await response.json() as IContextUsageData;
+			this._onDidChangeContextUsage.fire(data);
+			return data;
 		} catch {
 			return null;
 		}
@@ -198,10 +237,21 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 					buffer = lines.pop() || ''; // Keep the last, potentially incomplete line
 					
 					for (const line of lines) {
-						const trimmed = line.trim();
+						let trimmed = line.trim();
 						if (!trimmed) continue;
+						if (trimmed.startsWith('data: ')) {
+							trimmed = trimmed.substring(6).trim();
+						}
+						if (!trimmed || trimmed === '[DONE]') continue;
 						try {
 							const data = JSON.parse(trimmed);
+							if (data.type === 'context_usage' && typeof data.used === 'number') {
+								this._onDidChangeContextUsage.fire({
+									used: data.used,
+									total: data.total ?? 8192,
+									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100)
+								});
+							}
 							if (data.message?.content) {
 								yield data.message.content;
 							}
@@ -213,9 +263,20 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 
 				if (buffer.trim()) {
 					try {
-						const data = JSON.parse(buffer.trim());
-						if (data.message?.content) {
-							yield data.message.content;
+						let bTrimmed = buffer.trim();
+						if (bTrimmed.startsWith('data: ')) bTrimmed = bTrimmed.substring(6).trim();
+						if (bTrimmed && bTrimmed !== '[DONE]') {
+							const data = JSON.parse(bTrimmed);
+							if (data.type === 'context_usage' && typeof data.used === 'number') {
+								this._onDidChangeContextUsage.fire({
+									used: data.used,
+									total: data.total ?? 8192,
+									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100)
+								});
+							}
+							if (data.message?.content) {
+								yield data.message.content;
+							}
 						}
 					} catch (e) {}
 				}

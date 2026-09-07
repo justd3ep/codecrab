@@ -20,6 +20,9 @@ index.html contains:
 <script type="module" src="/src/main.tsx"></script>
 
 Never:
+- Output "use client"; (this is a Vite React SPA, not Next.js App Router).
+- Import third-party packages not listed in package.json dependencies.
+- Assume external libraries (recharts, react-hook-form, zod, axios, framer-motion) are available.
 - Use class components.
 - Use lifecycle methods.
 - Place index.html inside public/.
@@ -34,7 +37,8 @@ Self-check before output:
 ✓ src/main.tsx exists
 ✓ src/App.tsx exists
 ✓ index.html exists
-✓ all imports resolve
+✓ all imports resolve to real files
+✓ src/App.tsx directly mounts all generated components (no phantom wrappers like MainView)
 ✓ every referenced file exists
 ✓ no broken script references
 ✓ no missing css imports

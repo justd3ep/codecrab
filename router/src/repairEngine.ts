@@ -9,6 +9,8 @@
  * Max 3 attempts per issue before skipping.
  */
 
+import fs from 'fs';
+import path from 'path';
 import type { LlamaChatSession }   from 'node-llama-cpp';
 import type { ValidationIssue }    from './validator.js';
 import type { GeneratedFile }      from './validator.js';
@@ -413,3 +415,233 @@ export function buildDepContext(
 	}
 	return ctx;
 }
+
+
+
+/**
+ * Scan workspace + generated files and return a map of:
+ *   moduleName → { layer, relPath }[]
+ * Used to prevent parallel implementations during repair.
+ */
+export function collectWorkspaceModules(
+	workspaceRoot: string,
+	generatedFiles: string[],
+): Map<string, { layer: string; path: string }[]> {
+	const result = new Map<string, { layer: string; path: string }[]>();
+	const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'out', '.git', '.next']);
+
+	const LAYER_SUFFIX_RE = /\.(service|controller|repository|router|routes?|middleware|guard|module|dto|entity|model|schema)\.[tj]sx?$/i;
+	const LAYER_DIR_RE = /\/(services?|controllers?|repositor|routes?|middleware|models?|dto|guards?)\//i;
+
+	function classifyFileLayer(p: string): string {
+		if (LAYER_DIR_RE.test(p)) {
+			const m = LAYER_DIR_RE.exec(p);
+			return m ? m[1]!.replace(/s$/, '').toLowerCase() : 'other';
+		}
+		if (LAYER_SUFFIX_RE.test(p)) {
+			const m = LAYER_SUFFIX_RE.exec(p);
+			return m ? m[1]!.toLowerCase() : 'other';
+		}
+		return 'other';
+	}
+
+	function extractMod(p: string): string | null {
+		const base = path.basename(p, path.extname(p))
+			.replace(/\.(service|controller|repository|router|routes?|middleware|guard|module|dto|entity|model|schema)$/i, '')
+			.toLowerCase().trim();
+		return base.length > 1 ? base : null;
+	}
+
+	function addFile(relPath: string): void {
+		const mod = extractMod(relPath);
+		const layer = classifyFileLayer(relPath);
+		if (!mod || layer === 'other') return;
+		if (!result.has(mod)) result.set(mod, []);
+		result.get(mod)!.push({ layer, path: relPath });
+	}
+
+	for (const f of generatedFiles) addFile(f);
+
+	function scanDir(dir: string, depth = 0): void {
+		if (depth > 5) return;
+		try {
+			const entries = fs.readdirSync(dir, { withFileTypes: true });
+			for (const e of entries) {
+				if (SKIP_DIRS.has(e.name)) continue;
+				if (e.isDirectory()) scanDir(path.join(dir, e.name), depth + 1);
+				else if (/\.(ts|tsx|js|jsx)$/.test(e.name)) addFile(path.relative(workspaceRoot, path.join(dir, e.name)));
+			}
+		} catch { /* ignore */ }
+	}
+	scanDir(workspaceRoot);
+
+	return result;
+}
+
+export function fileExists(filePath: string, generatedPaths: Set<string>, workspaceRoot: string): boolean {
+	if (generatedPaths.has(filePath)) return true;
+	const exts = ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx'];
+	return exts.some(e => { try { return fs.existsSync(path.join(workspaceRoot, filePath + e)); } catch { return false; } });
+}
+
+export function buildTargetedRepairPrompt(
+	issues: ValidationIssue[],
+	generatedFiles: string[] = [],
+	workspaceRoot = '',
+): string {
+	const errors = issues.filter(i => i.severity === 'error');
+	if (errors.length === 0) return '';
+
+	const generatedSet = new Set(generatedFiles);
+	const wsModules = workspaceRoot ? collectWorkspaceModules(workspaceRoot, generatedFiles) : new Map();
+	const existingModuleList = [...wsModules.keys()].sort().slice(0, 20);
+
+	type RepairGroup = { mode: RepairMode; issues: ValidationIssue[] };
+	const groups = new Map<RepairMode, ValidationIssue[]>();
+	for (const iss of errors) {
+		const mode = classifyRepairMode(iss.kind, iss.message);
+		if (!groups.has(mode)) groups.set(mode, []);
+		groups.get(mode)!.push(iss);
+	}
+
+	const lines: string[] = ['<repair_instructions>'];
+
+	lines.push('## Project State', '');
+	if (existingModuleList.length > 0) {
+		lines.push('### Existing Modules (DO NOT duplicate)');
+		existingModuleList.forEach(m => lines.push(`  - ${m}`));
+		lines.push('');
+	}
+	if (generatedFiles.length > 0) {
+		lines.push('### Generated Files (already on disk)');
+		generatedFiles.slice(0, 25).forEach(f => lines.push(`  - ${f}`));
+		lines.push('');
+	}
+
+	lines.push(
+		'## Expected Dependency Graph',
+		'  Routes → Controllers → Services → Repositories → Models/Database',
+		'  ILLEGAL: Route → Repository | Route → Model | Controller → Model | Controller → Prisma | Route → bcrypt | Route → jwt',
+		'',
+	);
+
+	lines.push('## Repair Instructions', '');
+
+	const modifyIssues = groups.get(RepairMode.MODIFY_EXISTING) ?? [];
+	if (modifyIssues.length > 0) {
+		lines.push('### MODIFY (rewrite existing files — do NOT create new parallel implementations)');
+		const byFile = new Map<string, ValidationIssue[]>();
+		for (const iss of modifyIssues) {
+			const key = iss.file ?? 'unknown';
+			if (!byFile.has(key)) byFile.set(key, []);
+			byFile.get(key)!.push(iss);
+		}
+		for (const [file, fileIssues] of byFile) {
+			const exists = file !== 'unknown' && fileExists(file, generatedSet, workspaceRoot);
+			lines.push(`  ${exists ? '📝 MODIFY' : '❓ FIX'}: ${file}`);
+			fileIssues.forEach(i => lines.push(`    - ${i.message}`));
+		}
+		lines.push('');
+	}
+
+	const genIssues = groups.get(RepairMode.GENERATE_MISSING) ?? [];
+	if (genIssues.length > 0) {
+		lines.push('### GENERATE (create ONLY these missing files — no other new files)');
+		for (const iss of genIssues) {
+			lines.push(`  📄 ${iss.message}`);
+			if (iss.file && fileExists(iss.file, generatedSet, workspaceRoot)) {
+				lines.push(`    → Also update imports in: ${iss.file}`);
+			}
+		}
+		lines.push('');
+	}
+
+	const rewireIssues = groups.get(RepairMode.REWIRE_IMPORTS) ?? [];
+	if (rewireIssues.length > 0) {
+		lines.push('### REWIRE IMPORTS (fix import paths — do not restructure logic)');
+		for (const iss of rewireIssues) {
+			const file = iss.file ?? '';
+			lines.push(`  🔗 ${file}: ${iss.message}`);
+		}
+		lines.push('');
+	}
+
+	const deleteIssues = groups.get(RepairMode.DELETE_DUPLICATES) ?? [];
+	if (deleteIssues.length > 0) {
+		lines.push('### CONSOLIDATE (remove duplicate logic — reuse existing modules)');
+		for (const iss of deleteIssues) {
+			lines.push(`  🗑️  ${iss.file ?? ''}: ${iss.message}`);
+			lines.push(`    → Reuse existing module. Do NOT create a parallel implementation.`);
+		}
+		lines.push('');
+	}
+
+	const secIssues = groups.get(RepairMode.SECURITY_FIX) ?? [];
+	if (secIssues.length > 0) {
+		lines.push('### SECURITY FIXES (patch existing files only)');
+		for (const iss of secIssues) {
+			lines.push(`  🔒 ${iss.file ?? ''}: ${iss.message}`);
+		}
+		lines.push('');
+	}
+
+	const compileIssues = groups.get(RepairMode.COMPILE_FIX) ?? [];
+	if (compileIssues.length > 0) {
+		lines.push('### COMPILE ERRORS (fix type errors in these files)');
+		const byFile = new Map<string, ValidationIssue[]>();
+		for (const iss of compileIssues) {
+			const key = iss.file ?? 'unknown';
+			if (!byFile.has(key)) byFile.set(key, []);
+			byFile.get(key)!.push(iss);
+		}
+		for (const [file, fileIssues] of byFile) {
+			lines.push(`  📝 MODIFY: ${file}`);
+			fileIssues.forEach(i => lines.push(`    - ${i.message}`));
+		}
+		lines.push('');
+	}
+
+	lines.push(
+		'## Output Rules',
+		'  1. Use <file path="...">...</file> format for ALL output files.',
+		'  2. Output ONLY the files listed above as MODIFY or GENERATE.',
+		'  3. DO NOT output files that are already correct and not listed above.',
+		'  4. DO NOT regenerate the entire project.',
+		'  5. DO NOT create new modules for functionality that already exists — extend or modify instead.',
+		'  6. Move logic between layers by rewriting the affected files (routes, controller, service, repository).',
+		'  7. When moving database logic from a route to a repository, update the route → controller → service → repository chain.',
+		'</repair_instructions>',
+	);
+
+	return lines.join('\n');
+}
+
+export function buildFERepairPrompt(issues: ValidationIssue[], filesModified: string[] = []): string {
+	const errors = issues.filter(i => i.severity === 'error');
+	if (errors.length === 0) return '';
+
+	const lines: string[] = [
+		'<validation_errors>',
+		'Frontend validation found TypeScript/React errors in the generated files:',
+		'',
+	];
+
+	for (const iss of errors) {
+		lines.push(`- [${iss.file || 'General'}] ${iss.message}`);
+	}
+
+	lines.push(
+		'',
+		'Rules:',
+		'  1. Always import React and all used hooks at the top: import React, { useState, useEffect } from "react";',
+		'  2. Never use undeclared variables, undefined functions, or missing packages (e.g. uuid, lodash, mock arrays). Define mock data locally in the component file.',
+		'  3. Re-emit ONLY the specific file(s) that have errors above as <file path="...">...</file> blocks.',
+		'  4. Do NOT re-emit files that are already completed and error-free.',
+		'</validation_errors>',
+		'',
+		'[Validator] repairing — output the corrected file(s) now.'
+	);
+
+	return lines.join('\n');
+}
+
