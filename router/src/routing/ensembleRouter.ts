@@ -68,25 +68,36 @@ export function ensembleRoute(
 	const { feScore: fkw, beScore: bkw } = scoreKeywords(msg);
 	console.log(`[Ensemble] Keyword/Pattern scores: FE=${fkw}, BE=${bkw} | advisor=${advisorIntent}`);
 
-	// --- 1. Pure frontend ---
+	// --- 1. Decisive Gap Winners from keyword/pattern scoring ---
+	// If one domain has an overwhelming advantage (e.g. FE=8, BE=2, difference >= 3 or ratio >= 2.5),
+	// it must NOT be hijacked into fullstack by an incidental keyword or noisy advisor output.
+	if (fkw >= 4 && (bkw === 0 || fkw >= bkw + 3 || fkw >= bkw * 2.5)) {
+		console.log(`[Ensemble] Overwhelming frontend signals (FE=${fkw}, BE=${bkw}) -> routing to frontend`);
+		return { intent: 'frontend', isCreate };
+	}
+	if (bkw >= 4 && (fkw === 0 || bkw >= fkw + 3 || bkw >= fkw * 2.5)) {
+		console.log(`[Ensemble] Overwhelming backend signals (BE=${bkw}, FE=${fkw}) -> routing to backend`);
+		return { intent: 'backend', isCreate };
+	}
+
+	// --- 2. Pure single-domain requests (one has signal, other is strictly 0) ---
 	if (fkw > 0 && bkw === 0) {
 		console.log(`[Ensemble] Pure frontend request (FE=${fkw}, BE=0) -> routing to frontend`);
 		return { intent: 'frontend', isCreate };
 	}
-
-	// --- 2. Pure backend ---
 	if (bkw > 0 && fkw === 0) {
 		console.log(`[Ensemble] Pure backend request (BE=${bkw}, FE=0) -> routing to backend`);
 		return { intent: 'backend', isCreate };
 	}
 
-	// --- 3. Fullstack ---
-	if (advisorIntent?.includes('fullstack') || (fkw > 0 && bkw > 0)) {
-		console.log('[Ensemble] Fullstack detected (Advisor=fullstack or FE>0 & BE>0) -> general');
+	// --- 3. Explicit Fullstack from Advisor ---
+	// Only route to fullstack if Advisor explicitly says fullstack AND signals are not strongly one-sided
+	if (advisorIntent?.includes('fullstack') && Math.abs(fkw - bkw) <= 2) {
+		console.log('[Ensemble] Confirmed fullstack (Advisor=fullstack with balanced signals) -> general');
 		return { intent: 'general', isCreate };
 	}
 
-	// --- 4. Mixed / Ambiguous signals ---
+	// --- 4. Mixed / Ambiguous signals -> fuse with Open File & Workspace context ---
 	let feScore = Math.min(fkw, 4);
 	let beScore = Math.min(bkw, 4);
 
@@ -110,13 +121,19 @@ export function ensembleRoute(
 
 	console.log(`[Ensemble] Final fused scores: FE=${feScore}, BE=${beScore}`);
 
+	// Clear gap winner from fused scoring
 	if (feScore >= beScore + 2) return { intent: 'frontend', isCreate };
 	if (beScore >= feScore + 2) return { intent: 'backend', isCreate };
 
-	if (feScore > 0 || beScore > 0) {
+	// Balanced signals where both are genuinely present -> fullstack
+	if (feScore >= 2 && beScore >= 2) {
 		console.log('[Ensemble] Balanced signals -> fullstack (general)');
 		return { intent: 'general', isCreate };
 	}
+
+	// Margin winner when signals are weak
+	if (feScore > beScore) return { intent: 'frontend', isCreate };
+	if (beScore > feScore) return { intent: 'backend', isCreate };
 
 	// Empty workspace app fallback
 	const isEmpty = backendFileCount === 0 && frontendFileCount === 0;

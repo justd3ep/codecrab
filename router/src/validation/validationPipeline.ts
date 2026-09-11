@@ -4,6 +4,8 @@
  * No commit path bypasses this.
  */
 
+import fs                                                             from 'fs';
+import path                                                           from 'path';
 import type { TempFile, GeneratedFile, ValidationResult, ExecutionGraph } from '../core/types.js';
 import type { ValidationContract }                                          from '../core/types.js';
 import type { GenerationEngine }                                            from '../generation/generationEngine.js';
@@ -55,6 +57,18 @@ export class ValidationPipeline {
 			const errors = result.issues.filter(i => i.severity === 'error');
 
 			if (errors.length === 0) {
+				if (result.files.length > 1) {
+					for (const extra of result.files.slice(1)) {
+						const absExtra = path.join(opts.workspaceRoot, extra.path);
+						if (!fs.existsSync(absExtra)) {
+							try {
+								fs.mkdirSync(path.dirname(absExtra), { recursive: true });
+								fs.writeFileSync(absExtra, extra.content, 'utf-8');
+								opts.committedPaths?.add(extra.path);
+							} catch { /* non-fatal */ }
+						}
+					}
+				}
 				this.bus.emit('validation:passed', { jobId: opts.jobId, node: file.path });
 				return { passed: true, file: result.files[0] ?? file, issues: result.issues as any, repairs };
 			}

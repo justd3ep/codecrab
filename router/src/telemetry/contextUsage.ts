@@ -7,6 +7,18 @@
 
 export const DEFAULT_CONTEXT_SIZE = 8192;
 
+export let effectiveContextSize = DEFAULT_CONTEXT_SIZE;
+
+export function setEffectiveContextSize(size: number) {
+	if (typeof size === 'number' && size > 0) {
+		effectiveContextSize = size;
+		activeContextUsage.total = size;
+		if (activeContextUsage.used > 0) {
+			activeContextUsage.percent = Math.min(100, Math.round((activeContextUsage.used / size) * 100));
+		}
+	}
+}
+
 export let activeContextUsage = {
 	used: 0,
 	total: DEFAULT_CONTEXT_SIZE,
@@ -15,7 +27,7 @@ export let activeContextUsage = {
 	lastUpdated: Date.now()
 };
 
-export function updateContextUsage(used: number, total: number = DEFAULT_CONTEXT_SIZE, model: string = 'qwen') {
+export function updateContextUsage(used: number, total: number = effectiveContextSize, model: string = 'qwen') {
 	activeContextUsage = {
 		used,
 		total,

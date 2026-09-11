@@ -134,9 +134,10 @@ export class CodeCrabLanguageModelProvider
 		const opts = _options as any;
 		const workspaceRoot = opts?.workspaceRoot as string | undefined;
 		const openFiles = opts?.openFiles as string[] | undefined;
+		const contextSize = opts?.contextSize as number | undefined;
 
 		// Create the async stream from the AI service
-		const tokenStream = this._aiService.chat(simplifiedMessages, context, token, workspaceRoot, openFiles);
+		const tokenStream = this._aiService.chat(simplifiedMessages, context, token, workspaceRoot, openFiles, contextSize);
 
 		// Wrap in VS Code's ILanguageModelChatResponse shape
 		const parts: IChatResponsePart[] = [];

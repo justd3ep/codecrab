@@ -52,12 +52,12 @@ const ARCH_FOLDERS_MAP: Record<string, string[]> = {
 	flat: [],
 };
 
-export function buildPlannerContract(msg: string, advisorIntent: string): PlannerContract {
+export function buildPlannerContract(msg: string, advisorIntent: string, userScope?: UserScope): PlannerContract {
 	// Scope
 	const scope: PlannerContract['scope'] =
-		advisorIntent.includes('fullstack') ? 'fullstack'
-			: advisorIntent.includes('fe') ? 'frontend'
-				: advisorIntent.includes('be') ? 'backend'
+		userScope === 'FRONTEND_ONLY' || advisorIntent.includes('fe') ? 'frontend'
+			: userScope === 'BACKEND_ONLY' || advisorIntent.includes('be') ? 'backend'
+				: advisorIntent.includes('fullstack') ? 'fullstack'
 					: 'fullstack';
 
 	// Architecture

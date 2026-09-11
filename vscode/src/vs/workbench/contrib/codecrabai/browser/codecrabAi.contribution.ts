@@ -8,6 +8,7 @@
 import '../common/codecrabAiService.js';
 import '../common/codecrabRouterClient.js';
 import '../common/codecrabLanguageModel.js';
+import '../common/codecrabConfiguration.js';
 
 // Browser-side contributions
 import './codecrabInlineCompletions.js';

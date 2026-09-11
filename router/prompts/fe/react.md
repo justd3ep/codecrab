@@ -31,6 +31,13 @@ Never:
 - Import CSS from index.html.
 - Use ReactDOM.render (use createRoot).
 - Mix CRA and Vite conventions.
+- Use undefined or unimported icon components (e.g. IconSend, IconX, CalendarIcon). Import them directly from lucide-react (e.g. import { Send, X, Calendar } from 'lucide-react';) or use inline SVGs.
+- Render subcomponents in src/App.tsx without an import statement at the top.
+- Call React hooks (useState, useEffect) conditionally or after an early return.
+- Place setTimeout or setInterval directly inside component render functions (always wrap inside useEffect with cleanup).
+- Hardcode static message lists when interactive chat or state management is requested.
+- Import from "@/utils/..." or "@/lib/..." (e.g. "@/utils/currency") unless you generate that exact file in this response (always inline helpers like formatCurrency directly in the component).
+- Generate phantom wrapper components like MainView in src/App.tsx unless you output MainView.tsx in this response. App.tsx must directly import and assemble all generated subcomponents.
 
 Self-check before output:
 

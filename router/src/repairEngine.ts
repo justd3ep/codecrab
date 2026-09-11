@@ -538,7 +538,7 @@ export function buildTargetedRepairPrompt(
 		}
 		for (const [file, fileIssues] of byFile) {
 			const exists = file !== 'unknown' && fileExists(file, generatedSet, workspaceRoot);
-			lines.push(`  ${exists ? '📝 MODIFY' : '❓ FIX'}: ${file}`);
+			lines.push(`  ${exists ? 'MODIFY' : 'FIX'}: ${file}`);
 			fileIssues.forEach(i => lines.push(`    - ${i.message}`));
 		}
 		lines.push('');
@@ -548,7 +548,7 @@ export function buildTargetedRepairPrompt(
 	if (genIssues.length > 0) {
 		lines.push('### GENERATE (create ONLY these missing files — no other new files)');
 		for (const iss of genIssues) {
-			lines.push(`  📄 ${iss.message}`);
+			lines.push(`  - ${iss.message}`);
 			if (iss.file && fileExists(iss.file, generatedSet, workspaceRoot)) {
 				lines.push(`    → Also update imports in: ${iss.file}`);
 			}
@@ -561,7 +561,7 @@ export function buildTargetedRepairPrompt(
 		lines.push('### REWIRE IMPORTS (fix import paths — do not restructure logic)');
 		for (const iss of rewireIssues) {
 			const file = iss.file ?? '';
-			lines.push(`  🔗 ${file}: ${iss.message}`);
+			lines.push(`  - ${file}: ${iss.message}`);
 		}
 		lines.push('');
 	}
@@ -570,7 +570,7 @@ export function buildTargetedRepairPrompt(
 	if (deleteIssues.length > 0) {
 		lines.push('### CONSOLIDATE (remove duplicate logic — reuse existing modules)');
 		for (const iss of deleteIssues) {
-			lines.push(`  🗑️  ${iss.file ?? ''}: ${iss.message}`);
+			lines.push(`  - ${iss.file ?? ''}: ${iss.message}`);
 			lines.push(`    → Reuse existing module. Do NOT create a parallel implementation.`);
 		}
 		lines.push('');
@@ -580,7 +580,7 @@ export function buildTargetedRepairPrompt(
 	if (secIssues.length > 0) {
 		lines.push('### SECURITY FIXES (patch existing files only)');
 		for (const iss of secIssues) {
-			lines.push(`  🔒 ${iss.file ?? ''}: ${iss.message}`);
+			lines.push(`  - ${iss.file ?? ''}: ${iss.message}`);
 		}
 		lines.push('');
 	}
@@ -595,7 +595,7 @@ export function buildTargetedRepairPrompt(
 			byFile.get(key)!.push(iss);
 		}
 		for (const [file, fileIssues] of byFile) {
-			lines.push(`  📝 MODIFY: ${file}`);
+			lines.push(`  MODIFY: ${file}`);
 			fileIssues.forEach(i => lines.push(`    - ${i.message}`));
 		}
 		lines.push('');

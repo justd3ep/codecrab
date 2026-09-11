@@ -28,8 +28,8 @@ import { RecoveryManager }  from './jobs/recoveryManager.js';
 import { makeJobRoutes }    from './router/jobRoutes.js';
 import { makeHealthRoutes } from './router/healthRoutes.js';
 import config               from '@/config/index.js';
-import { activeContextUsage, updateContextUsage, DEFAULT_CONTEXT_SIZE } from './telemetry/contextUsage.js';
-import { ensureFrontendScaffold } from './frontendScaffold.js';
+import { activeContextUsage, updateContextUsage, setEffectiveContextSize, effectiveContextSize } from './telemetry/contextUsage.js';
+import { ensureFrontendScaffold, ensureBackendScaffold, mergePackageJson, mergeInitSh } from './frontendScaffold.js';
 import { runAdvisorProjectSummary } from './routing/intentClassifier.js';
 
 // ---------------------------------------------------------------------------
@@ -44,22 +44,42 @@ const BACKEND_ONLY_PATTERNS = [
 	/\bapi[\s-]?only\b/i, /\bno\s+frontend\b/i, /\bwithout\s+frontend\b/i,
 	/\bexpress\s+backend\b/i, /\bnestjs\s+backend\b/i,
 	/\bno\s+react\b/i, /\bno\s+ui\b/i,
+	// Natural language backend requests
+	/\b(?:build|create|implement|make)\s+(?:a\s+)?(?:[\w-]+\s+){0,3}(?:rest\s+|server\s+)?backend\b/i,
+	/\bbackend\s+for\b/i,
+	/\bbackend\s+(?:service|server|api|application)\b/i,
+	/\bonly\s+(?:the\s+)?(?:backend|server|api)\b/i,
 ];
 const FRONTEND_ONLY_PATTERNS = [
 	/\bfrontend[\s-]?only\b/i, /\breact[\s-]?only\b/i,
 	/\bnext\.?js[\s-]?only\b/i, /\bui[\s-]?only\b/i,
 	/\bcomponent[\s-]?only\b/i, /\bno\s+backend\b/i,
 	/\bwithout\s+backend\b/i, /\bno\s+server\b/i, /\bno\s+api\b/i,
+	// Natural language frontend requests
+	/\b(?:build|create|implement|make|design)\s+(?:a\s+)?(?:[\w-]+\s+){0,3}(?:dashboard\s+|web\s+)?frontend\b/i,
+	/\bfrontend\s+for\b/i,
+	/\bfrontend\s+(?:dashboard|app|application|ui|interface|client)\b/i,
+	/\bclient[\s-]?side\b/i,
+	/\bfrontend\s+code\b/i,
+	/\bonly\s+(?:the\s+)?(?:frontend|ui)\b/i,
+	/\buse\s+mock\s+(?:data|api|functions)\b/i,
 ];
 
 function parseUserScope(msg: string): UserScope {
-	if (BACKEND_ONLY_PATTERNS.some(p => p.test(msg))) {
-		console.log('[ConstraintParser] Scope: BACKEND_ONLY');
-		return 'BACKEND_ONLY';
+	const isFullStack = /\bfull[\s-]?stack\b/i.test(msg) ||
+		(/\b(?:frontend|react|ui|client)\b/i.test(msg) && /\b(?:backend|server|express|nestjs|database)\b/i.test(msg));
+
+	if (isFullStack) {
+		return 'ANY';
 	}
+
 	if (FRONTEND_ONLY_PATTERNS.some(p => p.test(msg))) {
 		console.log('[ConstraintParser] Scope: FRONTEND_ONLY');
 		return 'FRONTEND_ONLY';
+	}
+	if (BACKEND_ONLY_PATTERNS.some(p => p.test(msg))) {
+		console.log('[ConstraintParser] Scope: BACKEND_ONLY');
+		return 'BACKEND_ONLY';
 	}
 	return 'ANY';
 }
@@ -111,12 +131,13 @@ const ARCH_FOLDERS_MAP: Record<string, string[]> = {
 	flat: [],
 };
 
-function buildPlannerContract(msg: string, advisorIntent: string): PlannerContract {
+function buildPlannerContract(msg: string, advisorIntent: string, userScope?: UserScope): PlannerContract {
 	// Scope
+	const resolvedScope = userScope || parseUserScope(msg);
 	const scope: PlannerContract['scope'] =
-		advisorIntent.includes('fullstack') ? 'fullstack'
-			: advisorIntent.includes('fe') ? 'frontend'
-				: advisorIntent.includes('be') ? 'backend'
+		resolvedScope === 'FRONTEND_ONLY' || advisorIntent.includes('fe') ? 'frontend'
+			: resolvedScope === 'BACKEND_ONLY' || advisorIntent.includes('be') ? 'backend'
+				: advisorIntent.includes('fullstack') ? 'fullstack'
 					: 'fullstack';
 
 	// Architecture
@@ -356,7 +377,7 @@ function buildTargetedRepairPrompt(
 		}
 		for (const [file, fileIssues] of byFile) {
 			const exists = file !== 'unknown' && fileExists(file, generatedSet, workspaceRoot);
-			lines.push(`  ${exists ? '📝 MODIFY' : '❓ FIX'}: ${file}`);
+			lines.push(`  ${exists ? 'MODIFY' : 'FIX'}: ${file}`);
 			fileIssues.forEach(i => lines.push(`    - ${i.message}`));
 		}
 		lines.push('');
@@ -367,7 +388,7 @@ function buildTargetedRepairPrompt(
 	if (genIssues.length > 0) {
 		lines.push('### GENERATE (create ONLY these missing files — no other new files)');
 		for (const iss of genIssues) {
-			lines.push(`  📄 ${iss.message}`);
+			lines.push(`  - ${iss.message}`);
 			// If related files need updating, list them
 			if (iss.file && fileExists(iss.file, generatedSet, workspaceRoot)) {
 				lines.push(`    → Also update imports in: ${iss.file}`);
@@ -382,7 +403,7 @@ function buildTargetedRepairPrompt(
 		lines.push('### REWIRE IMPORTS (fix import paths — do not restructure logic)');
 		for (const iss of rewireIssues) {
 			const file = iss.file ?? '';
-			lines.push(`  🔗 ${file}: ${iss.message}`);
+			lines.push(`  - ${file}: ${iss.message}`);
 		}
 		lines.push('');
 	}
@@ -392,7 +413,7 @@ function buildTargetedRepairPrompt(
 	if (deleteIssues.length > 0) {
 		lines.push('### CONSOLIDATE (remove duplicate logic — reuse existing modules)');
 		for (const iss of deleteIssues) {
-			lines.push(`  🗑️  ${iss.file ?? ''}: ${iss.message}`);
+			lines.push(`  - ${iss.file ?? ''}: ${iss.message}`);
 			lines.push(`    → Reuse existing module. Do NOT create a parallel implementation.`);
 		}
 		lines.push('');
@@ -403,7 +424,7 @@ function buildTargetedRepairPrompt(
 	if (secIssues.length > 0) {
 		lines.push('### SECURITY FIXES (patch existing files only)');
 		for (const iss of secIssues) {
-			lines.push(`  🔒 ${iss.file ?? ''}: ${iss.message}`);
+			lines.push(`  - ${iss.file ?? ''}: ${iss.message}`);
 		}
 		lines.push('');
 	}
@@ -413,7 +434,7 @@ function buildTargetedRepairPrompt(
 	if (compileIssues.length > 0) {
 		lines.push('### COMPILE ERRORS (fix type errors — do not restructure)');
 		for (const iss of compileIssues) {
-			lines.push(`  ⚠️  ${iss.file ?? ''}: ${iss.message}`);
+			lines.push(`  - ${iss.file ?? ''}: ${iss.message}`);
 		}
 		lines.push('');
 	}
@@ -931,16 +952,15 @@ async function runAdvisor(userRequest: string, v2 = false): Promise<any> {
 	}
 	try {
 		const advisorModel = await mm.acquire('advisor');
-		// 512 ctx: system(~240 tok) + user(~20 tok) + template(~30 tok) + response(~10 tok) = ~300 tok, fits
-		const advisorCtx = await advisorModel.createContext({ contextSize: 512 });
+		// 2048 ctx: ample room for system prompt (~400 tok), multi-paragraph user requests (~300 tok), and JSON output (~200 tok)
+		const advisorCtx = await advisorModel.createContext({ contextSize: 2048 });
 		const seq = advisorCtx.getSequence();
 
 		// Build Qwen3 chat template + /no_think to suppress chain-of-thought mode.
 		// Pre-filling <think>\n\n</think> forces the model to skip reasoning and output JSON directly.
-		// planner.md is now ~50 tokens; total input fits well within 512-token context.
 		const fullPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n<|im_start|>user\n${userRequest} /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n`;
 		const inputTokens = advisorModel.tokenize(fullPrompt);
-		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 512`);
+		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 2048`);
 
 		// evaluate(inputTokens) both evals the prompt AND generates next tokens.
 		// For V2, we allow up to 500 chars (rich JSON is larger than {"intent":"..."})
@@ -1024,6 +1044,15 @@ function scoreKeywords(msg: string): { feScore: number; beScore: number } {
 	let feScore = 0;
 	let beScore = 0;
 
+	// Sanitize mock/client API mentions so they do not falsely trigger BE_SERVER_PATTERN
+	const beMsg = msg
+		.replace(/\b(?:mock|dummy|fake|stub|client-side|call|fetch)\s+(?:data[\s/]+)?api(?:s|\b)/gi, '')
+		.replace(/\bapi\s+(?:client|mock|functions?|endpoints?\s+mock)\b/gi, '');
+
+	if (/\b(?:mock\s+(?:data[\s/]+)?api|dummy\s+api|fake\s+api|mock\s+data|mock\s+functions?)\b/i.test(msg)) {
+		feScore += 2;
+	}
+
 	if (UI_COMPONENT_PATTERN.test(msg)) feScore += 2;
 	if (UI_INTERACTION_PATTERN.test(msg)) feScore += 1;
 	if (UI_DESIGN_PATTERN.test(msg)) feScore += 2;
@@ -1032,9 +1061,9 @@ function scoreKeywords(msg: string): { feScore: number; beScore: number } {
 	// High-signal UI keywords / phrases
 	if (/\b(?:kanban|trello|drag\s+and\s+drop|dark\s+mode|dashboard|responsive)\b/i.test(msg)) feScore += 2;
 
-	if (BE_DB_PATTERN.test(msg)) beScore += 2;
-	if (BE_SERVER_PATTERN.test(msg)) beScore += 2;
-	if (BE_AUTH_INFRA_PATTERN.test(msg)) beScore += 2;
+	if (BE_DB_PATTERN.test(beMsg)) beScore += 2;
+	if (BE_SERVER_PATTERN.test(beMsg)) beScore += 2;
+	if (BE_AUTH_INFRA_PATTERN.test(beMsg)) beScore += 2;
 
 	return { feScore, beScore };
 }
@@ -1108,21 +1137,32 @@ function ensembleRoute(
 	const { feScore: fkw, beScore: bkw } = scoreKeywords(msg);
 	console.log(`[Ensemble] Keyword/Pattern scores: FE=${fkw}, BE=${bkw} | advisor=${advisorIntent}`);
 
-	// --- 1. Pure frontend request (UI patterns present, ZERO backend patterns in prompt) ---
+	// --- 1. Decisive Gap Winners from keyword/pattern scoring ---
+	// If one domain has an overwhelming advantage (e.g. FE=8, BE=2, difference >= 3 or ratio >= 2.5),
+	// it must NOT be hijacked into fullstack by an incidental keyword or noisy advisor output.
+	if (fkw >= 4 && (bkw === 0 || fkw >= bkw + 3 || fkw >= bkw * 2.5)) {
+		console.log(`[Ensemble] Overwhelming frontend signals (FE=${fkw}, BE=${bkw}) -> routing to frontend`);
+		return { intent: 'frontend', isCreate };
+	}
+	if (bkw >= 4 && (fkw === 0 || bkw >= fkw + 3 || bkw >= fkw * 2.5)) {
+		console.log(`[Ensemble] Overwhelming backend signals (BE=${bkw}, FE=${fkw}) -> routing to backend`);
+		return { intent: 'backend', isCreate };
+	}
+
+	// --- 2. Pure single-domain requests (one has signal, other is strictly 0) ---
 	if (fkw > 0 && bkw === 0) {
 		console.log(`[Ensemble] Pure frontend request (FE=${fkw}, BE=0) -> routing to frontend`);
 		return { intent: 'frontend', isCreate };
 	}
-
-	// --- 2. Pure backend request (BE patterns present, ZERO frontend patterns in prompt) ---
 	if (bkw > 0 && fkw === 0) {
 		console.log(`[Ensemble] Pure backend request (BE=${bkw}, FE=0) -> routing to backend`);
 		return { intent: 'backend', isCreate };
 	}
 
-	// --- 3. Fullstack: Advisor explicitly says fullstack or both domains have strong signals ---
-	if (advisorIntent?.includes('fullstack') || (fkw > 0 && bkw > 0)) {
-		console.log('[Ensemble] Fullstack detected (Advisor=fullstack or FE>0 & BE>0) -> general');
+	// --- 3. Explicit Fullstack from Advisor ---
+	// Only route to fullstack if Advisor explicitly says fullstack AND signals are not strongly one-sided
+	if (advisorIntent?.includes('fullstack') && Math.abs(fkw - bkw) <= 2) {
+		console.log('[Ensemble] Confirmed fullstack (Advisor=fullstack with balanced signals) -> general');
 		return { intent: 'general', isCreate };
 	}
 
@@ -1155,10 +1195,15 @@ function ensembleRoute(
 	if (feScore >= beScore + 2) return { intent: 'frontend', isCreate };
 	if (beScore >= feScore + 2) return { intent: 'backend', isCreate };
 
-	if (feScore > 0 || beScore > 0) {
+	// Balanced signals where both are genuinely present -> fullstack
+	if (feScore >= 2 && beScore >= 2) {
 		console.log('[Ensemble] Balanced signals -> fullstack (general)');
 		return { intent: 'general', isCreate };
 	}
+
+	// Margin winner when signals are weak
+	if (feScore > beScore) return { intent: 'frontend', isCreate };
+	if (beScore > feScore) return { intent: 'backend', isCreate };
 
 	// Empty workspace app fallback
 	const isEmpty = backendFileCount === 0 && frontendFileCount === 0;
@@ -1387,6 +1432,7 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		api: ['axios', 'fetch', 'api', 'endpoint', 'request', 'mutation', 'query', 'backend', 'auth', 'jwt'],
 		routing: ['page', 'dashboard', 'login page', 'navigate', 'route', 'layout', 'protected route'],
 		state: ['zustand', 'redux', 'store', 'context', 'provider', 'global state'],
+		kanban: ['kanban', 'trello', 'drag and drop', 'dnd'],
 		table: ['table', 'grid', 'column', 'pagination', 'datatable'],
 		chart: ['chart', 'graph', 'analytics', 'dashboard metrics', 'pie', 'bar', 'line'],
 	};
@@ -1863,6 +1909,10 @@ function validateJsxSymbols(
 		while ((m = jsxTagRe.exec(content)) !== null) {
 			if (m[1]) usedComponents.add(m[1]);
 		}
+		const iconRefRe = /\b(Icon[A-Z][A-Za-z0-9]*)\b/g;
+		while ((m = iconRefRe.exec(content)) !== null) {
+			if (m[1]) usedComponents.add(m[1]);
+		}
 
 		// ── Extract imported symbols → importPath ───────────────────────────
 		const importedSymbols = new Map<string, string>(); // symbol → raw import path
@@ -1899,10 +1949,15 @@ function validateJsxSymbols(
 
 			// Check 2 & 3: import path must resolve to a real file
 			const importPath = importedSymbols.get(comp)!;
-			if (!importPath.startsWith('.')) continue; // skip node_modules
-
-			const fileDir = path.dirname(filePath).replace(/\\/g, '/');
-			const resolvedBase = path.normalize(path.join(fileDir, importPath)).replace(/\\/g, '/');
+			let resolvedBase: string;
+			if (importPath.startsWith('@/') || importPath.startsWith('~/')) {
+				resolvedBase = path.normalize(path.join('src', importPath.slice(2))).replace(/\\/g, '/');
+			} else if (importPath.startsWith('.')) {
+				const fileDir = path.dirname(filePath).replace(/\\/g, '/');
+				resolvedBase = path.normalize(path.join(fileDir, importPath)).replace(/\\/g, '/');
+			} else {
+				continue; // skip node_modules
+			}
 
 			const existsInResponse = RESOLVE_EXTS.some(e =>
 				responsePathsRel.has(resolvedBase + e) || responsePathsRel.has(resolvedBase),
@@ -2625,7 +2680,7 @@ function executeToolCall(
 					return { success: false, output: `Path Error: ${pathValidation.error}` };
 				}
 
-				const content = tool.arguments.content || '';
+				let content = tool.arguments.content || '';
 				const validation = validateContentForExtension(resolvedPath, content, intent);
 				if (!validation.valid) {
 					return { success: false, output: `Validation Error: ${validation.error}` };
@@ -2637,6 +2692,24 @@ function executeToolCall(
 				const dir = path.dirname(resolvedPath);
 				if (!fs.existsSync(dir)) {
 					fs.mkdirSync(dir, { recursive: true });
+				}
+
+				// Safe merging protection for package.json and init.sh
+				const baseName = path.basename(resolvedPath).toLowerCase();
+				if (baseName === 'package.json' && oldContent.trim()) {
+					try {
+						content = mergePackageJson(oldContent, content);
+						console.log(`[Writer] Merged package.json with existing dependencies`);
+					} catch (e: any) {
+						console.warn(`[Writer] Warning merging package.json: ${e?.message || e}`);
+					}
+				} else if (baseName === 'init.sh' && oldContent.trim()) {
+					try {
+						content = mergeInitSh(oldContent, content);
+						console.log(`[Writer] Merged init.sh with existing setup script`);
+					} catch (e: any) {
+						console.warn(`[Writer] Warning merging init.sh: ${e?.message || e}`);
+					}
 				}
 
 				// ─── Pipeline SHA trace (Stage 5–6) ───────────────────────────────
@@ -2718,26 +2791,21 @@ interface PipelineEvent {
 	used?: number;
 	total?: number;
 	percent?: number;
+	model?: string;
 }
 
 /** Emit a structured progress event. Renders as markdown in existing chat UI;
  *  also carries typed `event` metadata for future frontend parsing. */
 function streamEvent(res: express.Response, evt: PipelineEvent): void {
 	if (evt.type === 'context_usage') {
-		res.write(JSON.stringify({ type: 'context_usage', used: evt.used, total: evt.total, percent: evt.percent }) + '\n');
+		res.write(JSON.stringify({ type: 'context_usage', used: evt.used, total: evt.total, percent: evt.percent, model: evt.model }) + '\n');
 		return;
 	}
 	const icon =
-		evt.type === 'success' ? '✅'
-			: evt.type === 'error' ? '❌'
-				: evt.type === 'warning' ? '⚠️'
-					: evt.stage === 'read' ? '🔍'
-						: evt.stage === 'plan' ? '🗺️'
-							: evt.stage === 'generate' || evt.stage === 'write' ? '⚙️'
-								: evt.stage === 'validate' ? '🔬'
-									: evt.stage === 'repair' ? '🔧'
-										: evt.stage === 'complete' ? '✅'
-											: '•';
+		evt.type === 'success' ? '✓'
+			: evt.type === 'error' ? '✗'
+				: evt.type === 'warning' ? '!'
+					: '•';
 	const markdown = `${icon} ${evt.message}\n`;
 	res.write(JSON.stringify({ message: { content: markdown }, event: evt }) + '\n');
 }
@@ -2796,7 +2864,21 @@ function detectRepetitionLoop(text: string): { detected: boolean; reason?: strin
 		const windowLen = recentText.length;
 		const tail3 = allMatches.slice(-3);
 		const allInTail = tail3.every(idx => idx >= windowLen * 0.4);
-		if (allInTail) {
+		if (!allInTail) continue;
+
+		// Distinctness check: In a genuine loop, the text between consecutive matches is identical
+		// (e.g. repeating the exact same block). In legitimate repetitive code (like <Select.Item value="a">,
+		// <Select.Item value="b">, <td className="...">, etc.), the segments between matches contain
+		// different attributes and text. Require at least 3 consecutive identical inter-match segments.
+		let consecutiveIdentical = 0;
+		for (let i = 1; i < allMatches.length - 1; i++) {
+			const segPrev = recentText.substring(allMatches[i - 1]!, allMatches[i]!);
+			const segCurrent = recentText.substring(allMatches[i]!, allMatches[i + 1]!);
+			if (segPrev === segCurrent && segCurrent.length >= suffix.length) {
+				consecutiveIdentical++;
+			}
+		}
+		if (consecutiveIdentical >= 3) {
 			return { detected: true, reason: `Suffix loop: "${suffix}" repeated ${allMatches.length} times in recent output` };
 		}
 	}
@@ -2985,11 +3067,23 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 	try {
 		const workspaceRoot = req.body.workspaceRoot || config.workspace.defaultRoot;
-		const { messages, stream, openFiles } = req.body;
+		const { messages, stream, openFiles, contextSize: rawContextSize } = req.body;
 		const hasWorkspace = workspaceRoot && fs.existsSync(workspaceRoot);
 
+		const requestedContextSize = Math.max(
+			1024,
+			Math.min(
+				65536,
+				Number(rawContextSize) ||
+				Number(process.env.CODECRAB_CONTEXT_SIZE) ||
+				config.generation.contextSize ||
+				8192
+			)
+		);
+		setEffectiveContextSize(requestedContextSize);
+
 		console.log(`\n[Router] ========== INCOMING REQUEST ==========`);
-		console.log(`[Router] Messages: ${messages?.length || 0}, workspace: ${workspaceRoot || 'none'}, openFiles: ${openFiles?.length || 0}`);
+		console.log(`[Router] Messages: ${messages?.length || 0}, workspace: ${workspaceRoot || 'none'}, openFiles: ${openFiles?.length || 0}, contextSize: ${requestedContextSize}`);
 
 		// ---------------------------------------------------------------
 		// SERVER-SIDE CONTEXT GATHERING
@@ -3147,7 +3241,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 		const rawAdvisorIntent: string = advisorIntent ?? ensembledIntent;
 
 		// --- PLANNER CONTRACT (deterministic, no model call) ---
-		const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent);
+		const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent, userScope);
 		const validationContract = plannerContractToValidationContract(plannerContract, userScope);
 
 		// filesModified is shared between incremental engine and the monolithic fallback loop
@@ -3161,6 +3255,16 @@ app.post('/v1/chat/completions', async (req, res) => {
 		// ---------------------------------------------------------------
 		if (readWriteMode !== 'read' && hasWorkspace && advisorSaysCreate && intent !== 'frontend') {
 			try {
+				// ── 0. Bootstrap backend foundation files if create mode ───
+				if (workspaceRoot) {
+					const beBootstrapped = ensureBackendScaffold(workspaceRoot, lastUserMsg);
+					for (const f of beBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+					if (beBootstrapped.length > 0) {
+						try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
+						console.log(`[Router] VNext pipeline bootstrapped ${beBootstrapped.length} backend foundation files.`);
+					}
+				}
+
 				// ── 1. Workspace inspection ────────────────────────────────
 				const plannedModules = advisorV2Result?.modules ?? plannerContract.requiredFolders;
 				const inspection = inspectWorkspace(workspaceRoot, plannedModules);
@@ -3201,7 +3305,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 					res.setHeader('Content-Type', 'text/event-stream');
 					res.setHeader('Cache-Control', 'no-cache');
 					res.setHeader('Connection', 'keep-alive');
-					streamChunk(res, `🦀 **Workspace**\n\n`);
+					streamChunk(res, `**Workspace**\n\n`);
 					streamEvent(res, { type: 'info', stage: 'read', message: 'Reading workspace...' });
 					if (pkgContent) streamEvent(res, { type: 'success', stage: 'read', message: 'package.json loaded' });
 					if (openFiles && openFiles.length > 0) streamEvent(res, { type: 'success', stage: 'read', message: `${openFiles.length} open file(s) loaded` });
@@ -3217,6 +3321,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 						validationContract,
 						res,
 						signal: controller.signal,
+						contextSize: requestedContextSize,
 						maxTokensPerFile: MAX_TOKENS,
 						onFileCommitted(node, content) {
 							if (!filesModified.includes(node.path)) filesModified.push(node.path);
@@ -3268,7 +3373,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 					const feMode = determineMode(lastUserMsg, 'fe', backendFileCount, frontendFileCount);
 					const feActiveFile = openFiles?.[0];
 					const feSysPromptI = buildSystemPrompt(lastUserMsg, hasWorkspace, feMode, 'fe', feActiveFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
-					const feCtxIncr = await feModelIncr.createContext({ contextSize: 4096 });
+					const feCtxIncr = await feModelIncr.createContext({ contextSize: requestedContextSize });
 					context = feCtxIncr;
 					const feSessionIncr = new LlamaChatSession({ contextSequence: feCtxIncr.getSequence(), systemPrompt: feSysPromptI });
 
@@ -3283,18 +3388,44 @@ app.post('/v1/chat/completions', async (req, res) => {
 					].filter(Boolean).join('\n\n');
 
 					const feInitFilesI = filesModified.length;
-					// streamEvent(res, { type: 'progress', stage: 'generate', message: 'Generating frontend files...' });
+					try {
+						const promptTok = feModelIncr ? feModelIncr.tokenize(feSysPromptI + '\n' + fePromptIncr).length : 0;
+						const initTok = Math.max(feSessionIncr?.sequence?.nextTokenIndex || 0, promptTok);
+						updateContextUsage(initTok, requestedContextSize, 'frontend');
+						streamEvent(res, { type: 'context_usage', used: initTok, total: requestedContextSize, percent: Math.min(100, Math.round((initTok / requestedContextSize) * 100)), model: 'frontend' });
+					} catch {}
+
 					for (let feI = 0; feI < MAX_AGENT_ITERATIONS; feI++) {
 						if (controller.signal.aborted) break;
 						let feRespI = '';
+						let feChunkCountI = 0;
 						await feSessionIncr.prompt(feI === 0 ? fePromptIncr : fePromptIncr, {
 							maxTokens: MAX_TOKENS,
 							repeatPenalty: { penalty: REPEAT_PENALTY, lastTokens: REPEAT_PENALTY_TOKENS, penalizeNewLine: false },
 							signal: controller.signal,
 							stopOnAbortSignal: true,
 							// Buffer internally — raw model tokens are never sent to chat
-							onTextChunk(chunk) { feRespI += chunk; },
+							onTextChunk(chunk) {
+								feRespI += chunk;
+								feChunkCountI++;
+								if (feChunkCountI % 12 === 0) {
+									try {
+										const liveTok = feSessionIncr?.sequence?.nextTokenIndex || 0;
+										if (liveTok > 0) {
+											updateContextUsage(liveTok, requestedContextSize, 'frontend');
+											streamEvent(res, { type: 'context_usage', used: liveTok, total: requestedContextSize, percent: Math.min(100, Math.round((liveTok / requestedContextSize) * 100)), model: 'frontend' });
+										}
+									} catch {}
+								}
+							},
 						});
+						try {
+							const finTok = feSessionIncr?.sequence?.nextTokenIndex || 0;
+							if (finTok > 0) {
+								updateContextUsage(finTok, requestedContextSize, 'frontend');
+								streamEvent(res, { type: 'context_usage', used: finTok, total: requestedContextSize, percent: Math.min(100, Math.round((finTok / requestedContextSize) * 100)), model: 'frontend' });
+							}
+						} catch {}
 						if (!workspaceRoot) break;
 						const feEdits = extractFallbackEdits(feRespI, openFiles, workspaceRoot, lastUserMsg, feMode);
 						if (feEdits.length > 0) {
@@ -3358,19 +3489,26 @@ app.post('/v1/chat/completions', async (req, res) => {
 		// Compute mode for this specialist independently
 		let mode = determineMode(lastUserMsg, currentSpecialist, backendFileCount, frontendFileCount);
 
-		// Auto-scaffold frontend foundation files on create mode (package.json, index.html, init.sh, features.json, progress.txt)
+		// Auto-scaffold foundation files on create mode (package.json, tsconfig.json, init.sh, features.json, progress.txt)
 		let bootstrappedCount = 0;
-		if (workspaceRoot && (mode === 'create' || advisorSaysCreate) && (intent === 'frontend' || (intent === 'general' && promptNeedsFrontend(lastUserMsg)))) {
-			const bootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
-			bootstrappedCount = bootstrapped.length;
-			if (bootstrapped.length > 0) {
-				for (const f of bootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
-				if (!pkgContent) {
-					try {
-						pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8');
-					} catch { /* ignore */ }
-				}
-				console.log(`[Router] Initializer bootstrapped ${bootstrapped.length} frontend foundation files.`);
+		if (workspaceRoot && (mode === 'create' || advisorSaysCreate)) {
+			// Backend scaffolding when BE is active or prompt has backend/general intent
+			if (currentSpecialist === 'be' || intent === 'backend' || intent === 'general') {
+				const beBootstrapped = ensureBackendScaffold(workspaceRoot, lastUserMsg);
+				bootstrappedCount += beBootstrapped.length;
+				for (const f of beBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+			}
+			// Frontend scaffolding when FE is active or prompt has frontend signals
+			if (currentSpecialist === 'fe' || intent === 'frontend' || (intent === 'general' && promptNeedsFrontend(lastUserMsg))) {
+				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
+				bootstrappedCount += feBootstrapped.length;
+				for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+			}
+			if (bootstrappedCount > 0) {
+				try {
+					pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8');
+				} catch { /* ignore */ }
+				console.log(`[Router] Initializer bootstrapped ${bootstrappedCount} foundation files.`);
 			}
 		}
 
@@ -3379,12 +3517,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 		const activeFile = openFiles && openFiles.length > 0 ? openFiles[0] : undefined;
 		let systemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, currentSpecialist, activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
 
-		context = await activeModel.createContext({ contextSize: 8192 });
+		context = await activeModel.createContext({ contextSize: requestedContextSize });
 		let session = new LlamaChatSession({
 			contextSequence: context.getSequence(),
 			systemPrompt: systemPrompt,
 		});
-		const activeContextSize = (context as any)?.contextSize || 8192;
+		const activeContextSize = (context as any)?.contextSize || requestedContextSize;
 
 		// Load prior conversation history
 		const history: Array<{ type: 'user'; text: string } | { type: 'model'; response: string[] }> = [];
@@ -3411,21 +3549,23 @@ app.post('/v1/chat/completions', async (req, res) => {
 		try {
 			const promptTokens = activeModel ? activeModel.tokenize(systemPrompt + '\n' + enrichedLastMessage).length : 0;
 			const initialTokens = Math.max(session?.sequence?.nextTokenIndex || 0, promptTokens);
-			updateContextUsage(initialTokens, activeContextSize, currentSpecialist);
+			const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
+			updateContextUsage(initialTokens, activeContextSize, modelLabel);
 			streamEvent(res, {
 				type: 'context_usage',
 				used: initialTokens,
 				total: activeContextSize,
-				percent: Math.min(100, Math.round((initialTokens / activeContextSize) * 100))
+				percent: Math.min(100, Math.round((initialTokens / activeContextSize) * 100)),
+				model: modelLabel
 			});
-			console.log(`[Router] Initial context usage: ${initialTokens}/${activeContextSize} tokens (${Math.round((initialTokens / activeContextSize) * 100)}%)`);
+			console.log(`[Router] Initial context usage (${modelLabel}): ${initialTokens}/${activeContextSize} tokens (${Math.round((initialTokens / activeContextSize) * 100)}%)`);
 		} catch (e) {
 			console.warn('[Router] Failed to emit initial context usage:', e);
 		}
 
 		const modelNames: Record<string, string> = { be: 'Backend Specialist', fe: 'Frontend Specialist' };
 		const activeName = modelNames[mm.status.activeKey || ''] || 'Base Model';
-		streamChunk(res, `🦀 **Workspace**\n\n`);
+		streamChunk(res, `**Workspace**\n\n`);
 		const showRawOutput = isExplicitCodeRequest(lastUserMsg) || readWriteMode === 'read';
 
 		// Pipeline: read stage
@@ -3522,19 +3662,21 @@ app.post('/v1/chat/completions', async (req, res) => {
 						try {
 							const liveTokens = session?.sequence?.nextTokenIndex || 0;
 							if (liveTokens > 0) {
-								updateContextUsage(liveTokens, activeContextSize, currentSpecialist);
+								const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
+								updateContextUsage(liveTokens, activeContextSize, modelLabel);
 								streamEvent(res, {
 									type: 'context_usage',
 									used: liveTokens,
 									total: activeContextSize,
-									percent: Math.min(100, Math.round((liveTokens / activeContextSize) * 100))
+									percent: Math.min(100, Math.round((liveTokens / activeContextSize) * 100)),
+									model: modelLabel
 								});
 
 								// Check 75% cutoff threshold
 								const COMPACTION_THRESHOLD = Math.round(activeContextSize * 0.75); // 6,144 tokens
 								if (liveTokens >= COMPACTION_THRESHOLD && !compactionTriggered && iteration < MAX_AGENT_ITERATIONS - 1) {
 									compactionTriggered = true;
-									console.log(`[Router] 75% cutoff reached (${liveTokens}/${activeContextSize} tokens). Halting 3B generator for auto-compaction.`);
+									console.log(`[Router] 75% cutoff reached (${liveTokens}/${activeContextSize} tokens). Halting ${modelLabel} generator for auto-compaction.`);
 									iterController.abort();
 								}
 							}
@@ -3556,24 +3698,27 @@ app.post('/v1/chat/completions', async (req, res) => {
 			try {
 				const currentTokens = session?.sequence?.nextTokenIndex || 0;
 				if (currentTokens > 0) {
-					updateContextUsage(currentTokens, activeContextSize, currentSpecialist);
+					const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
+					updateContextUsage(currentTokens, activeContextSize, modelLabel);
 					streamEvent(res, {
 						type: 'context_usage',
 						used: currentTokens,
 						total: activeContextSize,
-						percent: Math.min(100, Math.round((currentTokens / activeContextSize) * 100))
+						percent: Math.min(100, Math.round((currentTokens / activeContextSize) * 100)),
+						model: modelLabel
 					});
 				}
 			} catch (e) { }
 
 			if (loopDetected) {
 				console.warn(`[Router] Loop detected: ${loopReason}. Aborting generation.`);
-				streamChunk(res, `\n\n⚠️ **Generation stopped:** ${loopReason}\n`);
+				streamChunk(res, `\n\n[Warning] **Generation stopped:** ${loopReason}\n`);
 				throw new Error(`Infinite loop detected: ${loopReason}`);
 			}
 
 			if (compactionTriggered) {
-				console.log('[Router] Auto-compaction triggered at 75% cutoff.');
+				const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
+				console.log(`[Router] Auto-compaction triggered at 75% cutoff for ${modelLabel}.`);
 				streamEvent(res, {
 					type: 'info',
 					stage: 'plan',
@@ -3601,10 +3746,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 						userRequest: originalUserRequest,
 						filesWritten: filesModified,
 						partialSnippet: fullResponse.slice(-400),
+						specialist: currentSpecialist,
 					});
 				} catch (e: any) {
 					console.warn('[Advisor] Summary pass failed, using fallback summary:', e.message);
-					projectSummary = `Files completed: ${filesModified.join(', ') || 'None'}. Continue generating the remaining requested components.`;
+					projectSummary = currentSpecialist === 'be'
+						? `Files completed: ${filesModified.join(', ') || 'None'}.\nREMAINING: Implement missing backend routes, controllers, and services.\nNEXT STEP: Generate the remaining backend files now.`
+						: `Files completed: ${filesModified.join(', ') || 'None'}.\nREMAINING: Assemble all components in src/App.tsx with complete state and handlers.\nNEXT STEP: Generate src/App.tsx now.`;
 				}
 
 				// Flush bloated KV cache
@@ -3624,31 +3772,48 @@ app.post('/v1/chat/completions', async (req, res) => {
 				});
 
 				// Reconstruct next prompt with constructive completion instructions
-				currentPrompt = [
-					`--- Project State (After 75% Context Compaction) ---`,
-					`Advisor Project Summary:\n${projectSummary}`,
-					`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
-					`--- Original User Request ---`,
-					originalUserRequest,
-					`--- Required Action ---`,
-					`The generator was paused due to token limits and has now been given a fresh context sequence.`,
-					`1. Inspect the original request against the files written so far.`,
-					`2. If any requested component, modal, action handler, filter, or stat card is still missing or incomplete, generate it now.`,
-					`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now.`,
-					`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
-				].join('\n\n');
+				if (currentSpecialist === 'be') {
+					currentPrompt = [
+						`--- Project State (After 75% Context Compaction) ---`,
+						`Advisor Project Summary:\n${projectSummary}`,
+						`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+						`--- Original User Request ---`,
+						originalUserRequest,
+						`--- Required Action ---`,
+						`The backend generator was paused due to token limits and has now been given a fresh context sequence.`,
+						`1. Inspect the original backend request against the files written so far.`,
+						`2. If any requested database schema/model, Prisma file, route, controller, service, middleware, or utility is still missing or incomplete, generate it now.`,
+						`3. If the server entrypoint (e.g. \`server.ts\`, \`src/server.ts\`, or \`src/app.ts\`) needs to be created or updated to register all routes, database connections, and middleware, emit the complete file block now.`,
+						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+					].join('\n\n');
+				} else {
+					currentPrompt = [
+						`--- Project State (After 75% Context Compaction) ---`,
+						`Advisor Project Summary:\n${projectSummary}`,
+						`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+						`--- Original User Request ---`,
+						originalUserRequest,
+						`--- Required Action ---`,
+						`The generator was paused due to token limits and has now been given a fresh context sequence.`,
+						`1. Inspect the original request against the files written so far.`,
+						`2. If any requested component, modal, action handler, filter, or stat card is still missing or incomplete, generate it now.`,
+						`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now.`,
+						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+					].join('\n\n');
+				}
 
 				// Compute and emit new ~20% baseline context usage
 				const freshTokens = activeModel ? activeModel.tokenize(systemPrompt + '\n' + currentPrompt).length : 0;
 				const newBaseline = Math.max(session.sequence?.nextTokenIndex || 0, freshTokens);
-				updateContextUsage(newBaseline, activeContextSize, currentSpecialist);
+				updateContextUsage(newBaseline, activeContextSize, modelLabel);
 				streamEvent(res, {
 					type: 'context_usage',
 					used: newBaseline,
 					total: activeContextSize,
-					percent: Math.min(100, Math.round((newBaseline / activeContextSize) * 100))
+					percent: Math.min(100, Math.round((newBaseline / activeContextSize) * 100)),
+					model: modelLabel
 				});
-				console.log(`[Router] Context flushed and re-armed at ~20% baseline: ${newBaseline}/${activeContextSize} tokens (${Math.round((newBaseline / activeContextSize) * 100)}%)`);
+				console.log(`[Router] Context flushed and re-armed at ~20% baseline (${modelLabel}): ${newBaseline}/${activeContextSize} tokens (${Math.round((newBaseline / activeContextSize) * 100)}%)`);
 
 				compactionTriggered = false;
 				justCompacted = true;
@@ -3666,8 +3831,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 				if (justCompacted && !compactionRetryDone) {
 					compactionRetryDone = true;
 					justCompacted = false;
-					console.log("[Router] Model produced empty response after compaction. Sending targeted completion directive...");
-					currentPrompt = `<validation_repair>\nYou did not emit any code after compaction.\nBased on the request: "${originalUserRequest.slice(0, 300)}..."\nYou MUST output the complete, working <file path="src/App.tsx"> that imports all components, implements all state (useState) and action handlers, and renders the user interface. Output <file path="src/App.tsx"> now.\n</validation_repair>`;
+					const modelLabel = currentSpecialist === 'be' ? 'Backend' : 'Frontend';
+					console.log(`[Router] ${modelLabel} model produced empty response after compaction. Sending targeted completion directive...`);
+					if (currentSpecialist === 'be') {
+						currentPrompt = `<validation_repair>\nYou did not emit any code after compaction.\nBased on the backend request: "${originalUserRequest.slice(0, 300)}..."\nYou MUST output the complete, working server entry file or remaining route/controller (e.g. <file path="server.ts"> or <file path="src/server.ts">) that wires all endpoints and database models. Output the complete file now.\n</validation_repair>`;
+					} else {
+						currentPrompt = `<validation_repair>\nYou did not emit any code after compaction.\nBased on the request: "${originalUserRequest.slice(0, 300)}..."\nYou MUST output the complete, working <file path="src/App.tsx"> that imports all components, implements all state (useState) and action handlers, and renders the user interface. Output <file path="src/App.tsx"> now.\n</validation_repair>`;
+					}
 					continue;
 				}
 				console.log("[Router] Tiny response detected. Aborting to prevent infinite loop.");
@@ -3680,7 +3850,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 			if (responseHistory.includes(trimmedResponse)) {
 				const errorMsg = 'Identical response detected from the model across iterations. Stopping to prevent infinite retry loop.';
 				console.error(`[Router] ${errorMsg}`);
-				streamChunk(res, `\n\n❌ **Error:** ${errorMsg}\n`);
+				streamChunk(res, `\n\n[Error] **Error:** ${errorMsg}\n`);
 				throw new Error(errorMsg);
 			}
 			responseHistory.push(trimmedResponse);
@@ -3991,9 +4161,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
 				if (feBootstrapped.length > 0) {
 					for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
-					if (!pkgContent) {
-						try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
-					}
+					try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
 					console.log(`[Router] Initializer bootstrapped ${feBootstrapped.length} frontend foundation files for FE phase.`);
 				}
 			}
@@ -4002,12 +4170,12 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			const feSystemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, 'fe', activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
 
 			// Fresh context — no shared state with BE session
-			context = await feModel.createContext({ contextSize: 8192 });
+			context = await feModel.createContext({ contextSize: requestedContextSize });
 			let feSession = new LlamaChatSession({
 				contextSequence: context.getSequence(),
 				systemPrompt: feSystemPrompt,
 			});
-			const feContextSize = (context as any)?.contextSize || 8192;
+			const feContextSize = (context as any)?.contextSize || requestedContextSize;
 
 			// Pass BE artifact context + Tier-2 RAG context to FE.
 			// Artifact ensures FE knows real API endpoints/symbols without hallucinating.
@@ -4058,7 +4226,8 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					type: 'context_usage',
 					used: feInitialTokens,
 					total: feContextSize,
-					percent: Math.min(100, Math.round((feInitialTokens / feContextSize) * 100))
+					percent: Math.min(100, Math.round((feInitialTokens / feContextSize) * 100)),
+					model: 'frontend'
 				});
 				console.log(`[Router] Initial FE context usage: ${feInitialTokens}/${feContextSize} tokens (${Math.round((feInitialTokens / feContextSize) * 100)}%)`);
 			} catch (e) { }
@@ -4102,7 +4271,8 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 										type: 'context_usage',
 										used: liveTokens,
 										total: feContextSize,
-										percent: Math.min(100, Math.round((liveTokens / feContextSize) * 100))
+										percent: Math.min(100, Math.round((liveTokens / feContextSize) * 100)),
+										model: 'frontend'
 									});
 
 									// Check 75% cutoff threshold
@@ -4131,7 +4301,8 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 							type: 'context_usage',
 							used: currentFeTokens,
 							total: feContextSize,
-							percent: Math.min(100, Math.round((currentFeTokens / feContextSize) * 100))
+							percent: Math.min(100, Math.round((currentFeTokens / feContextSize) * 100)),
+							model: 'frontend'
 						});
 					}
 				} catch (e) { }
@@ -4169,6 +4340,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 							userRequest: originalUserRequest,
 							filesWritten: filesModified,
 							partialSnippet: feResponse.slice(-400),
+							specialist: 'fe',
 						});
 					} catch (e: any) {
 						console.warn('[Advisor] FE Summary pass failed, using fallback:', e.message);
@@ -4181,7 +4353,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					}
 
 					feModel = await mm.acquire('frontend');
-					context = await feModel.createContext({ contextSize: 8192 });
+					context = await feModel.createContext({ contextSize: feContextSize });
 					feSession = new LlamaChatSession({
 						contextSequence: context.getSequence(),
 						systemPrompt: feSystemPrompt,
@@ -4208,7 +4380,8 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 						type: 'context_usage',
 						used: newBaseline,
 						total: feContextSize,
-						percent: Math.min(100, Math.round((newBaseline / feContextSize) * 100))
+						percent: Math.min(100, Math.round((newBaseline / feContextSize) * 100)),
+						model: 'frontend'
 					});
 					console.log(`[Router] FE Context flushed and re-armed at ~20% baseline: ${newBaseline}/${feContextSize} tokens (${Math.round((newBaseline / feContextSize) * 100)}%)`);
 

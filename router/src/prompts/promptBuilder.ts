@@ -302,7 +302,8 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		forms: ['login', 'register', 'signup', 'form', 'submit', 'validation', 'email', 'password', 'otp', 'zod', 'react-hook-form'],
 		api: ['axios', 'fetch', 'api', 'endpoint', 'request', 'mutation', 'query', 'backend', 'auth', 'jwt'],
 		routing: ['page', 'dashboard', 'login page', 'navigate', 'route', 'layout', 'protected route'],
-		state: ['zustand', 'redux', 'store', 'context', 'provider', 'global state', 'kanban', 'trello', 'board', 'drag', 'drop', 'dnd', 'task', 'cards'],
+		state: ['zustand', 'redux', 'store', 'context', 'provider', 'global state'],
+		kanban: ['kanban', 'trello', 'drag and drop', 'dnd'],
 		table: ['table', 'datatable', 'spreadsheet', 'data table'],
 		chart: ['chart', 'graph', 'analytics', 'dashboard metrics', 'pie', 'bar', 'line'],
 	};
@@ -360,9 +361,13 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'CRITICAL BOUNDARIES:',
 			'1. ONLY import third-party packages from the installed list above, or standard React ("react", "react/jsx-runtime").',
 			'2. NEVER import uninstalled packages (e.g. recharts, react-hook-form, zod, formik, axios, framer-motion) unless explicitly listed above.',
-			'3. For forms: Use standard React useState with controlled inputs unless react-hook-form is listed above.',
-			'4. For charts/metrics: Use clean SVG or Tailwind CSS elements unless recharts is listed above.',
-			'5. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
+			'3. ICONS: ONLY import icons from "lucide-react" using named imports (e.g. import { Send, Plus, X, Settings, LayoutDashboard, Bot, Building2, UserPlus } from "lucide-react";). NEVER use undeclared identifiers like IconSend or IconX.',
+			'4. IMPORTS: If src/App.tsx renders <MessageInput /> or <LeftSidebar />, it MUST explicitly import them: import { MessageInput } from "./components/MessageInput";.',
+			'5. HOOKS: ALWAYS import hooks: import React, { useState, useEffect } from "react";. NEVER call useState after an early return or if condition.',
+			'6. STATE: Use dynamic useState arrays for messages and lists. NEVER hardcode static arrays. Wire send and new chat buttons to mutate state.',
+			'7. NO PHANTOM WRAPPERS: NEVER emit an App.tsx that only renders a wrapper like <MainView /> or <DashboardView /> unless you output that exact component. App.tsx must directly import and assemble the requested subcomponents.',
+			'8. NO FAKE UTILITIES: NEVER import from "@/utils/..." or "@/lib/..." (e.g. "@/utils/currency"). If you need helper functions like formatCurrency, formatPrice, or formatDate, write them directly inside the component file or output the utility file.',
+			'9. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
 		].join('\n'));
 		console.log(`[PromptRouter] Injected ${installedPkgs.length} installed package constraints into FE system prompt.`);
 	} else {
@@ -376,7 +381,11 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'1. ONLY import standard React ("react") or local relative files ("./...").',
 			'2. NEVER import third-party packages (e.g. recharts, react-hook-form, zod, axios, framer-motion).',
 			'3. Implement all UI, forms, and charts using standard React useState and Tailwind CSS.',
-			'4. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
+			'4. Every component rendered in src/App.tsx MUST have an explicit import statement at the top.',
+			'5. ALWAYS import React hooks at the top: import React, { useState, useEffect } from "react";.',
+			'6. NO PHANTOM WRAPPERS: src/App.tsx must directly assemble the generated components, not delegate to an ungenerated MainView.',
+			'7. NO FAKE UTILITIES: Never import from "@/utils/..." unless you generate that file in this response. Inline helpers locally.',
+			'8. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
 		].join('\n'));
 	}
 

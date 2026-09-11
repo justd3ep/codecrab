@@ -244,6 +244,10 @@ export function validateJsxSymbols(
 		while ((m = jsxTagRe.exec(content)) !== null) {
 			if (m[1]) usedComponents.add(m[1]);
 		}
+		const iconRefRe = /\b(Icon[A-Z][A-Za-z0-9]*)\b/g;
+		while ((m = iconRefRe.exec(content)) !== null) {
+			if (m[1]) usedComponents.add(m[1]);
+		}
 		if (usedComponents.size === 0) continue;
 
 		const importedSymbols = new Map<string, string>();
@@ -275,10 +279,15 @@ export function validateJsxSymbols(
 			}
 
 			const importPath = importedSymbols.get(comp)!;
-			if (!importPath.startsWith('.')) continue;
-
-			const fileDir = path.dirname(filePath).replace(/\\/g, '/');
-			const resolvedBase = path.normalize(path.join(fileDir, importPath)).replace(/\\/g, '/');
+			let resolvedBase: string;
+			if (importPath.startsWith('@/') || importPath.startsWith('~/')) {
+				resolvedBase = path.normalize(path.join('src', importPath.slice(2))).replace(/\\/g, '/');
+			} else if (importPath.startsWith('.')) {
+				const fileDir = path.dirname(filePath).replace(/\\/g, '/');
+				resolvedBase = path.normalize(path.join(fileDir, importPath)).replace(/\\/g, '/');
+			} else {
+				continue;
+			}
 
 			const existsInResponse = RESOLVE_EXTS.some(e =>
 				responsePathsRel.has(resolvedBase + e) || responsePathsRel.has(resolvedBase),
@@ -414,11 +423,12 @@ export interface PipelineEvent {
 	used?: number;
 	total?: number;
 	percent?: number;
+	model?: string;
 }
 
 export function streamEvent(res: Response, evt: PipelineEvent): void {
 	if (evt.type === 'context_usage') {
-		res.write(JSON.stringify({ type: 'context_usage', used: evt.used, total: evt.total, percent: evt.percent }) + '\n');
+		res.write(JSON.stringify({ type: 'context_usage', used: evt.used, total: evt.total, percent: evt.percent, model: evt.model }) + '\n');
 		return;
 	}
 	const icon =
@@ -462,7 +472,21 @@ export function detectRepetitionLoop(text: string): { detected: boolean; reason?
 		const windowLen = recentText.length;
 		const tail3 = allMatches.slice(-3);
 		const allInTail = tail3.every(idx => idx >= windowLen * 0.4);
-		if (allInTail) {
+		if (!allInTail) continue;
+
+		// Distinctness check: In a genuine loop, the text between consecutive matches is identical
+		// (e.g. repeating the exact same block). In legitimate repetitive code (like <Select.Item value="a">,
+		// <Select.Item value="b">, <td className="...">, etc.), the segments between matches contain
+		// different attributes and text. Require at least 3 consecutive identical inter-match segments.
+		let consecutiveIdentical = 0;
+		for (let i = 1; i < allMatches.length - 1; i++) {
+			const segPrev = recentText.substring(allMatches[i - 1]!, allMatches[i]!);
+			const segCurrent = recentText.substring(allMatches[i]!, allMatches[i + 1]!);
+			if (segPrev === segCurrent && segCurrent.length >= suffix.length) {
+				consecutiveIdentical++;
+			}
+		}
+		if (consecutiveIdentical >= 3) {
 			return { detected: true, reason: `Suffix loop: "${suffix}" repeated ${allMatches.length} times in recent output` };
 		}
 	}

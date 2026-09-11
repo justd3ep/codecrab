@@ -8,6 +8,7 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+import { mergePackageJson, mergeInitSh } from '../frontendScaffold.js';
 
 // ---------------------------------------------------------------------------
 // Content Validation
@@ -461,6 +462,24 @@ export function executeToolCall(
 				const dir = path.dirname(resolvedPath);
 				if (!fs.existsSync(dir)) {
 					fs.mkdirSync(dir, { recursive: true });
+				}
+
+				// Safe merging protection for package.json and init.sh
+				const baseName = path.basename(resolvedPath).toLowerCase();
+				if (baseName === 'package.json' && oldContent.trim()) {
+					try {
+						content = mergePackageJson(oldContent, content);
+						console.log(`[Writer] Merged package.json with existing dependencies`);
+					} catch (e: any) {
+						console.warn(`[Writer] Warning merging package.json: ${e?.message || e}`);
+					}
+				} else if (baseName === 'init.sh' && oldContent.trim()) {
+					try {
+						content = mergeInitSh(oldContent, content);
+						console.log(`[Writer] Merged init.sh with existing setup script`);
+					} catch (e: any) {
+						console.warn(`[Writer] Warning merging init.sh: ${e?.message || e}`);
+					}
 				}
 
 				// ─── Pipeline SHA trace (Stage 5–6) ───────────────────────────────

@@ -26,6 +26,7 @@ import { SnapshotManager }                                         from './works
 import { MetricsCollector }                                        from './pipelineMetrics.js';
 import { PipelineStateMachine, PipelineState, DEFAULT_REPAIR_BUDGET } from './pipelineState.js';
 import type { RepairBudget }                                       from './pipelineState.js';
+import { updateContextUsage }                                      from './telemetry/contextUsage.js';
 
 const execPromise = util.promisify(exec);
 
@@ -42,6 +43,7 @@ export interface IncrementalEngineOptions {
 	validationContract: ValidationContract;
 	res:                express.Response;
 	signal:             AbortSignal;
+	contextSize?:       number;
 	maxTokensPerFile:   number;
 	repairBudget?:      RepairBudget;
 	onFileCommitted?:   (node: FileNode, content: string) => void;
@@ -64,21 +66,31 @@ function streamChunk(res: express.Response, content: string): void {
 }
 
 interface PipelineEvent {
-	type:  'progress' | 'success' | 'warning' | 'error' | 'info';
-	stage: 'read' | 'plan' | 'generate' | 'write' | 'validate' | 'repair' | 'complete';
-	message: string;
+	type:  'progress' | 'success' | 'warning' | 'error' | 'info' | 'context_usage';
+	stage?: 'read' | 'plan' | 'generate' | 'write' | 'validate' | 'repair' | 'complete';
+	message?: string;
 	file?:   string;
+	used?:   number;
+	total?:  number;
+	percent?: number;
+	model?:  string;
 }
 
 function streamEvent(res: express.Response, evt: PipelineEvent): void {
+	if (evt.type === 'context_usage') {
+		res.write(JSON.stringify({
+			type: 'context_usage',
+			used: evt.used,
+			total: evt.total,
+			percent: evt.percent,
+			model: evt.model || 'backend'
+		}) + '\n');
+		return;
+	}
 	const icon =
-		evt.type === 'success'   ? '✅'
-		: evt.type === 'error'   ? '❌'
-		: evt.type === 'warning' ? '⚠️'
-		: evt.stage === 'generate' || evt.stage === 'write' ? '⚙️'
-		: evt.stage === 'validate' ? '🔬'
-		: evt.stage === 'repair'   ? '🔧'
-		: evt.stage === 'complete' ? '✅'
+		evt.type === 'success'   ? '✓'
+		: evt.type === 'error'   ? '✗'
+		: evt.type === 'warning' ? '!'
 		: '•';
 	res.write(JSON.stringify({ message: { content: `${icon} ${evt.message}\n` }, event: evt }) + '\n');
 }
@@ -232,6 +244,7 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 	const {
 		graph, workspaceRoot, model, systemPrompt, userRequest,
 		validationContract, res, signal, maxTokensPerFile,
+		contextSize = 8192,
 		repairBudget = DEFAULT_REPAIR_BUDGET,
 		onFileCommitted,
 	} = opts;
@@ -319,12 +332,26 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 		let generatedFile: GeneratedFile | null = null;
 
 		try {
-			context = await model.createContext({ contextSize: 8192 });
+			context = await model.createContext({ contextSize });
 			const session = new LlamaChatSession({ contextSequence: context.getSequence(), systemPrompt });
 
 			const filePrompt = buildSingleFilePrompt(node, graph, symbolIndex, promptCache, userRequest);
 			let rawResponse  = '';
 			let loopDetected = false;
+			let chunkCount   = 0;
+
+			try {
+				const promptTokens = model ? model.tokenize(systemPrompt + '\n' + filePrompt).length : 0;
+				const initialTokens = Math.max(session?.sequence?.nextTokenIndex || 0, promptTokens);
+				updateContextUsage(initialTokens, contextSize, 'backend');
+				streamEvent(res, {
+					type: 'context_usage',
+					used: initialTokens,
+					total: contextSize,
+					percent: Math.min(100, Math.round((initialTokens / contextSize) * 100)),
+					model: 'backend'
+				});
+			} catch {}
 
 			await session.prompt(filePrompt, {
 				maxTokens:         maxTokensPerFile,
@@ -332,6 +359,22 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 				stopOnAbortSignal: true,
 				onTextChunk(chunk) {
 					rawResponse += chunk;
+					chunkCount++;
+					if (chunkCount % 12 === 0) {
+						try {
+							const liveTokens = session?.sequence?.nextTokenIndex || 0;
+							if (liveTokens > 0) {
+								updateContextUsage(liveTokens, contextSize, 'backend');
+								streamEvent(res, {
+									type: 'context_usage',
+									used: liveTokens,
+									total: contextSize,
+									percent: Math.min(100, Math.round((liveTokens / contextSize) * 100)),
+									model: 'backend'
+								});
+							}
+						} catch {}
+					}
 					const lines = rawResponse.split('\n').map(l => l.trim()).filter(Boolean);
 					if (lines.length >= 8) {
 						const last = lines[lines.length - 1]!;
@@ -345,6 +388,20 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 					}
 				},
 			});
+
+			try {
+				const currentTokens = session?.sequence?.nextTokenIndex || 0;
+				if (currentTokens > 0) {
+					updateContextUsage(currentTokens, contextSize, 'backend');
+					streamEvent(res, {
+						type: 'context_usage',
+						used: currentTokens,
+						total: contextSize,
+						percent: Math.min(100, Math.round((currentTokens / contextSize) * 100)),
+						model: 'backend'
+					});
+				}
+			} catch {}
 
 			metrics.endGenerate(node.path, filePrompt.length, rawResponse.length);
 
@@ -392,7 +449,7 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 
 			let repairCtx: import('node-llama-cpp').LlamaContext | null = null;
 			try {
-				repairCtx = await model.createContext({ contextSize: 8192 });
+				repairCtx = await model.createContext({ contextSize });
 				const repairSession = new LlamaChatSession({ contextSequence: repairCtx.getSequence(), systemPrompt });
 				const depCtx = node.dependencies.map((d: DependencyEdge) => symbolIndex.getSignature(d.path)).filter(Boolean);
 
@@ -481,6 +538,20 @@ export async function runIncrementalEngine(opts: IncrementalEngineOptions): Prom
 
 		// Filter to only genuinely missing (not Planned)
 		const realErrors = projectResult.issues.filter(i => i.severity === 'error');
+
+		// Save any synthesized files to disk before link check and compilation
+		for (const f of projectResult.files) {
+			const absPath = path.join(workspaceRoot, f.path);
+			if (!fs.existsSync(absPath)) {
+				try {
+					fs.mkdirSync(path.dirname(absPath), { recursive: true });
+					fs.writeFileSync(absPath, f.content, 'utf-8');
+					console.log(`[IncrementalEngine] Written synthesized file: ${f.path}`);
+					committedPaths.add(f.path);
+					allCommitted.push(f);
+				} catch { /* non-fatal */ }
+			}
+		}
 
 		if (realErrors.length === 0) {
 			streamEvent(res, { type: 'success', stage: 'validate', message: 'Project validation passed' });

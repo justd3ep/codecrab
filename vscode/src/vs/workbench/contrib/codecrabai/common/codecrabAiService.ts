@@ -10,6 +10,7 @@ import { Event, Emitter } from '../../../../base/common/event.js';
 import { Disposable } from '../../../../base/common/lifecycle.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { ICodeCrabRouterClient, IRouterChatRequest, IRouterCompletionRequest, IContextUsageData } from './codecrabRouterClient.js';
 
 // ---------------------------------------------------------------------------
@@ -70,7 +71,8 @@ export interface ICodeCrabAiService {
 		context: IFileContext,
 		token: CancellationToken,
 		workspaceRoot?: string,
-		openFiles?: string[]
+		openFiles?: string[],
+		contextSize?: number
 	): AsyncIterable<string>;
 
 	/**
@@ -137,7 +139,8 @@ export class CodeCrabAiService extends Disposable implements ICodeCrabAiService 
 	private _routerAvailable = false;
 
 	constructor(
-		@ICodeCrabRouterClient private readonly _routerClient: ICodeCrabRouterClient
+		@ICodeCrabRouterClient private readonly _routerClient: ICodeCrabRouterClient,
+		@IConfigurationService private readonly _configurationService: IConfigurationService
 	) {
 		super();
 	}
@@ -151,15 +154,18 @@ export class CodeCrabAiService extends Disposable implements ICodeCrabAiService 
 		context: IFileContext,
 		token: CancellationToken,
 		workspaceRoot?: string,
-		openFiles?: string[]
+		openFiles?: string[],
+		contextSize?: number
 	): AsyncIterable<string> {
+		const configuredContextSize = contextSize ?? this._configurationService.getValue<number>('codecrab.contextWindow') ?? 8192;
 		const request: IRouterChatRequest = {
 			model: this._activeModel.ollamaTag,
 			messages: messages,
 			stream: true,
 			context: context,
 			workspaceRoot: workspaceRoot,
-			openFiles: openFiles
+			openFiles: openFiles,
+			contextSize: configuredContextSize
 		};
 		yield* this._routerClient.streamChat(request, token);
 	}

@@ -26,7 +26,7 @@ import {
 import { resolveCapabilities, loadCapabilityPrompts, buildCapabilitySystemPrompt } from '../capabilityResolver.js';
 import { runIncrementalEngine, shouldUseIncrementalEngine } from '../incrementalEngine.js';
 import { ensureGitRepo, commitHarnessTurn, getGitLogSummarySync } from '../gitHarness.js';
-import { ensureFrontendScaffold } from '../frontendScaffold.js';
+import { ensureFrontendScaffold, ensureBackendScaffold } from '../frontendScaffold.js';
 import config from '@/config/index.js';
 
 import { type UserScope, parseUserScope } from '../parsing/constraintParser.js';
@@ -56,7 +56,7 @@ import {
 	detectBackendIntent,
 	classifyIntent,
 } from '../routing/intentClassifier.js';
-import { DEFAULT_CONTEXT_SIZE, updateContextUsage } from '../telemetry/contextUsage.js';
+import { updateContextUsage, setEffectiveContextSize, effectiveContextSize } from '../telemetry/contextUsage.js';
 import {
 	loadPrompt,
 	type PromptRouterContext,
@@ -147,6 +147,7 @@ async function runAdvisorProjectSummary(params: {
 	userRequest: string;
 	filesWritten: string[];
 	partialSnippet: string;
+	specialist?: 'fe' | 'be';
 }): Promise<string> {
 	const advisorModel = await mm.acquire('advisor');
 	return runAdvisorProjectSummaryImpl(advisorModel, params);
@@ -199,11 +200,25 @@ router.post('/chat/completions', async (req, res) => {
 
 	try {
 		const workspaceRoot = req.body.workspaceRoot || config.workspace.defaultRoot;
-		const { messages, stream, openFiles } = req.body;
+		const { messages, stream, openFiles, contextSize: rawContextSize } = req.body;
 		const hasWorkspace = workspaceRoot && fs.existsSync(workspaceRoot);
 
+		const requestedContextSize = Math.max(
+			1024,
+			Math.min(
+				65536,
+				Number(rawContextSize) ||
+				Number(process.env.CODECRAB_CONTEXT_SIZE) ||
+				config.generation.contextSize ||
+				8192
+			)
+		);
+		setEffectiveContextSize(requestedContextSize);
+		const activeContextSize = requestedContextSize;
+		const feContextSize = requestedContextSize;
+
 		console.log(`\n[Router] ========== INCOMING REQUEST ==========`);
-		console.log(`[Router] Messages: ${messages?.length || 0}, workspace: ${workspaceRoot || 'none'}, openFiles: ${openFiles?.length || 0}`);
+		console.log(`[Router] Messages: ${messages?.length || 0}, workspace: ${workspaceRoot || 'none'}, openFiles: ${openFiles?.length || 0}, contextSize: ${requestedContextSize}`);
 
 		// ---------------------------------------------------------------
 		// SERVER-SIDE CONTEXT GATHERING
@@ -361,7 +376,7 @@ router.post('/chat/completions', async (req, res) => {
 		const rawAdvisorIntent: string = advisorIntent ?? ensembledIntent;
 
 		// --- PLANNER CONTRACT (deterministic, no model call) ---
-		const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent);
+		const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent, userScope);
 		const validationContract = plannerContractToValidationContract(plannerContract, userScope);
 
 		// filesModified is shared between incremental engine and the monolithic fallback loop
@@ -374,18 +389,25 @@ router.post('/chat/completions', async (req, res) => {
 		let currentSpecialist: 'be' | 'fe' = initialSpecialist;
 		let mode = determineMode(lastUserMsg, currentSpecialist, backendFileCount, frontendFileCount);
 
-		// Auto-scaffold frontend foundation files on create mode (package.json, index.html, init.sh, features.json, progress.txt)
-		if (workspaceRoot && (mode === 'create' || advisorSaysCreate) && (intent === 'frontend' || (intent === 'general' && promptNeedsFrontend(lastUserMsg)))) {
-			const bootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
-			bootstrappedCount = bootstrapped.length;
-			if (bootstrapped.length > 0) {
-				for (const f of bootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
-				if (!pkgContent) {
-					try {
-						pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8');
-					} catch { /* ignore */ }
-				}
-				console.log(`[Router] Initializer bootstrapped ${bootstrapped.length} frontend foundation files.`);
+		// Auto-scaffold foundation files on create mode (package.json, tsconfig.json, init.sh, features.json, progress.txt)
+		if (workspaceRoot && (mode === 'create' || advisorSaysCreate)) {
+			// Backend scaffolding when BE is active or prompt has backend/general intent
+			if (currentSpecialist === 'be' || intent === 'backend' || intent === 'general') {
+				const beBootstrapped = ensureBackendScaffold(workspaceRoot, lastUserMsg);
+				bootstrappedCount += beBootstrapped.length;
+				for (const f of beBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+			}
+			// Frontend scaffolding when FE is active or prompt has frontend signals
+			if (currentSpecialist === 'fe' || intent === 'frontend' || (intent === 'general' && promptNeedsFrontend(lastUserMsg))) {
+				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
+				bootstrappedCount += feBootstrapped.length;
+				for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+			}
+			if (bootstrappedCount > 0) {
+				try {
+					pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8');
+				} catch { /* ignore */ }
+				console.log(`[Router] Initializer bootstrapped ${bootstrappedCount} foundation files.`);
 			}
 		}
 
@@ -397,6 +419,16 @@ router.post('/chat/completions', async (req, res) => {
 		// ---------------------------------------------------------------
 		if (readWriteMode !== 'read' && hasWorkspace && advisorSaysCreate && intent !== 'frontend') {
 			try {
+				// ── 0. Bootstrap backend foundation files if create mode ───
+				if (workspaceRoot) {
+					const beBootstrapped = ensureBackendScaffold(workspaceRoot, lastUserMsg);
+					for (const f of beBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+					if (beBootstrapped.length > 0) {
+						try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
+						console.log(`[Router] VNext pipeline bootstrapped ${beBootstrapped.length} backend foundation files.`);
+					}
+				}
+
 				// ── 1. Workspace inspection ────────────────────────────────
 				const plannedModules = advisorV2Result?.modules ?? plannerContract.requiredFolders;
 				const inspection = inspectWorkspace(workspaceRoot, plannedModules);
@@ -443,12 +475,12 @@ router.post('/chat/completions', async (req, res) => {
 
 					try {
 						const promptTokens = incrModel ? incrModel.tokenize(incrSysPrompt + '\n' + lastUserMsg).length : 0;
-						updateContextUsage(promptTokens, DEFAULT_CONTEXT_SIZE, 'backend');
+						updateContextUsage(promptTokens, requestedContextSize, 'backend');
 						streamEvent(res, {
 							type: 'context_usage',
 							used: promptTokens,
-							total: DEFAULT_CONTEXT_SIZE,
-							percent: Math.min(100, Math.round((promptTokens / DEFAULT_CONTEXT_SIZE) * 100))
+							total: requestedContextSize,
+							percent: Math.min(100, Math.round((promptTokens / requestedContextSize) * 100))
 						});
 					} catch (e) {
 						console.warn('[Router] Failed to emit initial context usage in incremental engine:', e);
@@ -464,6 +496,7 @@ router.post('/chat/completions', async (req, res) => {
 						validationContract,
 						res,
 						signal: controller.signal,
+						contextSize: requestedContextSize,
 						maxTokensPerFile: MAX_TOKENS,
 						onFileCommitted(node, content) {
 							if (!filesModified.includes(node.path)) filesModified.push(node.path);
@@ -530,7 +563,7 @@ router.post('/chat/completions', async (req, res) => {
 					const feMode = determineMode(lastUserMsg, 'fe', backendFileCount, frontendFileCount);
 					const feActiveFile = openFiles?.[0];
 					const feSysPromptI = buildSystemPrompt(lastUserMsg, hasWorkspace, feMode, 'fe', feActiveFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
-					const feCtxIncr = await feModelIncr.createContext({ contextSize: DEFAULT_CONTEXT_SIZE });
+					const feCtxIncr = await feModelIncr.createContext({ contextSize: requestedContextSize });
 					context = feCtxIncr;
 					const feSessionIncr = new LlamaChatSession({ contextSequence: feCtxIncr.getSequence(), systemPrompt: feSysPromptI });
 
@@ -621,7 +654,7 @@ router.post('/chat/completions', async (req, res) => {
 		const activeFile = openFiles && openFiles.length > 0 ? openFiles[0] : undefined;
 		let systemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, currentSpecialist, activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
 
-		context = await activeModel.createContext({ contextSize: DEFAULT_CONTEXT_SIZE });
+		context = await activeModel.createContext({ contextSize: requestedContextSize });
 		let session = new LlamaChatSession({
 			contextSequence: context.getSequence(),
 			systemPrompt: systemPrompt,
@@ -660,14 +693,14 @@ router.post('/chat/completions', async (req, res) => {
 		try {
 			const promptTokens = activeModel ? activeModel.tokenize(systemPrompt + '\n' + enrichedLastMessage).length : 0;
 			const initialTokens = Math.max(session?.sequence?.nextTokenIndex || 0, promptTokens);
-			updateContextUsage(initialTokens, DEFAULT_CONTEXT_SIZE, currentSpecialist);
+			updateContextUsage(initialTokens, activeContextSize, currentSpecialist);
 			streamEvent(res, {
 				type: 'context_usage',
 				used: initialTokens,
-				total: DEFAULT_CONTEXT_SIZE,
-				percent: Math.min(100, Math.round((initialTokens / DEFAULT_CONTEXT_SIZE) * 100))
+				total: activeContextSize,
+				percent: Math.min(100, Math.round((initialTokens / activeContextSize) * 100))
 			});
-			console.log(`[Router] Initial context usage: ${initialTokens}/${DEFAULT_CONTEXT_SIZE} tokens (${Math.round((initialTokens / DEFAULT_CONTEXT_SIZE) * 100)}%)`);
+			console.log(`[Router] Initial context usage: ${initialTokens}/${activeContextSize} tokens (${Math.round((initialTokens / activeContextSize) * 100)}%)`);
 		} catch (e) {
 			console.warn('[Router] Failed to emit initial context usage:', e);
 		}
@@ -716,7 +749,8 @@ router.post('/chat/completions', async (req, res) => {
 			].join('\n\n')
 			: enrichedLastMessage;
 		const originalUserRequest = enrichedLastMessage;
-
+		let justCompacted = false;
+		let compactionRetryDone = false;
 
 		for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
 			console.log(`[Router] --- Agentic iteration ${iteration + 1} ---`);
@@ -762,19 +796,19 @@ router.post('/chat/completions', async (req, res) => {
 						try {
 							const liveTokens = session.sequence?.nextTokenIndex || 0;
 							if (liveTokens > 0) {
-								updateContextUsage(liveTokens, DEFAULT_CONTEXT_SIZE, currentSpecialist);
+								updateContextUsage(liveTokens, activeContextSize, currentSpecialist);
 								streamEvent(res, {
 									type: 'context_usage',
 									used: liveTokens,
-									total: DEFAULT_CONTEXT_SIZE,
-									percent: Math.min(100, Math.round((liveTokens / DEFAULT_CONTEXT_SIZE) * 100))
+									total: activeContextSize,
+									percent: Math.min(100, Math.round((liveTokens / activeContextSize) * 100))
 								});
 
 								// Check 75% cutoff threshold
-								const COMPACTION_THRESHOLD = Math.round(DEFAULT_CONTEXT_SIZE * 0.75); // 6,144 tokens
+								const COMPACTION_THRESHOLD = Math.round(activeContextSize * 0.75);
 								if (liveTokens >= COMPACTION_THRESHOLD && !compactionTriggered && iteration < MAX_AGENT_ITERATIONS - 1) {
 									compactionTriggered = true;
-									console.log(`[Router] 75% cutoff reached (${liveTokens}/${DEFAULT_CONTEXT_SIZE} tokens). Halting 3B generator for auto-compaction.`);
+									console.log(`[Router] 75% cutoff reached (${liveTokens}/${activeContextSize} tokens). Halting 3B generator for auto-compaction.`);
 									iterController.abort();
 								}
 							}
@@ -798,12 +832,12 @@ router.post('/chat/completions', async (req, res) => {
 				try {
 					const liveTokens = session.sequence?.nextTokenIndex || 0;
 					if (liveTokens > 0) {
-						updateContextUsage(liveTokens, DEFAULT_CONTEXT_SIZE, currentSpecialist);
+						updateContextUsage(liveTokens, activeContextSize, currentSpecialist);
 						streamEvent(res, {
 							type: 'context_usage',
 							used: liveTokens,
-							total: DEFAULT_CONTEXT_SIZE,
-							percent: Math.min(100, Math.round((liveTokens / DEFAULT_CONTEXT_SIZE) * 100))
+							total: activeContextSize,
+							percent: Math.min(100, Math.round((liveTokens / activeContextSize) * 100))
 						});
 					}
 				} catch { /* ignore */ }
@@ -837,6 +871,7 @@ router.post('/chat/completions', async (req, res) => {
 					userRequest: originalUserRequest,
 					filesWritten: filesModified,
 					partialSnippet: fullResponse.slice(-400),
+					specialist: currentSpecialist,
 				});
 
 				// Flush bloated KV cache
@@ -848,37 +883,60 @@ router.post('/chat/completions', async (req, res) => {
 				// Re-acquire specialist model in VRAM (since Advisor pass swapped it)
 				activeModel = await mm.acquire(intent);
 
-				// Re-arm context with fresh 8K sequence retaining the ~20% baseline prompts
-				context = await activeModel.createContext({ contextSize: DEFAULT_CONTEXT_SIZE });
+				// Re-arm context with fresh sequence retaining the ~20% baseline prompts
+				context = await activeModel.createContext({ contextSize: activeContextSize });
 				session = new LlamaChatSession({
 					contextSequence: context.getSequence(),
 					systemPrompt: systemPrompt,
 				});
 
-				// Reconstruct next prompt with Advisor summary + remaining instructions
-				currentPrompt = [
-					`--- Project Brain Summary (Advisor Auto-Compaction) ---`,
-					projectSummary,
-					`--- Files Already Completed (Do NOT re-generate) ---`,
-					filesModified.map(f => `- ${f}`).join('\n') || 'None',
-					`--- Original Request ---`,
-					originalUserRequest,
-					`\nResume generation. Output ONLY the remaining uncompleted files as <file path="...">...</file> blocks. Do NOT re-emit files that are already completed.`,
-				].join('\n\n');
+				// Reconstruct next prompt with constructive completion instructions
+				if (currentSpecialist === 'be') {
+					currentPrompt = [
+						`--- Project State (After 75% Context Compaction) ---`,
+						`Advisor Project Summary:\n${projectSummary}`,
+						`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+						`--- Original User Request ---`,
+						originalUserRequest,
+						`--- Required Action ---`,
+						`The backend generator was paused due to token limits and has now been given a fresh context sequence.`,
+						`1. Inspect the original backend request against the files written so far.`,
+						`2. If any requested database schema/model, Prisma file, route, controller, service, middleware, or utility is still missing or incomplete, generate it now.`,
+						`3. If the server entrypoint (e.g. \`server.ts\`, \`src/server.ts\`, or \`src/app.ts\`) needs to be created or updated to register all routes, database connections, and middleware, emit the complete file block now.`,
+						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+					].join('\n\n');
+				} else {
+					currentPrompt = [
+						`--- Project State (After 75% Context Compaction) ---`,
+						`Advisor Project Summary:\n${projectSummary}`,
+						`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+						`--- Original User Request ---`,
+						originalUserRequest,
+						`--- Required Action ---`,
+						`The generator was paused due to token limits and has now been given a fresh context sequence.`,
+						`1. Inspect the original request against the files written so far.`,
+						`2. If any requested component, modal, action handler, filter, or stat card is still missing or incomplete, generate it now.`,
+						`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now.`,
+						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+					].join('\n\n');
+				}
 
 				// Compute and emit new ~20% baseline context usage
 				const freshTokens = activeModel ? activeModel.tokenize(systemPrompt + '\n' + currentPrompt).length : 0;
 				const newBaseline = Math.max(session.sequence?.nextTokenIndex || 0, freshTokens);
-				updateContextUsage(newBaseline, DEFAULT_CONTEXT_SIZE, currentSpecialist);
+				const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
+				updateContextUsage(newBaseline, activeContextSize, modelLabel);
 				streamEvent(res, {
 					type: 'context_usage',
 					used: newBaseline,
-					total: DEFAULT_CONTEXT_SIZE,
-					percent: Math.min(100, Math.round((newBaseline / DEFAULT_CONTEXT_SIZE) * 100))
+					total: activeContextSize,
+					percent: Math.min(100, Math.round((newBaseline / activeContextSize) * 100)),
+					model: modelLabel
 				});
-				console.log(`[Router] Context flushed and re-armed at ~20% baseline: ${newBaseline}/${DEFAULT_CONTEXT_SIZE} tokens (${Math.round((newBaseline / DEFAULT_CONTEXT_SIZE) * 100)}%)`);
+				console.log(`[Router] Context flushed and re-armed at ~20% baseline (${modelLabel}): ${newBaseline}/${activeContextSize} tokens (${Math.round((newBaseline / activeContextSize) * 100)}%)`);
 
 				compactionTriggered = false;
+				justCompacted = true;
 				continue;
 			}
 
@@ -891,26 +949,41 @@ router.post('/chat/completions', async (req, res) => {
 
 			try {
 				const currentTokens = session.sequence.nextTokenIndex;
-				updateContextUsage(currentTokens, DEFAULT_CONTEXT_SIZE, currentSpecialist);
+				const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
+				updateContextUsage(currentTokens, activeContextSize, modelLabel);
 				streamEvent(res, {
 					type: 'context_usage',
 					used: currentTokens,
-					total: DEFAULT_CONTEXT_SIZE,
-					percent: Math.min(100, Math.round((currentTokens / DEFAULT_CONTEXT_SIZE) * 100))
+					total: activeContextSize,
+					percent: Math.min(100, Math.round((currentTokens / activeContextSize) * 100)),
+					model: modelLabel
 				});
-				if (currentTokens >= Math.round(DEFAULT_CONTEXT_SIZE * 0.75)) {
+				if (currentTokens >= Math.round(activeContextSize * 0.75)) {
 					streamEvent(res, {
 						type: 'warning',
 						stage: 'generate',
-						message: `Context window 75% filled (${currentTokens}/${DEFAULT_CONTEXT_SIZE} tokens). Auto-compaction trigger threshold reached.`
+						message: `Context window 75% filled (${currentTokens}/${activeContextSize} tokens). Auto-compaction trigger threshold reached.`
 					});
 				}
 			} catch { /* sequence disposed or not tracking */ }
 
 			if (responseTokenCount < 30) {
+				if (justCompacted && !compactionRetryDone) {
+					compactionRetryDone = true;
+					justCompacted = false;
+					const modelLabel = currentSpecialist === 'be' ? 'Backend' : 'Frontend';
+					console.log(`[Router] ${modelLabel} model produced empty response after compaction. Sending targeted completion directive...`);
+					if (currentSpecialist === 'be') {
+						currentPrompt = `<validation_repair>\nYou did not emit any code after compaction.\nBased on the backend request: "${originalUserRequest.slice(0, 300)}..."\nYou MUST output the complete, working server entry file or remaining route/controller (e.g. <file path="server.ts"> or <file path="src/server.ts">) that wires all endpoints and database models. Output the complete file now.\n</validation_repair>`;
+					} else {
+						currentPrompt = `<validation_repair>\nYou did not emit any code after compaction.\nBased on the request: "${originalUserRequest.slice(0, 300)}..."\nYou MUST output the complete, working <file path="src/App.tsx"> that imports all components, implements all state (useState) and action handlers, and renders the user interface. Output <file path="src/App.tsx"> now.\n</validation_repair>`;
+					}
+					continue;
+				}
 				console.log("[Router] Tiny response detected. Aborting to prevent infinite loop.");
 				break;
 			}
+			justCompacted = false;
 
 			// Check for identical responses (identical-response detection)
 			const trimmedResponse = fullResponse.trim();
@@ -1275,11 +1348,20 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			mode = determineMode(lastUserMsg, currentSpecialist, backendFileCount, frontendFileCount);
 			console.log(`[Router] Phase 2 Specialist=${currentSpecialist}, Mode=${mode}`);
 
+			if (workspaceRoot && (mode === 'create' || advisorSaysCreate)) {
+				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
+				if (feBootstrapped.length > 0) {
+					for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+					try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
+					console.log(`[Router] Initializer bootstrapped ${feBootstrapped.length} frontend foundation files for FE phase.`);
+				}
+			}
+
 			// Build FE system prompt with FE specialist mode
 			const feSystemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, 'fe', activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
 
 			// Fresh context — no shared state with BE session
-			context = await feModel.createContext({ contextSize: DEFAULT_CONTEXT_SIZE });
+			context = await feModel.createContext({ contextSize: feContextSize });
 			const feSession = new LlamaChatSession({
 				contextSequence: context.getSequence(),
 				systemPrompt: feSystemPrompt,
@@ -1332,12 +1414,12 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			try {
 				const fePromptTokens = feModel ? feModel.tokenize(feSystemPrompt + '\n' + fePrompt).length : 0;
 				const feInitialTokens = Math.max(feSession?.sequence?.nextTokenIndex || 0, fePromptTokens);
-				updateContextUsage(feInitialTokens, DEFAULT_CONTEXT_SIZE, 'frontend');
+				updateContextUsage(feInitialTokens, feContextSize, 'frontend');
 				streamEvent(res, {
 					type: 'context_usage',
 					used: feInitialTokens,
-					total: DEFAULT_CONTEXT_SIZE,
-					percent: Math.min(100, Math.round((feInitialTokens / DEFAULT_CONTEXT_SIZE) * 100))
+					total: feContextSize,
+					percent: Math.min(100, Math.round((feInitialTokens / feContextSize) * 100))
 				});
 			} catch (e) {
 				console.warn('[Router] Failed to emit FE initial context usage:', e);
@@ -1371,19 +1453,19 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 							try {
 								const liveTokens = feSession.sequence?.nextTokenIndex || 0;
 								if (liveTokens > 0) {
-									updateContextUsage(liveTokens, DEFAULT_CONTEXT_SIZE, 'frontend');
+									updateContextUsage(liveTokens, feContextSize, 'frontend');
 									streamEvent(res, {
 										type: 'context_usage',
 										used: liveTokens,
-										total: DEFAULT_CONTEXT_SIZE,
-										percent: Math.min(100, Math.round((liveTokens / DEFAULT_CONTEXT_SIZE) * 100))
+										total: feContextSize,
+										percent: Math.min(100, Math.round((liveTokens / feContextSize) * 100))
 									});
 
 									// Check 75% cutoff threshold
-									const COMPACTION_THRESHOLD = Math.round(DEFAULT_CONTEXT_SIZE * 0.75);
+									const COMPACTION_THRESHOLD = Math.round(feContextSize * 0.75);
 									if (liveTokens >= COMPACTION_THRESHOLD && !feCompactionTriggered && feIter < MAX_AGENT_ITERATIONS - 1) {
 										feCompactionTriggered = true;
-										console.log(`[Router] FE 75% cutoff reached (${liveTokens}/${DEFAULT_CONTEXT_SIZE} tokens). Halting for auto-compaction.`);
+										console.log(`[Router] FE 75% cutoff reached (${liveTokens}/${feContextSize} tokens). Halting for auto-compaction.`);
 										feIterController.abort();
 									}
 								}
@@ -1401,12 +1483,12 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					try {
 						const liveTokens = feSession.sequence?.nextTokenIndex || 0;
 						if (liveTokens > 0) {
-							updateContextUsage(liveTokens, DEFAULT_CONTEXT_SIZE, 'frontend');
+							updateContextUsage(liveTokens, feContextSize, 'frontend');
 							streamEvent(res, {
 								type: 'context_usage',
 								used: liveTokens,
-								total: DEFAULT_CONTEXT_SIZE,
-								percent: Math.min(100, Math.round((liveTokens / DEFAULT_CONTEXT_SIZE) * 100))
+								total: feContextSize,
+								percent: Math.min(100, Math.round((liveTokens / feContextSize) * 100))
 							});
 						}
 					} catch { /* ignore */ }
@@ -1447,7 +1529,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					}
 
 					const freshFeModel = await mm.acquire('frontend');
-					context = await freshFeModel.createContext({ contextSize: DEFAULT_CONTEXT_SIZE });
+					context = await freshFeModel.createContext({ contextSize: feContextSize });
 					const newFeSession = new LlamaChatSession({
 						contextSequence: context.getSequence(),
 						systemPrompt: feSystemPrompt,
@@ -1465,14 +1547,14 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 
 					const freshTokens = feModel ? feModel.tokenize(feSystemPrompt + '\n' + fePrompt).length : 0;
 					const newBaseline = Math.max(newFeSession.sequence?.nextTokenIndex || 0, freshTokens);
-					updateContextUsage(newBaseline, DEFAULT_CONTEXT_SIZE, 'frontend');
+					updateContextUsage(newBaseline, feContextSize, 'frontend');
 					streamEvent(res, {
 						type: 'context_usage',
 						used: newBaseline,
-						total: DEFAULT_CONTEXT_SIZE,
-						percent: Math.min(100, Math.round((newBaseline / DEFAULT_CONTEXT_SIZE) * 100))
+						total: feContextSize,
+						percent: Math.min(100, Math.round((newBaseline / feContextSize) * 100))
 					});
-					console.log(`[Router] FE Context flushed and re-armed at ~20% baseline: ${newBaseline}/${DEFAULT_CONTEXT_SIZE} tokens (${Math.round((newBaseline / DEFAULT_CONTEXT_SIZE) * 100)}%)`);
+					console.log(`[Router] FE Context flushed and re-armed at ~20% baseline: ${newBaseline}/${feContextSize} tokens (${Math.round((newBaseline / feContextSize) * 100)}%)`);
 
 					feCompactionTriggered = false;
 					continue;
@@ -1483,18 +1565,18 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 
 				try {
 					const currentTokens = feSession.sequence.nextTokenIndex;
-					updateContextUsage(currentTokens, DEFAULT_CONTEXT_SIZE, 'frontend');
+					updateContextUsage(currentTokens, feContextSize, 'frontend');
 					streamEvent(res, {
 						type: 'context_usage',
 						used: currentTokens,
-						total: DEFAULT_CONTEXT_SIZE,
-						percent: Math.min(100, Math.round((currentTokens / DEFAULT_CONTEXT_SIZE) * 100))
+						total: feContextSize,
+						percent: Math.min(100, Math.round((currentTokens / feContextSize) * 100))
 					});
-					if (currentTokens >= Math.round(DEFAULT_CONTEXT_SIZE * 0.75)) {
+					if (currentTokens >= Math.round(feContextSize * 0.75)) {
 						streamEvent(res, {
 							type: 'warning',
 							stage: 'generate',
-							message: `Context window 75% filled (${currentTokens}/${DEFAULT_CONTEXT_SIZE} tokens). Auto-compaction trigger threshold reached.`
+							message: `Context window 75% filled (${currentTokens}/${feContextSize} tokens). Auto-compaction trigger threshold reached.`
 						});
 					}
 				} catch { /* sequence disposed or not tracking */ }

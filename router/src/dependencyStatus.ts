@@ -75,8 +75,15 @@ export function classifyDependency(
   committedPaths:  Set<string>,
   workspaceRoot:   string,
 ): DependencyStatus {
-  // ── External: npm package or node builtin ────────────────────────────────
-  if (!importSpecifier.startsWith('.')) {
+  // ── Local alias or relative path resolution ──────────────────────────────
+  let resolved: string;
+  if (importSpecifier.startsWith('@/') || importSpecifier.startsWith('~/')) {
+    resolved = path.normalize(path.join('src', importSpecifier.slice(2))).replace(/\\/g, '/');
+  } else if (importSpecifier.startsWith('.')) {
+    const fromDir = path.dirname(fromFile);
+    resolved = path.normalize(path.join(fromDir, importSpecifier)).replace(/\\/g, '/');
+  } else {
+    // External: npm package or node builtin
     const pkg = importSpecifier.startsWith('@')
       ? importSpecifier.split('/').slice(0, 2).join('/')
       : importSpecifier.split('/')[0]!;
@@ -85,16 +92,13 @@ export function classifyDependency(
     return DependencyStatus.External;
   }
 
-  // ── Resolve relative path ─────────────────────────────────────────────────
-  const fromDir   = path.dirname(fromFile);
-  const resolved  = path.normalize(path.join(fromDir, importSpecifier));
-
   // Build set of all planned paths (all nodes in graph)
-  const plannedPaths = new Set(graph.nodes.map(n => n.path));
+  const plannedPaths = new Set(graph.nodes.map(n => n.path.replace(/\\/g, '/')));
 
   // ── Generated: committed this session ────────────────────────────────────
+  const normCommitted = new Set(Array.from(committedPaths).map(p => p.replace(/\\/g, '/')));
   for (const ext of RESOLVE_EXTS) {
-    if (committedPaths.has(resolved + ext)) return DependencyStatus.Generated;
+    if (normCommitted.has(resolved + ext)) return DependencyStatus.Generated;
   }
 
   // ── Planned: in graph but not yet generated ───────────────────────────────
@@ -136,7 +140,7 @@ export function findMissingImports(
   workspaceRoot:  string,
 ): Array<{ importSpecifier: string; status: DependencyStatus }> {
   const results: Array<{ importSpecifier: string; status: DependencyStatus }> = [];
-  const re = /import\s+(?:[\w{}\s*,]+\s+from\s+)?['"](\.\.?\/[^'"]+)['"]/g;
+  const re = /import\s+(?:[\w{}\s*,]+\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/)[^'"]+)['"]/g;
   let m: RegExpExecArray | null;
 
   while ((m = re.exec(content)) !== null) {

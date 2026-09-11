@@ -30,6 +30,7 @@ export interface IRouterChatRequest {
 	context?: IFileContext;
 	workspaceRoot?: string;  // Absolute path to workspace root for server-side context gathering
 	openFiles?: string[];    // Absolute paths of currently open editor files
+	contextSize?: number;    // User-configured context window size in tokens
 }
 
 export interface IRouterCompletionRequest {
@@ -249,7 +250,8 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 								this._onDidChangeContextUsage.fire({
 									used: data.used,
 									total: data.total ?? 8192,
-									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100)
+									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100),
+									model: data.model
 								});
 							}
 							if (data.message?.content) {
@@ -271,7 +273,8 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 								this._onDidChangeContextUsage.fire({
 									used: data.used,
 									total: data.total ?? 8192,
-									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100)
+									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100),
+									model: data.model
 								});
 							}
 							if (data.message?.content) {

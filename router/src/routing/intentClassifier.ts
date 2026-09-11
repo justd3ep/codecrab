@@ -173,15 +173,15 @@ export async function runAdvisor(
 		return v2 ? { intent: null, v2Result: null } : null;
 	}
 	try {
-		// 512 ctx: system(~240 tok) + user(~20 tok) + template(~30 tok) + response(~10 tok) = ~300 tok, fits
-		const advisorCtx = await advisorModel.createContext({ contextSize: 512 });
+		// 2048 ctx: ample room for system prompt (~400 tok), multi-paragraph user requests (~300 tok), and JSON output (~200 tok)
+		const advisorCtx = await advisorModel.createContext({ contextSize: 2048 });
 		const seq = advisorCtx.getSequence();
 
 		// Build Qwen3 chat template + /no_think to suppress chain-of-thought mode.
 		// Pre-filling <think>\n\n</think> forces the model to skip reasoning and output JSON directly.
 		const fullPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n<|im_start|>user\n${userRequest} /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n`;
 		const inputTokens = advisorModel.tokenize(fullPrompt);
-		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 512`);
+		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 2048`);
 
 		let raw = '';
 		const eosToken = advisorModel.tokens.eos;
@@ -217,23 +217,36 @@ export async function runAdvisorProjectSummary(
 		userRequest: string;
 		filesWritten: string[];
 		partialSnippet: string;
+		specialist?: 'fe' | 'be';
 	},
 ): Promise<string> {
 	try {
-		console.log('[Advisor] Running Project Brain Summary pass for 75% auto-compaction...');
+		const isBackend = params.specialist === 'be';
+		console.log(`[Advisor] Running Project Brain Summary pass for 75% auto-compaction (${isBackend ? 'backend' : 'frontend'})...`);
 		const advisorCtx = await advisorModel.createContext({ contextSize: 1024 });
 		const seq = advisorCtx.getSequence();
 
-		const systemPrompt = [
-			'You are the CodeCrab Project Brain Summarizer.',
-			'The code generation specialist reached its 75% context cutoff.',
-			'Your task: create a concise, factual 100-150 word project summary.',
-			'Structure:',
-			'1. COMPLETED: List files and components already written to disk.',
-			'2. REMAINING: List required components or features still missing from the request.',
-			'3. NEXT STEP: Give an explicit instruction on which file to generate next.',
-			'Keep it brief and factual. No conversational filler.',
-		].join('\n');
+		const systemPrompt = isBackend
+			? [
+				'You are the CodeCrab Project Brain Summarizer.',
+				'The backend code generation specialist reached its 75% context cutoff.',
+				'Your task: create a concise, factual 100-150 word project summary.',
+				'Structure:',
+				'1. COMPLETED: List backend files, routes, models, and controllers already written to disk.',
+				'2. REMAINING: List required backend endpoints, services, schemas, or middleware still missing from the request.',
+				'3. NEXT STEP: Give an explicit instruction on which backend file to generate next.',
+				'Keep it brief and factual. No conversational filler.',
+			].join('\n')
+			: [
+				'You are the CodeCrab Project Brain Summarizer.',
+				'The code generation specialist reached its 75% context cutoff.',
+				'Your task: create a concise, factual 100-150 word project summary.',
+				'Structure:',
+				'1. COMPLETED: List files and components already written to disk.',
+				'2. REMAINING: List required components or features still missing from the request.',
+				'3. NEXT STEP: Give an explicit instruction on which file to generate next.',
+				'Keep it brief and factual. No conversational filler.',
+			].join('\n');
 
 		const userContent = [
 			`Original User Goal: ${params.userRequest}`,
@@ -256,13 +269,20 @@ export async function runAdvisorProjectSummary(
 		await advisorCtx.dispose();
 		let summary = raw.trim();
 		if (!summary.includes('REMAINING') && !summary.includes('NEXT STEP')) {
-			summary += `\nREMAINING: Verify all requested features, handlers, and components are fully wired.\nNEXT STEP: Generate complete src/App.tsx connecting all components with native React state.`;
+			summary += isBackend
+				? `\nREMAINING: Implement missing backend routes, controllers, database models, and error handling.\nNEXT STEP: Generate the main server entrypoint (e.g. server.ts or src/app.ts) or remaining routes to wire all API endpoints.`
+				: `\nREMAINING: Verify all requested features, handlers, and components are fully wired.\nNEXT STEP: Generate complete src/App.tsx connecting all components with native React state.`;
 		}
 		console.log(`[Advisor] Summary generated (${summary.length} chars):`, summary.slice(0, 120) + '...');
-		return summary || 'Project state summarized. Continue generating remaining uncompleted components.';
+		return summary || (isBackend
+			? 'Project state summarized. Continue generating remaining uncompleted backend routes and controllers.'
+			: 'Project state summarized. Continue generating remaining uncompleted components.');
 	} catch (e: any) {
 		console.warn('[Advisor] Summary pass failed, using fallback summary:', e.message);
-		return `Files completed: ${params.filesWritten.join(', ') || 'None'}.\nREMAINING: Assemble all components in src/App.tsx with complete state and handlers.\nNEXT STEP: Generate src/App.tsx now.`;
+		const isBackend = params.specialist === 'be';
+		return isBackend
+			? `Files completed: ${params.filesWritten.join(', ') || 'None'}.\nREMAINING: Implement missing backend routes, controllers, and services.\nNEXT STEP: Generate the remaining backend files now.`
+			: `Files completed: ${params.filesWritten.join(', ') || 'None'}.\nREMAINING: Assemble all components in src/App.tsx with complete state and handlers.\nNEXT STEP: Generate src/App.tsx now.`;
 	}
 }
 
@@ -298,14 +318,26 @@ export function classifyOpenFile(openFiles: string[] | undefined): 'fe' | 'be' |
 export function scoreKeywords(msg: string): { feScore: number; beScore: number } {
 	let feScore = 0;
 	let beScore = 0;
+
+	// Sanitize mock/client API mentions so they do not falsely trigger BE_SERVER_PATTERN
+	const beMsg = msg
+		.replace(/\b(?:mock|dummy|fake|stub|client-side|call|fetch)\s+(?:data[\s/]+)?api(?:s|\b)/gi, '')
+		.replace(/\bapi\s+(?:client|mock|functions?|endpoints?\s+mock)\b/gi, '');
+
+	if (/\b(?:mock\s+(?:data[\s/]+)?api|dummy\s+api|fake\s+api|mock\s+data|mock\s+functions?)\b/i.test(msg)) {
+		feScore += 2;
+	}
+
 	if (UI_COMPONENT_PATTERN.test(msg)) feScore += 2;
 	if (UI_INTERACTION_PATTERN.test(msg)) feScore += 1;
 	if (UI_DESIGN_PATTERN.test(msg)) feScore += 2;
 	if (UI_FRAMEWORK_PATTERN.test(msg)) feScore += 2;
 	if (/\b(?:kanban|trello|drag\s+and\s+drop|dark\s+mode|dashboard|responsive)\b/i.test(msg)) feScore += 2;
-	if (BE_DB_PATTERN.test(msg)) beScore += 2;
-	if (BE_SERVER_PATTERN.test(msg)) beScore += 2;
-	if (BE_AUTH_INFRA_PATTERN.test(msg)) beScore += 2;
+
+	if (BE_DB_PATTERN.test(beMsg)) beScore += 2;
+	if (BE_SERVER_PATTERN.test(beMsg)) beScore += 2;
+	if (BE_AUTH_INFRA_PATTERN.test(beMsg)) beScore += 2;
+
 	return { feScore, beScore };
 }
 

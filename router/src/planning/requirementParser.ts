@@ -66,6 +66,11 @@ const BACKEND_ONLY_PATTERNS = [
 	/\bapi[\s-]?only\b/i, /\bno\s+frontend\b/i, /\bwithout\s+frontend\b/i,
 	/\bexpress\s+backend\b/i, /\bnestjs\s+backend\b/i,
 	/\bno\s+react\b/i, /\bno\s+ui\b/i,
+	// Natural language backend requests
+	/\b(?:build|create|implement|make)\s+(?:a\s+)?(?:[\w-]+\s+)*(?:rest\s+|server\s+)?backend\b/i,
+	/\bbackend\s+for\b/i,
+	/\bbackend\s+(?:service|server|api|application)\b/i,
+	/\bonly\s+(?:the\s+)?(?:backend|server|api)\b/i,
 ];
 
 const FRONTEND_ONLY_PATTERNS = [
@@ -73,6 +78,14 @@ const FRONTEND_ONLY_PATTERNS = [
 	/\bnext\.?js[\s-]?only\b/i, /\bui[\s-]?only\b/i,
 	/\bcomponent[\s-]?only\b/i, /\bno\s+backend\b/i,
 	/\bwithout\s+backend\b/i, /\bno\s+server\b/i, /\bno\s+api\b/i,
+	// Natural language frontend requests
+	/\b(?:build|create|implement|make|design)\s+(?:a\s+)?(?:[\w-]+\s+){0,3}(?:dashboard\s+|web\s+)?frontend\b/i,
+	/\bfrontend\s+for\b/i,
+	/\bfrontend\s+(?:dashboard|app|application|ui|interface|client)\b/i,
+	/\bclient[\s-]?side\b/i,
+	/\bfrontend\s+code\b/i,
+	/\bonly\s+(?:the\s+)?(?:frontend|ui)\b/i,
+	/\buse\s+mock\s+(?:data|api|functions)\b/i,
 ];
 
 // ---------------------------------------------------------------------------
@@ -80,17 +93,22 @@ const FRONTEND_ONLY_PATTERNS = [
 // ---------------------------------------------------------------------------
 
 export function parseUserScope(msg: string): UserScope {
-	if (BACKEND_ONLY_PATTERNS.some(p => p.test(msg)))  return 'BACKEND_ONLY';
+	const isFullStack = /\bfull[\s-]?stack\b/i.test(msg) ||
+		(/\b(?:frontend|react|ui|client)\b/i.test(msg) && /\b(?:backend|server|express|nestjs|database)\b/i.test(msg));
+
+	if (isFullStack) return 'ANY';
 	if (FRONTEND_ONLY_PATTERNS.some(p => p.test(msg))) return 'FRONTEND_ONLY';
+	if (BACKEND_ONLY_PATTERNS.some(p => p.test(msg)))  return 'BACKEND_ONLY';
 	return 'ANY';
 }
 
-export function buildPlannerContract(msg: string, advisorIntent: string): PlannerContract {
+export function buildPlannerContract(msg: string, advisorIntent: string, userScope?: UserScope): PlannerContract {
 	// Scope
+	const resolvedScope = userScope || parseUserScope(msg);
 	const scope: ScopeType =
-		advisorIntent.includes('fullstack') ? 'fullstack'
-			: advisorIntent.includes('fe') ? 'frontend'
-				: advisorIntent.includes('be') ? 'backend'
+		resolvedScope === 'FRONTEND_ONLY' || advisorIntent.includes('fe') ? 'frontend'
+			: resolvedScope === 'BACKEND_ONLY' || advisorIntent.includes('be') ? 'backend'
+				: advisorIntent.includes('fullstack') ? 'fullstack'
 					: 'fullstack';
 
 	// Architecture

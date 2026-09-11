@@ -19,6 +19,7 @@ export interface GenerationConfig {
 	maxProjectRepairs:   number;
 	requestTimeoutMs:    number;
 	maxAgentIterations:  number;
+	contextSize?:        number;
 }
 
 export interface LoggingConfig {
