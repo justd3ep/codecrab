@@ -79,7 +79,9 @@ export function classifyRepairMode(kind: string, message: string): RepairMode {
 				? RepairMode.MODIFY_EXISTING
 				: RepairMode.GENERATE_MISSING;
 		case 'missing_import':
-			return RepairMode.REWIRE_IMPORTS;
+			return /missing from (?:generated output|workspace)|cannot resolve local import/i.test(message)
+				? RepairMode.GENERATE_MISSING
+				: RepairMode.REWIRE_IMPORTS;
 		case 'undefined_symbol':
 			return RepairMode.MODIFY_EXISTING;
 		case 'dead_code':
@@ -358,6 +360,9 @@ export async function runRepairLoop(
 			if (signal.aborted) break;
 			job.attempt = attempt;
 
+			// Quarantine previous attempt history from KV cache to prevent token buildup
+			try { session.setChatHistory([]); } catch { /* ignore */ }
+
 			console.log(`[RepairEngine] issue=${issue.kind} mode=${mode} attempt=${attempt}/${job.maxAttempts} file=${currentFile.path}`);
 
 			const prompt = buildSingleIssueRepairPrompt(job);
@@ -379,7 +384,7 @@ export async function runRepairLoop(
 				currentFile   = repaired;
 				issueResolved = true;
 				resolvedCount++;
-				console.log(`[RepairEngine] ✅ resolved: ${issue.kind} in ${currentFile.path}`);
+				console.log(`[RepairEngine] [RESOLVED] ${issue.kind} in ${currentFile.path}`);
 				break;
 			} else {
 				console.log(`[RepairEngine] attempt ${attempt}: issue not resolved after repair`);
@@ -390,7 +395,7 @@ export async function runRepairLoop(
 
 		if (!issueResolved) {
 			skippedCount++;
-			console.log(`[RepairEngine] ⚠️ gave up on: ${issue.kind} in ${currentFile.path} after ${job.maxAttempts} attempts`);
+			console.log(`[RepairEngine] [SKIPPED] gave up on: ${issue.kind} in ${currentFile.path} after ${job.maxAttempts} attempts`);
 		}
 	}
 
@@ -622,7 +627,7 @@ export function buildFERepairPrompt(issues: ValidationIssue[], filesModified: st
 
 	const lines: string[] = [
 		'<validation_errors>',
-		'Frontend validation found TypeScript/React errors in the generated files:',
+		'Frontend validation found errors in the generated files:',
 		'',
 	];
 
@@ -632,11 +637,14 @@ export function buildFERepairPrompt(issues: ValidationIssue[], filesModified: st
 
 	lines.push(
 		'',
-		'Rules:',
-		'  1. Always import React and all used hooks at the top: import React, { useState, useEffect } from "react";',
-		'  2. Never use undeclared variables, undefined functions, or missing packages (e.g. uuid, lodash, mock arrays). Define mock data locally in the component file.',
-		'  3. Re-emit ONLY the specific file(s) that have errors above as <file path="...">...</file> blocks.',
-		'  4. Do NOT re-emit files that are already completed and error-free.',
+		'Rules for Frontend Repair:',
+		'  1. MISSING COMPONENT IMPORTS: If an import cannot be resolved (e.g. ./components/Foo):',
+		'     - EITHER output the missing component file `<file path="...">` implementing that component in full,',
+		'     - OR rewrite the importing file (e.g. src/App.tsx) to remove that import and render the layout/components directly.',
+		'  2. NO PHANTOM WRAPPERS: src/App.tsx must contain real UI (layout, navigation, state, main content). Never output a 5-10 line wrapper that delegates to an ungenerated component.',
+		'  3. MISSING TYPES / UTILS: Define interfaces or mock data directly in the component file, or emit the missing module.',
+		'  4. REACT HOOKS: Always import React and all used hooks at the top: import React, { useState, useEffect } from "react";',
+		'  5. Output ONLY the file(s) that need fixes as <file path="...">...</file> blocks. Do not regenerate files that have no errors.',
 		'</validation_errors>',
 		'',
 		'[Validator] repairing — output the corrected file(s) now.'

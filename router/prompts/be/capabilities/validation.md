@@ -1,35 +1,53 @@
-## Input Validation
+## Input Validation Guidelines
 
-Use `zod` for schema validation. Validate ALL incoming request bodies.
+Validate all incoming request bodies and query parameters safely and deterministically.
 
-Validation middleware (`src/middleware/validate.middleware.ts`):
+### Dependency-Free Validation (Default)
+When third-party validation libraries (such as `zod` or `joi`) are NOT in `package.json`, implement clean, in-file validation functions:
+
 ```typescript
-import { z, ZodSchema } from 'zod';
-import { ValidationError } from '../utils/errors';
+export interface ValidationError {
+  field: string;
+  message: string;
+}
 
-export const validate = (schema: ZodSchema) =>
-  (req: Request, _res: Response, next: NextFunction) => {
-    const result = schema.safeParse(req.body);
-    if (!result.success) {
-      const message = result.error.errors.map(e => `${e.path.join('.')}: ${e.message}`).join('; ');
-      return next(new ValidationError(message));
+export function validateProductInput(body: any): { valid: boolean; errors: ValidationError[] } {
+  const errors: ValidationError[] = [];
+
+  if (!body || typeof body !== 'object') {
+    return { valid: false, errors: [{ field: 'body', message: 'Request body must be an object' }] };
+  }
+  if (!body.name || typeof body.name !== 'string' || body.name.trim().length === 0) {
+    errors.push({ field: 'name', message: 'Product name is required' });
+  }
+  if (body.price === undefined || typeof body.price !== 'number' || body.price < 0) {
+    errors.push({ field: 'price', message: 'Price must be a non-negative number' });
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+```
+
+### Controller Usage Pattern
+Call the validator in the controller and return `400 Bad Request` if invalid:
+
+```typescript
+export async function createProductHandler(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    const { valid, errors } = validateProductInput(req.body);
+    if (!valid) {
+      res.status(400).json({ success: false, error: 'Validation failed', details: errors });
+      return;
     }
-    req.body = result.data;
-    next();
-  };
+    const product = await productService.create(req.body);
+    res.status(201).json({ success: true, data: product });
+  } catch (error) {
+    next(error);
+  }
+}
 ```
 
-Route usage:
-```typescript
-const createUserSchema = z.object({
-  email:    z.string().email(),
-  password: z.string().min(8),
-  name:     z.string().min(2),
-});
-router.post('/', validate(createUserSchema), controller.create);
-```
-
-Rules:
-- Every POST/PUT/PATCH route MUST use `validate()` middleware
-- Validation schemas live in `src/validators/<entity>.validator.ts`
-- Never manually check `req.body.field` — always use validated schema output
+### Rules
+1. Never import from non-existent files like `../utils/validators` or `../utils/errors`.
+2. Do not import `zod` unless `zod` is explicitly listed in `package.json`.
+3. Keep validation functions in the controller or service file alongside the types.

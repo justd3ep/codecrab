@@ -159,11 +159,62 @@ function getLayers(arch: ArchKey): Layer[] {
 	return Object.keys(tmpl) as Layer[];
 }
 
-function inferModulesFromIntent(advisor: AdvisorV2Result): string[] {
+export function extractDomainModules(text: string): string[] {
+	const msg = text.toLowerCase();
+
+	// E-commerce / Shop / Store / Catalog / Apparel / Fashion
+	if (/\b(?:product|store|shop|cart|catalog|ecommerce|e-commerce|fashion|clothing|checkout|order|apparel)\b/.test(msg)) {
+		const mods: string[] = ['products'];
+		if (/\b(?:cart|basket|bag|drawer)\b/.test(msg)) mods.push('cart');
+		if (/\b(?:order|checkout|payment)\b/.test(msg)) mods.push('orders');
+		if (/\b(?:review|rating)\b/.test(msg)) mods.push('reviews');
+		if (mods.length === 1) mods.push('cart');
+		return mods;
+	}
+
+	// SaaS / Dashboard / Billing / Invoices / Analytics
+	if (/\b(?:billing|invoice|subscription|saas|analytics|metric|churn|transaction)\b/.test(msg)) {
+		const mods: string[] = ['invoices'];
+		if (/\b(?:metric|analytic|statistic|kpi|chart)\b/.test(msg)) mods.push('metrics');
+		if (/\b(?:customer|client|subscriber)\b/.test(msg)) mods.push('customers');
+		if (mods.length === 1) mods.push('metrics');
+		return mods;
+	}
+
+	// Auth / Users
+	if (/\b(?:auth|login|signup|register|user|jwt|role|permission|password)\b/.test(msg)) {
+		return ['auth', 'users'];
+	}
+
+	// Task / Kanban / Todo / Project
+	if (/\b(?:task|todo|kanban|trello|project|board|column|issue)\b/.test(msg)) {
+		return ['tasks', 'projects'];
+	}
+
+	// Blog / CMS / Posts / Articles
+	if (/\b(?:blog|post|article|comment|content|author|cms)\b/.test(msg)) {
+		return ['posts', 'comments'];
+	}
+
+	// Social / Messaging / Chat
+	if (/\b(?:chat|message|conversation|thread|channel)\b/.test(msg)) {
+		return ['messages', 'channels'];
+	}
+
+	return ['items'];
+}
+
+function inferModulesFromIntent(advisor: AdvisorV2Result, userRequest?: string): string[] {
 	const intent = advisor.intent ?? '';
-	if (intent.includes('auth')) return ['auth', 'users'];
-	if (advisor.requiredFeatures?.includes('jwt')) return ['auth', 'users'];
-	return ['users'];
+	if (userRequest) {
+		const extracted = extractDomainModules(userRequest);
+		if (extracted.length > 0 && !(extracted.length === 1 && extracted[0] === 'items')) {
+			return extracted;
+		}
+	}
+	if (intent.includes('auth') || advisor.requiredFeatures?.includes('jwt')) return ['auth', 'users'];
+	if (userRequest) return extractDomainModules(userRequest);
+	return ['items'];
 }
 
 // ---------------------------------------------------------------------------
@@ -171,11 +222,12 @@ function inferModulesFromIntent(advisor: AdvisorV2Result): string[] {
 // ---------------------------------------------------------------------------
 
 export function buildExecutionGraph(
-	advisor:    AdvisorV2Result,
-	inspection: WorkspaceInspection | null,
+	advisor:     AdvisorV2Result,
+	inspection:  WorkspaceInspection | null,
+	userRequest?: string,
 ): ExecutionGraph | null {
 	try {
-		return _buildGraph(advisor, inspection);
+		return _buildGraph(advisor, inspection, userRequest);
 	} catch (e: any) {
 		console.error(`[GraphBuilder] buildExecutionGraph failed: ${e.message}`);
 		return null;
@@ -183,13 +235,16 @@ export function buildExecutionGraph(
 }
 
 function _buildGraph(
-	advisor:    AdvisorV2Result,
-	inspection: WorkspaceInspection | null,
+	advisor:     AdvisorV2Result,
+	inspection:  WorkspaceInspection | null,
+	userRequest?: string,
 ): ExecutionGraph {
 	const arch     = (advisor.architecture ?? 'unknown') as ArchKey;
-	const modules  = (advisor.modules && advisor.modules.length > 0)
-		? advisor.modules
-		: inferModulesFromIntent(advisor);
+	const hasMeaningfulModules = advisor.modules && advisor.modules.length > 0 &&
+		!advisor.modules.some(m => ['controllers', 'services', 'repositories', 'domain', 'application', 'infrastructure'].includes(m.toLowerCase()));
+	const modules  = hasMeaningfulModules
+		? advisor.modules!
+		: inferModulesFromIntent(advisor, userRequest);
 	const language = advisor.language ?? 'typescript';
 	const ext      = language === 'typescript' ? 'ts' : 'js';
 

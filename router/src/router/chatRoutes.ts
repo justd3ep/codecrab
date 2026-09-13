@@ -443,7 +443,7 @@ router.post('/chat/completions', async (req, res) => {
 				})();
 
 
-				const graph = buildExecutionGraph(v2ForGraph, inspection);
+				const graph = buildExecutionGraph(v2ForGraph, inspection, lastUserMsg);
 
 				// ── 3. Decide whether incremental engine is worthwhile ─────
 				const useIncremental = readWriteMode === 'write' && shouldUseIncrementalEngine({
@@ -462,7 +462,7 @@ router.post('/chat/completions', async (req, res) => {
 					// ── 5. Build capability-enriched system prompt ─────────────
 					const features = v2ForGraph.requiredFeatures ?? plannerContract.requiredFeatures;
 					const architecture = v2ForGraph.architecture ?? plannerContract.architecture;
-					const baseBePrompt = buildBESystemPrompt(lastUserMsg, 'create', openFiles?.[0]);
+					const baseBePrompt = buildBESystemPrompt(lastUserMsg, 'create', openFiles?.[0], workspaceRoot);
 					const incrSysPrompt = buildCapabilitySystemPrompt(baseBePrompt, features, architecture);
 
 					// ── 6. Set up SSE stream ───────────────────────────────────

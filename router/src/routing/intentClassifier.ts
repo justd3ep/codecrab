@@ -286,6 +286,71 @@ export async function runAdvisorProjectSummary(
 	}
 }
 
+/**
+ * Decomposes and disambiguates the user goal when an autoregressive repetition loop is detected.
+ * Uses the fast 0.6B advisor model to translate broad goals into a structured, atomic [TASK_SPEC].
+ */
+export async function runAdvisorLoopDecomposition(
+	advisorModel: LlamaModel,
+	params: {
+		userRequest: string;
+		filesWritten: string[];
+		loopingFile: string;
+		specialist?: 'fe' | 'be';
+	},
+): Promise<string> {
+	try {
+		console.log(`[Advisor] Running loop decomposition pass on looping file: ${params.loopingFile || 'unknown'}...`);
+		const advisorCtx = await advisorModel.createContext({ contextSize: 1024 });
+		const seq = advisorCtx.getSequence();
+
+		const systemPrompt = [
+			'You are the CodeCrab Task Disambiguator.',
+			'The code generator entered a repetition loop and has been paused.',
+			'Your job: inspect the user goal and files already written, and output an exact, concise TASK SPECIFICATION for the next uncompleted component/file.',
+			'Output MUST strictly follow this syntax and nothing else:',
+			'[TASK_SPEC]',
+			'COMPLETED: <comma-separated list of completed files>',
+			'FORBIDDEN: <do not repeat the looping file>',
+			'NEXT_TARGET_FILE: <path of the next missing file to generate>',
+			'COMPONENT_NAME: <name of exported component/function>',
+			'PROPS_INTERFACE: <name of props interface and key fields>',
+			'KEY_ELEMENTS: <3-5 essential UI elements or logic handlers>',
+			'[/TASK_SPEC]',
+			'Keep it factual, brief (under 120 words), and strict. Never output code blocks or markdown fences.',
+		].join('\n');
+
+		const userContent = [
+			`User Goal: ${params.userRequest.slice(0, 500)}`,
+			`Files Already Written: ${params.filesWritten.join(', ') || 'None'}`,
+			`Repeated File (FORBIDDEN to generate again): ${params.loopingFile || 'None'}`,
+		].join('\n');
+
+		const fullPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n<|im_start|>user\n${userContent} /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n`;
+		const inputTokens = advisorModel.tokenize(fullPrompt);
+
+		let raw = '';
+		const eosToken = advisorModel.tokens.eos;
+		for await (const token of seq.evaluate(inputTokens, { temperature: 0.1 })) {
+			const text = advisorModel.detokenize([token]);
+			raw += text;
+			if (token === eosToken) break;
+			if (raw.length > 800) break;
+		}
+
+		await advisorCtx.dispose();
+		let spec = raw.trim();
+		if (!spec.includes('[TASK_SPEC]')) {
+			spec = `[TASK_SPEC]\nCOMPLETED: ${params.filesWritten.join(', ') || 'None'}\nFORBIDDEN: Do not re-emit ${params.loopingFile}\nNEXT_TARGET_FILE: src/App.tsx (or next missing component)\nKEY_ELEMENTS: Wire all completed components with state and action handlers\n[/TASK_SPEC]`;
+		}
+		console.log(`[Advisor] Loop task specification generated (${spec.length} chars)`);
+		return spec;
+	} catch (e: any) {
+		console.warn('[Advisor] Loop decomposition failed, using fallback:', e.message);
+		return `[TASK_SPEC]\nCOMPLETED: ${params.filesWritten.join(', ') || 'None'}\nFORBIDDEN: Do not re-emit ${params.loopingFile}\nNEXT_TARGET_FILE: src/App.tsx (or next missing component)\nKEY_ELEMENTS: Wire all completed components with state and action handlers\n[/TASK_SPEC]`;
+	}
+}
+
 // ---------------------------------------------------------------------------
 // 7. Ensemble helpers (scoring / classifying)
 // ---------------------------------------------------------------------------

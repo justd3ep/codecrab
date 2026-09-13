@@ -1,35 +1,62 @@
-## Error Handling
+## Centralized Error Handling Guidelines
 
-Implement a centralized error handler. Never send raw errors to the client.
+Implement consistent error handling across routes, controllers, and services.
 
-Error classes (`src/utils/errors.ts`):
+### Application Error Class
+Define a reusable `AppError` class. It can be declared in `src/models/error.ts` or directly in `src/middleware/errorHandler.ts` or inline:
+
 ```typescript
 export class AppError extends Error {
   constructor(
     public message: string,
     public statusCode: number = 500,
     public code?: string,
-  ) { super(message); this.name = 'AppError'; }
-}
-export class NotFoundError       extends AppError { constructor(m = 'Not found')    { super(m, 404, 'NOT_FOUND'); } }
-export class UnauthorizedError   extends AppError { constructor(m = 'Unauthorized') { super(m, 401, 'UNAUTHORIZED'); } }
-export class ValidationError     extends AppError { constructor(m: string)          { super(m, 400, 'VALIDATION_ERROR'); } }
-export class ForbiddenError      extends AppError { constructor(m = 'Forbidden')    { super(m, 403, 'FORBIDDEN'); } }
-export class ConflictError       extends AppError { constructor(m: string)          { super(m, 409, 'CONFLICT'); } }
-```
-
-Global error handler (last middleware in app.ts):
-```typescript
-app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
-  if (err instanceof AppError) {
-    return res.status(err.statusCode).json({ success: false, message: err.message, code: err.code });
+  ) {
+    super(message);
+    this.name = 'AppError';
+    Object.setPrototypeOf(this, new.target.prototype);
   }
-  console.error(err);
-  res.status(500).json({ success: false, message: 'Internal server error' });
-});
+}
+
+export class NotFoundError extends AppError {
+  constructor(message = 'Resource not found') {
+    super(message, 404, 'NOT_FOUND');
+  }
+}
+
+export class BadRequestError extends AppError {
+  constructor(message = 'Bad request') {
+    super(message, 400, 'BAD_REQUEST');
+  }
+}
 ```
 
-Rules:
-- ALL async route handlers must call `next(err)` on error
-- Services throw AppError subclasses — never raw strings
-- Controllers never send raw error messages to the client
+### Express Global Error Middleware
+Register as the last middleware in `src/app.ts`:
+
+```typescript
+import { Request, Response, NextFunction } from 'express';
+
+export function errorHandler(
+  err: any,
+  _req: Request,
+  res: Response,
+  _next: NextFunction
+): void {
+  const statusCode = err.statusCode || 500;
+  const message = err.message || 'Internal server error';
+
+  console.error('[Error]', err);
+
+  res.status(statusCode).json({
+    success: false,
+    error: message,
+    code: err.code || 'INTERNAL_ERROR',
+  });
+}
+```
+
+### Rules
+1. Never import from non-existent `../utils/errors` files.
+2. In controllers, catch errors with try/catch and pass to `next(err)`.
+3. In services, throw `AppError`, `NotFoundError`, or standard `Error`.

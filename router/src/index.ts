@@ -13,6 +13,8 @@ import { tier2Retrieve, patchTier2Caches, shouldSkipFEPhase, cleanupArtifacts, p
 import { buildArtifactFromFiles, writeArtifact, deleteArtifact } from './rag/artifact.js';
 import { runPostGenerationValidator } from './validator.js';
 import type { ValidationContract, ValidationIssue } from './validator.js';
+import { selectTopDependencyFiles, buildDependencyContextBlock } from './dependencySelector.js';
+import { buildFERepairPrompt } from './repairEngine.js';
 import { inspectWorkspace } from './workspaceInspector.js';
 import { buildExecutionGraph, nextPendingNode, isGraphComplete, graphSummary, markNodeFailed } from './planner.js';
 import type { AdvisorV2Result, ExecutionGraph } from './planner.js';
@@ -30,7 +32,7 @@ import { makeHealthRoutes } from './router/healthRoutes.js';
 import config               from '@/config/index.js';
 import { activeContextUsage, updateContextUsage, setEffectiveContextSize, effectiveContextSize } from './telemetry/contextUsage.js';
 import { ensureFrontendScaffold, ensureBackendScaffold, mergePackageJson, mergeInitSh } from './frontendScaffold.js';
-import { runAdvisorProjectSummary } from './routing/intentClassifier.js';
+import { runAdvisorProjectSummary, runAdvisorLoopDecomposition } from './routing/intentClassifier.js';
 
 // ---------------------------------------------------------------------------
 // Constraint Parser — runs BEFORE advisor, highest priority
@@ -224,7 +226,9 @@ function classifyRepairMode(kind: string, message: string): RepairMode {
 			// Layer violation = rewrite existing file, not add new one
 			return /layer violation|imports.*directly|belongs in/i.test(message) ? RepairMode.MODIFY_EXISTING : RepairMode.GENERATE_MISSING;
 		case 'missing_import':
-			return RepairMode.REWIRE_IMPORTS;
+			return /missing from (?:generated output|workspace)|cannot resolve local import/i.test(message)
+				? RepairMode.GENERATE_MISSING
+				: RepairMode.REWIRE_IMPORTS;
 		case 'undefined_symbol':
 			return RepairMode.MODIFY_EXISTING;
 		case 'dead_code':
@@ -1491,9 +1495,13 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'CRITICAL BOUNDARIES:',
 			'1. ONLY import third-party packages from the installed list above, or standard React ("react", "react/jsx-runtime").',
 			'2. NEVER import uninstalled packages (e.g. recharts, react-hook-form, zod, formik, axios, framer-motion) unless explicitly listed above.',
-			'3. For forms: Use standard React useState with controlled inputs unless react-hook-form is listed above.',
-			'4. For charts/metrics: Use clean SVG or Tailwind CSS elements unless recharts is listed above.',
-			'5. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
+			'3. ICONS: ONLY import icons from "lucide-react" using named imports (e.g. import { Send, Plus, X, Settings, LayoutDashboard, Bot, Building2, UserPlus } from "lucide-react";). NEVER use undeclared identifiers like IconSend or IconX.',
+			'4. IMPORTS: If src/App.tsx renders <MessageInput /> or <LeftSidebar />, it MUST explicitly import them: import { MessageInput } from "./components/MessageInput";.',
+			'5. HOOKS: ALWAYS import hooks: import React, { useState, useEffect } from "react";. NEVER call useState after an early return or if condition.',
+			'6. STATE: Use dynamic useState arrays for messages and lists. NEVER hardcode static arrays. Wire send and new chat buttons to mutate state.',
+			'7. NO PHANTOM WRAPPERS: NEVER emit an App.tsx that only renders a wrapper like <MainView /> or <DashboardView /> unless you output that exact component. App.tsx must directly import and assemble the requested subcomponents.',
+			'8. NO FAKE UTILITIES: NEVER import from "@/utils/..." or "@/lib/..." (e.g. "@/utils/currency"). If you need helper functions like formatCurrency, formatPrice, or formatDate, write them directly inside the component file or output the utility file.',
+			'9. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
 		].join('\n'));
 	} else {
 		parts.push([
@@ -1537,6 +1545,7 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'3. ZERO ORPHANS: Every file emitted in `src/components/` MUST be imported and rendered in the component tree.',
 			'4. FILENAME PARITY: The exported component name MUST match the filename (e.g. `src/components/HabitCard.tsx` exports `export function HabitCard`).',
 			'5. FULL REQUIREMENT COVERAGE: Every requirement requested by the user must be implemented with real interactive state and handlers.',
+			'6. NO PHANTOM WRAPPERS: src/App.tsx MUST be the real main view holding application state (useState), layouts, navigation/sidebar, and child views. NEVER output a tiny 5-10 line wrapper that delegates to an ungenerated <MainView /> or <DashboardView />. Either compose the modular components inside src/App.tsx, or if you extract a container component, you MUST emit that component in <file path="...">.',
 		].join('\n'));
 	}
 
@@ -1556,6 +1565,7 @@ function buildBESystemPrompt(
 	userMessage: string,
 	mode: AgentMode,
 	activeFile?: string,
+	workspaceRoot?: string,
 ): string {
 	const parts: string[] = [];
 	const activePrompts: string[] = [];
@@ -1569,18 +1579,98 @@ function buildBESystemPrompt(
 
 	addBE('agent');
 
+	let installedPkgs: string[] = [];
+	if (workspaceRoot) {
+		const pkgPath = path.join(workspaceRoot, 'package.json');
+		try {
+			if (fs.existsSync(pkgPath)) {
+				const raw = fs.readFileSync(pkgPath, 'utf-8');
+				const parsed = JSON.parse(raw);
+				const deps = Object.keys(parsed.dependencies || {});
+				const devDeps = Object.keys(parsed.devDependencies || {});
+				installedPkgs = Array.from(new Set([...deps, ...devDeps]));
+			}
+		} catch { /* ignore */ }
+	}
+
+	const hasPkg = (name: string) => installedPkgs.includes(name);
+
 	const ext = activeFile ? path.extname(activeFile).toLowerCase() : '';
-	if (ext === '.ts' || ext === '.js' || msg.includes('typescript') || msg.includes('express') || msg.includes('node')) {
+	if (ext === '.ts' || ext === '.js' || msg.includes('typescript') || msg.includes('express') || msg.includes('node') || mode === 'create') {
 		if (ext === '.js' || msg.includes('javascript')) addBE('javascript');
 		else addBE('typescript');
 		addBE('node');
 	}
-	if (msg.includes('express')) addBE('express');
-	if (msg.includes('sql') || msg.includes('database') || msg.includes('postgres') || msg.includes('mysql')) addBE('sql');
+
+	// Express & REST are standard for backend APIs
+	const isExpress = hasPkg('express') || msg.includes('express') || mode === 'create';
+	if (isExpress) addBE('express');
+	addBE('rest');
+
+	// Database vs In-Memory DB
+	const hasSqlOrOrm = [
+		hasPkg('pg'), hasPkg('mysql'), hasPkg('mysql2'), hasPkg('sqlite3'),
+		hasPkg('prisma'), hasPkg('@prisma/client'), hasPkg('typeorm'), hasPkg('mongoose')
+	].some(Boolean);
+
+	if (hasSqlOrOrm || msg.includes('sql') || msg.includes('database') || msg.includes('postgres') || msg.includes('mysql')) {
+		addBE('sql');
+	} else {
+		addBE('in-memory-db');
+	}
+
+	// Domain skills & capabilities
+	const DOMAIN_SKILLS: Record<string, string[]> = {
+		'ecommerce': ['product', 'shop', 'store', 'cart', 'checkout', 'catalog', 'clothing', 'fashion', 'price', 'order', 'e-commerce', 'ecommerce'],
+		'saas-dashboard': ['dashboard', 'metrics', 'billing', 'analytics', 'invoice', 'subscription', 'saas', 'revenue', 'transaction'],
+		'capabilities/validation': ['validate', 'validation', 'schema', 'input', 'form'],
+		'capabilities/error-handling': ['error', 'exception', 'handler'],
+		'capabilities/controller-pattern': ['controller', 'mvc', 'repository', 'clean', 'backend', 'api'],
+		'capabilities/service-pattern': ['service', 'repository', 'clean', 'backend', 'api'],
+		'capabilities/jwt': ['jwt', 'token', 'auth', 'login', 'bearer'],
+		'capabilities/pagination': ['paginate', 'pagination', 'page', 'limit', 'offset'],
+	};
+
+	for (const [skill, keywords] of Object.entries(DOMAIN_SKILLS)) {
+		const matched = keywords.some(kw => msg.includes(kw));
+		if (matched || (mode === 'create' && (skill.includes('error-handling') || skill.includes('controller-pattern') || skill.includes('service-pattern')))) {
+			addBE(skill);
+		}
+	}
 
 	if (mode === 'create') addBE('create-mode');
 	else if (mode === 'edit') addBE('edit-mode');
 	else addBE('needs-context-mode');
+
+	// Inject workspace dependency constraints
+	if (installedPkgs.length > 0) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'WORKSPACE DEPENDENCY CONSTRAINTS (package.json)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			`Installed packages: ${installedPkgs.join(', ')}`,
+			'CRITICAL BOUNDARIES:',
+			'1. ONLY import third-party packages from the installed list above, or standard Node.js built-ins ("http", "path", "fs", "crypto").',
+			'2. NEVER import uninstalled packages (such as mongoose, prisma, typeorm, bcrypt, jsonwebtoken, zod, axios, express-validator) unless explicitly listed above.',
+			'3. NO PHANTOM UTILITIES: NEVER import from non-existent files like "../utils/logger", "../utils/validators", "../utils/errors", or "../models/database". If helper functions are needed, declare them locally in the file or in shared models/types.',
+			'4. SERVER ARCHITECTURE: "src/app.ts" configures middleware and mounts routes, exporting app (export default app;). "src/server.ts" imports app and calls app.listen(PORT). NEVER call app.listen() inside "src/app.ts".',
+			'5. IN-MEMORY STORAGE: If no database package (mongoose/prisma/pg) is installed, store data using an in-memory Map or Array in the service with initial mock data.',
+		].join('\n'));
+	} else {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'WORKSPACE DEPENDENCY CONSTRAINTS',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'CRITICAL BOUNDARIES:',
+			'1. ONLY import standard Express and Node.js built-ins ("http", "path", "fs", "crypto").',
+			'2. NEVER import uninstalled packages (such as mongoose, prisma, bcrypt, jsonwebtoken, zod).',
+			'3. NO PHANTOM UTILITIES: Never import from "../utils/..." unless that file already exists on disk. Declare helper functions locally.',
+			'4. SERVER ARCHITECTURE: "src/app.ts" exports app; "src/server.ts" calls app.listen(PORT). Never call app.listen() in both.',
+			'5. IN-MEMORY STORAGE: Use an in-memory Map or Array with sample seed data for data persistence.',
+		].join('\n'));
+	}
 
 	console.log('PROMPTS LOADED (BE):', JSON.stringify(activePrompts, null, 2));
 	return parts.join('\n\n');
@@ -1606,7 +1696,7 @@ function buildSystemPrompt(
 	if (currentSpecialist === 'fe') {
 		prompt = buildFESystemPrompt({ userMessage, mode, activeFile, workspaceRoot, packageJson, openFiles });
 	} else {
-		prompt = buildBESystemPrompt(userMessage, mode, activeFile);
+		prompt = buildBESystemPrompt(userMessage, mode, activeFile, workspaceRoot);
 	}
 
 	if (readWriteMode === 'read') {
@@ -2823,8 +2913,8 @@ function isExplicitCodeRequest(msg: string): boolean {
 // ---------------------------------------------------------------------------
 
 const MAX_TOKENS = 4096;
-const REPEAT_PENALTY = 1.15;
-const REPEAT_PENALTY_TOKENS = 64;
+const REPEAT_PENALTY = 1.18;
+const REPEAT_PENALTY_TOKENS = 256;
 const REQUEST_TIMEOUT_MS = 3600000; // 60 minutes (3600 seconds)
 const MAX_AGENT_ITERATIONS = 6; // 3 for BE pass + 3 for FE pass in full-stack mode
 const MAX_CORRECTIONS_PER_FILE = 3;
@@ -3279,7 +3369,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 				})();
 
 
-				const graph = buildExecutionGraph(v2ForGraph, inspection);
+				const graph = buildExecutionGraph(v2ForGraph, inspection, lastUserMsg);
 
 				// ── 3. Decide whether incremental engine is worthwhile ─────
 				const useIncremental = readWriteMode === 'write' && shouldUseIncrementalEngine({
@@ -3298,7 +3388,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 					// ── 5. Build capability-enriched system prompt ─────────────
 					const features = v2ForGraph.requiredFeatures ?? plannerContract.requiredFeatures;
 					const architecture = v2ForGraph.architecture ?? plannerContract.architecture;
-					const baseBePrompt = buildBESystemPrompt(lastUserMsg, 'create', openFiles?.[0]);
+					const baseBePrompt = buildBESystemPrompt(lastUserMsg, 'create', openFiles?.[0], workspaceRoot);
 					const incrSysPrompt = buildCapabilitySystemPrompt(baseBePrompt, features, architecture);
 
 					// ── 6. Set up SSE stream ───────────────────────────────────
@@ -3617,6 +3707,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 		const originalUserRequest = enrichedLastMessage;
 		let justCompacted = false;
 		let compactionRetryDone = false;
+		let loopRecoveryCount = 0;
 
 		for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
 			console.log(`[Router] --- Agentic iteration ${iteration + 1} ---`);
@@ -3711,9 +3802,103 @@ app.post('/v1/chat/completions', async (req, res) => {
 			} catch (e) { }
 
 			if (loopDetected) {
-				console.warn(`[Router] Loop detected: ${loopReason}. Aborting generation.`);
-				streamChunk(res, `\n\n[Warning] **Generation stopped:** ${loopReason}\n`);
-				throw new Error(`Infinite loop detected: ${loopReason}`);
+				console.warn(`[Router] Loop detected: ${loopReason}. Harvesting files and recovering with fresh context.`);
+				streamEvent(res, {
+					type: 'warning',
+					stage: 'generate',
+					message: `Repetition detected. Harvesting files and restarting with fresh context sequence...`
+				});
+
+				// Harvest completed closed file blocks before cutoff
+				if (workspaceRoot && fullResponse.length > 0) {
+					const completedEdits = extractFallbackEdits(fullResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
+					for (const edit of completedEdits) {
+						const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode);
+						if (wr.success && !filesModified.includes(edit.path)) {
+							filesModified.push(edit.path);
+							streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
+							if (wr.diffMsg) streamChunk(res, wr.diffMsg);
+						}
+					}
+				}
+
+				if (loopRecoveryCount < 3 && iteration < MAX_AGENT_ITERATIONS - 1) {
+					loopRecoveryCount++;
+
+					// Extract the looping file if matched
+					const pathMatch = loopReason.match(/path="([^"]+)"/i);
+					const loopingFile = (pathMatch && pathMatch[1]) ? pathMatch[1] : '';
+
+					// Run 0.6B Advisor to distill the user goal into an atomic [TASK_SPEC]
+					let taskSpec = '';
+					try {
+						const advisorModel = await mm.acquire('advisor');
+						taskSpec = await runAdvisorLoopDecomposition(advisorModel, {
+							userRequest: originalUserRequest,
+							filesWritten: filesModified,
+							loopingFile,
+							specialist: currentSpecialist,
+						});
+					} catch (e: any) {
+						console.warn('[Advisor] Loop task decomposition pass failed, using fallback:', e.message);
+						taskSpec = `[TASK_SPEC]\nCOMPLETED: ${filesModified.join(', ') || 'None'}\nFORBIDDEN: Do not re-emit ${loopingFile}\nNEXT_TARGET_FILE: src/App.tsx (or next missing component)\nKEY_ELEMENTS: Wire all completed components with state and action handlers\n[/TASK_SPEC]`;
+					}
+
+					// Flush bloated/looping KV cache
+					if (context) {
+						await context.dispose();
+						context = null;
+					}
+
+					// Re-acquire specialist model and re-arm fresh context
+					activeModel = await mm.acquire(intent);
+					context = await activeModel.createContext({ contextSize: activeContextSize });
+					session = new LlamaChatSession({
+						contextSequence: context.getSequence(),
+						systemPrompt: systemPrompt,
+					});
+
+					// Select top 3 dependencies from disk
+					const topDeps = workspaceRoot
+						? selectTopDependencyFiles(workspaceRoot, filesModified, 'src/App.tsx', 3)
+						: [];
+					const depContextBlock = buildDependencyContextBlock(topDeps);
+
+					currentPrompt = [
+						`--- Repetition Recovery & Task Specification ---`,
+						`A repetition pattern was detected on "${loopingFile || 'component'}". The context sequence has been wiped clean.`,
+						`Advisor Task Specification:`,
+						taskSpec,
+						depContextBlock,
+						`--- Required Action ---`,
+						`1. Follow the [TASK_SPEC] above strictly: DO NOT output or repeat ${loopingFile || 'any completed file'}.`,
+						`2. Generate the NEXT_TARGET_FILE specified in the task specification, or the remaining missing components.`,
+						`3. If \`src/App.tsx\` needs to be created or updated, emit the complete <file path="src/App.tsx"> block wiring the components from disk. Do NOT emit a phantom wrapper like <MainView />.`,
+						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+					].filter(Boolean).join('\n\n');
+
+					// Update baseline tokens
+					const freshTokens = activeModel ? activeModel.tokenize(systemPrompt + '\n' + currentPrompt).length : 0;
+					const newBaseline = Math.max(session.sequence?.nextTokenIndex || 0, freshTokens);
+					const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
+					updateContextUsage(newBaseline, activeContextSize, modelLabel);
+					streamEvent(res, {
+						type: 'context_usage',
+						used: newBaseline,
+						total: activeContextSize,
+						percent: Math.min(100, Math.round((newBaseline / activeContextSize) * 100)),
+						model: modelLabel
+					});
+
+					console.log(`[Router] Context sequence reset cleanly. Resuming generation (loop recovery attempt ${loopRecoveryCount}/3)...`);
+					continue;
+				} else {
+					if (filesModified.length > 0) {
+						console.warn(`[Router] Max loop recovery attempts reached, but ${filesModified.length} file(s) are on disk. Proceeding.`);
+						break;
+					}
+					throw new Error(`Infinite loop detected: ${loopReason}`);
+				}
 			}
 
 			if (compactionTriggered) {
@@ -3787,19 +3972,25 @@ app.post('/v1/chat/completions', async (req, res) => {
 						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
 					].join('\n\n');
 				} else {
+					const topDeps = workspaceRoot
+						? selectTopDependencyFiles(workspaceRoot, filesModified, 'src/App.tsx', 3)
+						: [];
+					const depContextBlock = buildDependencyContextBlock(topDeps);
+
 					currentPrompt = [
 						`--- Project State (After 75% Context Compaction) ---`,
 						`Advisor Project Summary:\n${projectSummary}`,
 						`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+						depContextBlock,
 						`--- Original User Request ---`,
 						originalUserRequest,
 						`--- Required Action ---`,
-						`The generator was paused due to token limits and has now been given a fresh context sequence.`,
-						`1. Inspect the original request against the files written so far.`,
+						`The generator was paused due to token limits and has now been given a fresh context sequence with the top dependency files preserved above.`,
+						`1. Inspect the dependency files above to reference their exact exported component names, props, and interfaces.`,
 						`2. If any requested component, modal, action handler, filter, or stat card is still missing or incomplete, generate it now.`,
-						`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now.`,
+						`3. If \`src/App.tsx\` needs to be created or updated, emit the complete <file path="src/App.tsx"> block wiring the components from disk. Do NOT emit a phantom wrapper like <MainView />.`,
 						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
-					].join('\n\n');
+					].filter(Boolean).join('\n\n');
 				}
 
 				// Compute and emit new ~20% baseline context usage
@@ -3969,13 +4160,20 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 							if (hasErrors || !validationResult.passed) {
 								if (iteration === MAX_AGENT_ITERATIONS - 1) {
+									if (filesModified.length > 0) {
+										console.warn(`[Router] Max agent iterations (${MAX_AGENT_ITERATIONS}) reached, but ${filesModified.length} file(s) were successfully written to disk. Exiting repair loop gracefully.`);
+										streamChunk(res, `\n\n> Note: Validation completed after ${MAX_AGENT_ITERATIONS} steps. Generated files have been preserved on disk.\n`);
+										break;
+									}
 									throw new Error(`Agent Iteration Protection: Exceeded maximum iteration limit of ${MAX_AGENT_ITERATIONS} steps without finding a valid correction.`);
 								}
 								// Abort guard — stop looping if client disconnected
 								if (controller.signal.aborted) break;
 
 								// Targeted repair: feed only specific issues back to the model
-								const repairPrompt = buildTargetedRepairPrompt(validationResult.issues, filesModified, workspaceRoot ?? '');
+								const repairPrompt = currentSpecialist === 'fe'
+									? buildFERepairPrompt(validationResult.issues, filesModified)
+									: buildTargetedRepairPrompt(validationResult.issues, filesModified, workspaceRoot ?? '');
 								currentPrompt = repairPrompt || `<validation_errors>\nSome files failed validation.\n${errorOutputs.join('\n')}\nRe-emit the corrected file(s).\n</validation_errors>`;
 
 								console.log(`[Router] Fallback validation failed, looping back to LLM for correction...`);
@@ -4075,8 +4273,12 @@ Continue with your task using plain text only. Do not emit any file blocks or wr
 				}
 			}
 
-			// If we reached the last iteration and the model is trying to continue (e.g. it emitted a tool call), raise an error
+			// If we reached the last iteration and the model is trying to continue (e.g. it emitted a tool call), check if files were already generated
 			if (iteration === MAX_AGENT_ITERATIONS - 1) {
+				if (filesModified.length > 0) {
+					console.warn(`[Router] Max agent iterations reached with active tool call, but ${filesModified.length} file(s) were written. Finishing.`);
+					break;
+				}
 				throw new Error(`Agent Iteration Protection: Exceeded maximum iteration limit of ${MAX_AGENT_ITERATIONS} steps without finding a final response.`);
 			}
 
@@ -4237,6 +4439,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			let feJsxRepairDone = false; // allow one JSX repair pass in FE loop
 			let feJustCompacted = false;
 			let feCompactionRetryDone = false;
+			let feLoopRecoveryCount = 0;
 
 			for (let feIter = 0; feIter < MAX_AGENT_ITERATIONS; feIter++) {
 				console.log(`[Router] --- FE iteration ${feIter + 1} ---`);
@@ -4308,8 +4511,96 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 				} catch (e) { }
 
 				if (feLoopDetected) {
-					streamEvent(res, { type: 'warning', stage: 'generate', message: `FE generation stopped: ${feLoopReason}` });
-					throw new Error(`FE loop: ${feLoopReason}`);
+					console.warn(`[Router] FE Loop detected: ${feLoopReason}. Harvesting files and recovering with fresh context.`);
+					streamEvent(res, {
+						type: 'warning',
+						stage: 'generate',
+						message: `FE repetition detected. Harvesting files and restarting with fresh context sequence...`
+					});
+
+					// Harvest completed closed file blocks before cutoff
+					if (workspaceRoot && feResponse.length > 0) {
+						const completedEdits = extractFallbackEdits(feResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
+						for (const edit of completedEdits) {
+							const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode);
+							if (wr.success && !filesModified.includes(edit.path)) {
+								filesModified.push(edit.path);
+								streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
+								if (wr.diffMsg) streamChunk(res, wr.diffMsg);
+							}
+						}
+					}
+
+					if (feLoopRecoveryCount < 3 && feIter < MAX_AGENT_ITERATIONS - 1) {
+						feLoopRecoveryCount++;
+
+						const pathMatch = feLoopReason.match(/path="([^"]+)"/i);
+						const loopingFile = (pathMatch && pathMatch[1]) ? pathMatch[1] : '';
+
+						let feTaskSpec = '';
+						try {
+							const advisorModel = await mm.acquire('advisor');
+							feTaskSpec = await runAdvisorLoopDecomposition(advisorModel, {
+								userRequest: originalUserRequest,
+								filesWritten: filesModified,
+								loopingFile,
+								specialist: 'fe',
+							});
+						} catch (e: any) {
+							console.warn('[Advisor] FE Loop task decomposition pass failed, using fallback:', e.message);
+							feTaskSpec = `[TASK_SPEC]\nCOMPLETED: ${filesModified.join(', ') || 'None'}\nFORBIDDEN: Do not re-emit ${loopingFile}\nNEXT_TARGET_FILE: src/App.tsx\nKEY_ELEMENTS: Wire all completed components with state and action handlers\n[/TASK_SPEC]`;
+						}
+
+						if (context) {
+							await context.dispose();
+							context = null;
+						}
+
+						feModel = await mm.acquire('frontend');
+						context = await feModel.createContext({ contextSize: feContextSize });
+						feSession = new LlamaChatSession({
+							contextSequence: context.getSequence(),
+							systemPrompt: feSystemPrompt,
+						});
+
+						const topDeps = workspaceRoot
+							? selectTopDependencyFiles(workspaceRoot, filesModified, 'src/App.tsx', 3)
+							: [];
+						const depContextBlock = buildDependencyContextBlock(topDeps);
+
+						fePrompt = [
+							`--- Repetition Recovery & Task Specification ---`,
+							`A repetition pattern was detected on "${loopingFile || 'component'}". The context sequence has been wiped clean.`,
+							`Advisor Task Specification:`,
+							feTaskSpec,
+							depContextBlock,
+							`--- Required Action ---`,
+							`1. Follow the [TASK_SPEC] above strictly: DO NOT output or repeat ${loopingFile || 'any completed file'}.`,
+							`2. Generate the NEXT_TARGET_FILE specified in the task specification, or the remaining missing components and src/App.tsx.`,
+							`3. If \`src/App.tsx\` needs to be created or updated, emit the complete <file path="src/App.tsx"> block wiring the components from disk. Do NOT emit a phantom wrapper like <MainView />.`,
+							`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
+						].filter(Boolean).join('\n\n');
+
+						const freshTokens = feModel ? feModel.tokenize(feSystemPrompt + '\n' + fePrompt).length : 0;
+						const newBaseline = Math.max(feSession.sequence?.nextTokenIndex || 0, freshTokens);
+						updateContextUsage(newBaseline, feContextSize, 'frontend');
+						streamEvent(res, {
+							type: 'context_usage',
+							used: newBaseline,
+							total: feContextSize,
+							percent: Math.min(100, Math.round((newBaseline / feContextSize) * 100)),
+							model: 'frontend'
+						});
+
+						console.log(`[Router] FE context sequence reset cleanly. Resuming generation (loop recovery attempt ${feLoopRecoveryCount}/3)...`);
+						continue;
+					} else {
+						if (filesModified.length > feInitialFilesCount) {
+							console.warn(`[Router] FE loop recovery limit reached, but files were written. Proceeding.`);
+							break;
+						}
+						throw new Error(`FE loop: ${feLoopReason}`);
+					}
 				}
 
 				if (feCompactionTriggered) {
@@ -4359,19 +4650,25 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 						systemPrompt: feSystemPrompt,
 					});
 
+					const topDeps = workspaceRoot
+						? selectTopDependencyFiles(workspaceRoot, filesModified, 'src/App.tsx', 3)
+						: [];
+					const depContextBlock = buildDependencyContextBlock(topDeps);
+
 					fePrompt = [
 						`--- Project State (After 75% Context Compaction) ---`,
 						`Advisor Project Summary:\n${projectSummary}`,
 						`Files written so far:\n${filesModified.map(f => `- ${f}`).join('\n') || 'None'}`,
+						depContextBlock,
 						`--- Original User Request ---`,
 						originalUserRequest,
 						`--- Required Action ---`,
-						`The generator was paused due to token limits and has now been given a fresh context sequence.`,
-						`1. Inspect the original request against the files written so far.`,
+						`The generator was paused due to token limits and has now been given a fresh context sequence with the top dependency files preserved above.`,
+						`1. Inspect the dependency files above to reference their exact exported component names, props, and interfaces.`,
 						`2. If any requested component, modal, action handler, filter, or stat card is still missing or incomplete, generate it now.`,
-						`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now.`,
+						`3. If \`src/App.tsx\` needs to be created or updated to wire all state and components together, emit the complete <file path="src/App.tsx"> block now. Do NOT emit a phantom wrapper like <MainView />.`,
 						`4. Output your code as complete <file path="...">...</file> blocks. Do not output empty text.`,
-					].join('\n\n');
+					].filter(Boolean).join('\n\n');
 
 					const freshTokens = feModel ? feModel.tokenize(feSystemPrompt + '\n' + fePrompt).length : 0;
 					const newBaseline = Math.max(feSession.sequence?.nextTokenIndex || 0, freshTokens);

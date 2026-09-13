@@ -422,14 +422,64 @@ export function buildBESystemPrompt(
 
 	addBE('agent');
 
+	let installedPkgs: string[] = [];
+	if (workspaceRoot) {
+		const pkgPath = path.join(workspaceRoot, 'package.json');
+		try {
+			if (fs.existsSync(pkgPath)) {
+				const raw = fs.readFileSync(pkgPath, 'utf-8');
+				const parsed = JSON.parse(raw);
+				const deps = Object.keys(parsed.dependencies || {});
+				const devDeps = Object.keys(parsed.devDependencies || {});
+				installedPkgs = Array.from(new Set([...deps, ...devDeps]));
+			}
+		} catch { /* ignore */ }
+	}
+
+	const hasPkg = (name: string) => installedPkgs.includes(name);
+
 	const ext = activeFile ? path.extname(activeFile).toLowerCase() : '';
-	if (ext === '.ts' || ext === '.js' || msg.includes('typescript') || msg.includes('express') || msg.includes('node')) {
+	if (ext === '.ts' || ext === '.js' || msg.includes('typescript') || msg.includes('express') || msg.includes('node') || mode === 'create') {
 		if (ext === '.js' || msg.includes('javascript')) addBE('javascript');
 		else addBE('typescript');
 		addBE('node');
 	}
-	if (msg.includes('express')) addBE('express');
-	if (msg.includes('sql') || msg.includes('database') || msg.includes('postgres') || msg.includes('mysql')) addBE('sql');
+
+	// Express & REST are standard for backend APIs
+	const isExpress = hasPkg('express') || msg.includes('express') || mode === 'create';
+	if (isExpress) addBE('express');
+	addBE('rest');
+
+	// Database vs In-Memory DB
+	const hasSqlOrOrm = [
+		hasPkg('pg'), hasPkg('mysql'), hasPkg('mysql2'), hasPkg('sqlite3'),
+		hasPkg('prisma'), hasPkg('@prisma/client'), hasPkg('typeorm'), hasPkg('mongoose')
+	].some(Boolean);
+
+	if (hasSqlOrOrm || msg.includes('sql') || msg.includes('database') || msg.includes('postgres') || msg.includes('mysql')) {
+		addBE('sql');
+	} else {
+		addBE('in-memory-db');
+	}
+
+	// Domain skills & capabilities
+	const DOMAIN_SKILLS: Record<string, string[]> = {
+		'ecommerce': ['product', 'shop', 'store', 'cart', 'checkout', 'catalog', 'clothing', 'fashion', 'price', 'order', 'e-commerce', 'ecommerce'],
+		'saas-dashboard': ['dashboard', 'metrics', 'billing', 'analytics', 'invoice', 'subscription', 'saas', 'revenue', 'transaction'],
+		'capabilities/validation': ['validate', 'validation', 'schema', 'input', 'form'],
+		'capabilities/error-handling': ['error', 'exception', 'handler'],
+		'capabilities/controller-pattern': ['controller', 'mvc', 'repository', 'clean', 'backend', 'api'],
+		'capabilities/service-pattern': ['service', 'repository', 'clean', 'backend', 'api'],
+		'capabilities/jwt': ['jwt', 'token', 'auth', 'login', 'bearer'],
+		'capabilities/pagination': ['paginate', 'pagination', 'page', 'limit', 'offset'],
+	};
+
+	for (const [skill, keywords] of Object.entries(DOMAIN_SKILLS)) {
+		const matched = keywords.some(kw => msg.includes(kw));
+		if (matched || (mode === 'create' && (skill.includes('error-handling') || skill.includes('controller-pattern') || skill.includes('service-pattern')))) {
+			addBE(skill);
+		}
+	}
 
 	if (mode === 'create') addBE('create-mode');
 	else if (mode === 'edit') addBE('edit-mode');
@@ -437,6 +487,36 @@ export function buildBESystemPrompt(
 
 	const phase2Notes = injectPhase2Harness(workspaceRoot);
 	if (phase2Notes.length > 0) parts.push(...phase2Notes);
+
+	// Inject workspace dependency constraints
+	if (installedPkgs.length > 0) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'WORKSPACE DEPENDENCY CONSTRAINTS (package.json)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			`Installed packages: ${installedPkgs.join(', ')}`,
+			'CRITICAL BOUNDARIES:',
+			'1. ONLY import third-party packages from the installed list above, or standard Node.js built-ins ("http", "path", "fs", "crypto").',
+			'2. NEVER import uninstalled packages (such as mongoose, prisma, typeorm, bcrypt, jsonwebtoken, zod, axios, express-validator) unless explicitly listed above.',
+			'3. NO PHANTOM UTILITIES: NEVER import from non-existent files like "../utils/logger", "../utils/validators", "../utils/errors", or "../models/database". If helper functions are needed, declare them locally in the file or in shared models/types.',
+			'4. SERVER ARCHITECTURE: "src/app.ts" configures middleware and mounts routes, exporting app (export default app;). "src/server.ts" imports app and calls app.listen(PORT). NEVER call app.listen() inside "src/app.ts".',
+			'5. IN-MEMORY STORAGE: If no database package (mongoose/prisma/pg) is installed, store data using an in-memory Map or Array in the service with initial mock data.',
+		].join('\n'));
+	} else {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'WORKSPACE DEPENDENCY CONSTRAINTS',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'CRITICAL BOUNDARIES:',
+			'1. ONLY import standard Express and Node.js built-ins ("http", "path", "fs", "crypto").',
+			'2. NEVER import uninstalled packages (such as mongoose, prisma, bcrypt, jsonwebtoken, zod).',
+			'3. NO PHANTOM UTILITIES: Never import from "../utils/..." unless that file already exists on disk. Declare helper functions locally.',
+			'4. SERVER ARCHITECTURE: "src/app.ts" exports app; "src/server.ts" calls app.listen(PORT). Never call app.listen() in both.',
+			'5. IN-MEMORY STORAGE: Use an in-memory Map or Array with sample seed data for data persistence.',
+		].join('\n'));
+	}
 
 	console.log('PROMPTS LOADED (BE):', JSON.stringify(activePrompts, null, 2));
 	return parts.join('\n\n');
