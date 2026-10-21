@@ -42,11 +42,8 @@ const scaffoldSrc = fs.readFileSync(path.join(ROUTER, 'src', 'frontendScaffold.t
 const gitSrc = fs.readFileSync(path.join(ROUTER, 'src', 'gitHarness.ts'), 'utf8');
 const cfgSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'config.local.ts'), 'utf8');
 const cfgTypesSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'types.ts'), 'utf8');
-
-/** Read a source file relative to the router root. */
-function read(rel: string): string {
-	return fs.readFileSync(path.join(ROUTER, rel), 'utf8');
-}
+const guardSrc = fs.readFileSync(path.join(ROUTER, 'src', 'tools', 'scaffoldGuard.ts'), 'utf8');
+const toolEngineSrc = fs.readFileSync(path.join(ROUTER, 'src', 'tools', 'toolEngine.ts'), 'utf8');
 
 /** Strip comments so a doc string is never read as code. */
 function stripComments(src: string): string {
@@ -210,8 +207,6 @@ console.log('\n=== P1.7 — a create request cannot clobber the scaffold ===');
 // The guard lives in tools/scaffoldGuard.ts, and it is CALLED from the
 // live executeToolCall in tools/toolEngine.ts. The PROPERTY is what
 // matters, so the checks follow the code wherever it lives.
-const guardSrc = read('src/tools/scaffoldGuard.ts');
-const toolEngineSrc = read('src/tools/toolEngine.ts');
 
 check('SCAFFOLD_OWNED_FILES exists', () =>
 	guardSrc.includes('SCAFFOLD_OWNED_FILES') ? true : 'the set is missing');
