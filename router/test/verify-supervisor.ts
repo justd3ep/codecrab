@@ -113,6 +113,29 @@ await check('the tsx CLI is spawned via node, not via a .cmd shell wrapper', () 
 await check('the child handle is unref\'d so the editor can exit cleanly', () =>
 	/child\.unref\(\)/.test(src) ? true : 'child.unref() missing');
 
+// The hang timeout must be LONGER than the supervisor's boot timeout.
+//
+// The router loads a 5.75GB GGUF off disk before it starts listening.
+// On a warm page cache that is ~5s; on a cold one it can take
+// minutes. The supervisor waits BOOT_TIMEOUT_MS for /health to
+// answer — so if this test gives up at the SAME moment, a slow boot
+// is reported as "the parent HUNG".
+//
+// This test failed once at 183s for exactly that reason.
+await check('this test\'s hang timeout is longer than the supervisor\'s boot timeout', () => {
+	const boot = src.match(/BOOT_TIMEOUT_MS\s*=\s*([\d_]+)/);
+	if (!boot) return 'the supervisor\'s BOOT_TIMEOUT_MS was not found';
+	const bootMs = Number(boot[1]!.replace(/_/g, ''));
+	// The test's own hang timeout.
+	const self = fs.readFileSync(path.join(HERE, 'verify-supervisor.ts'), 'utf8');
+	const mine = self.match(/setTimeout\(\(\)\s*=>\s*\{\s*hung = true; resolve\(\); \},\s*([\d_]+)\)/);
+	if (!mine) return 'the test\'s hang timeout was not found';
+	const myMs = Number(mine[1]!.replace(/_/g, ''));
+	return myMs > bootMs
+		? true
+		: `the test gives up after ${myMs}ms and the supervisor after ${bootMs}ms — a slow boot is reported as a hang`;
+});
+
 console.log('\n=== 2. compiled output matches source ===');
 
 await check('compiled supervisor exists', () =>
@@ -168,7 +191,20 @@ try {
 	parent.stdout.on('data', c => (parentOut += c));
 	parent.stderr.on('data', c => (parentOut += c));
 	await new Promise<void>(resolve => {
-		const t = setTimeout(() => { hung = true; resolve(); }, 180_000);
+		// The hang timeout must be LONGER than the supervisor's own
+		// BOOT_TIMEOUT_MS (180_000ms), or a slow boot is reported as a
+		// hang.
+		//
+		// The router loads a 5.75GB GGUF off disk before it starts
+		// listening. On a warm page cache that is ~5s; on a cold one
+		// it can take minutes. The supervisor waits 180s for the
+		// router to answer /health — so the test must wait LONGER
+		// than that before calling it a hang.
+		//
+		// This test failed once at 183s with "the parent HUNG": the
+		// boot was simply slow, and the test gave up at exactly the
+		// moment the supervisor did.
+		const t = setTimeout(() => { hung = true; resolve(); }, 300_000);
 		parent.on('exit', code => { parentRc = code; clearTimeout(t); resolve(); });
 	});
 
