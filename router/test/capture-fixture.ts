@@ -508,9 +508,6 @@ function stripTypes(src: string): string {
 	const code = protect(src);
 
 	const stripped = code
-		// An optional parameter: `openFiles?: string[]` -> `openFiles`.
-		.replace(/([A-Za-z_$][\w$]*)\?\s*:\s*[A-Za-z_$][\w$<>[\]|,\s]*?(?=\s*[,)=])/g, '$1')
-		.replace(/([(,]\s*)([A-Za-z_$][\w$]*)\s*:\s*[A-Za-z_$][\w$<>[\]|,\s]*?(?=\s*[,)=])/g, '$1$2')
 		// The non-null assertion: `foo!` — but not `!==`, `!=` or a leading `!`.
 		.replace(/\]!/g, ']')
 		.replace(/\)(!)(?=[.\s,;)\]}])/g, ')')
@@ -571,7 +568,34 @@ function loadFunctions(
 		if (openBrace < 0) return null;
 		const end = findFunctionEnd(moduleSrc, openBrace);
 		if (end < 0) return null;
-		return moduleSrc.slice(m.index, end);
+
+		// The parameter list is REBUILT with bare names.
+		//
+		// Stripping a parameter's type with a regex is fragile: the
+		// type may contain `{`, `}`, `;` and `>` (an object type, a
+		// generic), and a character class that cannot cross those
+		// silently fails to strip — leaving the annotation in the
+		// evaluated code, where it is a syntax error.
+		//
+		// Here the parameter NAMES are read from the signature, and
+		// the list is rewritten as `(name, name, ...)`. Exact, and it
+		// handles optional parameters, defaults, object types and
+		// generics alike.
+		const paramText = moduleSrc.slice(openParen + 1, paramsEnd - 1);
+		const paramNames = paramText
+			.split(',')
+			.map(p => p.trim())
+			.filter(p => p.length > 0)
+			.map(p => {
+				// `name: Type` / `name?: Type` / `name: Type = default`
+				const nameMatch = /^([A-Za-z_$][\w$]*)/.exec(p);
+				return nameMatch ? nameMatch[1]! : null;
+			})
+			.filter((n): n is string => n !== null);
+
+		const rebuiltParams = `(${paramNames.join(', ')})`;
+		const head = moduleSrc.slice(m.index, openParen);
+		return head + rebuiltParams + moduleSrc.slice(paramsEnd - 1, end);
 	};
 
 	const KEYWORDS = new Set([
