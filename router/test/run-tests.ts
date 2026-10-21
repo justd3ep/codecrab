@@ -66,6 +66,18 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-parity-execute-toolcall-mutation.ts',
 		what: 'the executeToolCall parity test catches every mutation',
 	},
+	{
+		file: 'verify-parity-targeted-repair.ts',
+		what: 'the parity of the buildTargetedRepairPrompt consolidation',
+	},
+	{
+		file: 'verify-parity-targeted-repair-mutation.ts',
+		what: 'the targeted-repair parity test catches every mutation',
+	},
+	{
+		file: 'verify-no-vacuous-checks.ts',
+		what: 'no source-text check can pass for the wrong reason',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook

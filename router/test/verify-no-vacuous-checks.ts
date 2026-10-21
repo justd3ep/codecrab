@@ -80,8 +80,10 @@ for (const file of fs.readdirSync(TEST).filter(f => f.endsWith('.ts'))) {
 	const lines = text.split('\n');
 
 	for (let n = 0; n < lines.length; n++) {
-		for (const m of lines[n].matchAll(PAT)) {
-			const [, varName, src, marker] = m;
+		for (const m of lines[n]!.matchAll(PAT)) {
+			const varName = m[1]!;
+			const src = m[2]!;
+			const marker = m[3]!;
 			if (!marker) continue;
 
 			// Does this index get sliced?
