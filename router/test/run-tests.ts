@@ -78,6 +78,14 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-no-vacuous-checks.ts',
 		what: 'no source-text check can pass for the wrong reason',
 	},
+	{
+		file: 'verify-parity-determine-mode.ts',
+		what: 'the parity of the determineMode consolidation',
+	},
+	{
+		file: 'verify-parity-determine-mode-mutation.ts',
+		what: 'the determineMode parity test catches every mutation',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
@@ -149,9 +157,20 @@ function runScript(file: string): Promise<{ passed: number; failed: number; ok: 
 				});
 				return;
 			}
+
 			resolve({
 				passed: Number(m[1]), failed: Number(m[2]),
 				ok: code === 0 && Number(m[2]) === 0,
+				// The script's OWN failure lines. Without them a failure
+				// is just a count — the reader has no idea WHAT broke,
+				// and has to re-run the script by hand to find out.
+				...(Number(m[2]) > 0
+					? {
+						error: out.split('\n')
+							.filter(l => /^\s*FAIL\b/.test(l) || /^\s*-\s/.test(l))
+							.slice(0, 12).join('\n'),
+					}
+					: {}),
 			});
 		});
 		proc.on('error', e => {
