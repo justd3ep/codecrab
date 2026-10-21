@@ -238,8 +238,8 @@ check('src/App.tsx is NOT protected (the model must write it)', () => {
 });
 
 check('package.json is NOT protected (it goes through a merge)', () => {
-	const i = indexLive.indexOf('const SCAFFOLD_OWNED_FILES');
-	const body = indexLive.slice(i, i + 1200);
+	const i = guardSrc.indexOf('const SCAFFOLD_OWNED_FILES');
+	const body = guardSrc.slice(i, i + 1200);
 	return !body.includes("'package.json'") ? true : 'package.json is protected — the merge would never run';
 });
 
