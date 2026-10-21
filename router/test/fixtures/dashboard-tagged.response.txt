@@ -1,0 +1,24 @@
+<file path="src/App.tsx">
+import React, { useState } from 'react';
+import { MainView } from './components/MainView';
+
+export default function App() {
+  return (
+    <div className="min-h-screen bg-gray-50 dark:bg-slate-900 overflow-hidden">
+      <MainView />
+    </div>
+  );
+}
+</file>
+
+<file path="src/components/Sidebar.tsx">
+import { Home, ListTodo, FolderKanban, Calendar, Settings } from 'lucide-react';
+
+export function Sidebar() {
+  return (
+    <nav className="w-72 bg-white dark:bg-slate-800 p-4">
+      <Home size={20} />
+    </nav>
+  );
+}
+</file>

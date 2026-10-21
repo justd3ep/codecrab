@@ -1,0 +1,7 @@
+I can help with that. To build a task management dashboard with React and Tailwind, you'll want:
+
+1. A sidebar for navigation
+2. A top bar with search
+3. Cards showing task statistics
+
+The key design consideration is keeping the layout responsive. Let me know if you'd like me to generate the full implementation.

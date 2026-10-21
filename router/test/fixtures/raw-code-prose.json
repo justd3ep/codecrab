@@ -1,0 +1,13 @@
+{
+  "name": "raw-code-prose",
+  "capturedAt": "2026-10-21T12:55:06.028Z",
+  "synthetic": false,
+  "note": "A response that should produce NO files. The prose-only case is a plain explanation; the raw-code-prose case is code the extractor rejected. Both pin that the router writes nothing rather than writing a broken file.",
+  "response": "Here's the App component for your dashboard.\n\nimport React, { useState } from 'react';\nimport { weeklyProductivityChart } from './components/weeklyProductivityChart';\n\nexport default function App() {\n  const [active, setActive] = useState('dashboard');\n  return (\n    <div className=\"min-h-screen flex\">\n      <main className=\"flex-1 p-8\">\n        <weeklyProductivityChart />\n      </main>\n    </div>\n  );\n}\n",
+  "expect": {
+    "create": [],
+    "edit": [],
+    "onlyClosed": []
+  },
+  "expectNoFiles": true
+}

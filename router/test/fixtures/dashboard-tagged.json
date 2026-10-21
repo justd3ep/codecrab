@@ -1,0 +1,39 @@
+{
+  "name": "dashboard-tagged",
+  "capturedAt": "2026-10-21T12:53:39.448Z",
+  "synthetic": false,
+  "note": "Captured from a real model response. The `expect` block is the extraction result at capture time; the fixture test asserts it does not change.",
+  "response": "<file path=\"src/App.tsx\">\nimport React, { useState } from 'react';\nimport { MainView } from './components/MainView';\n\nexport default function App() {\n  return (\n    <div className=\"min-h-screen bg-gray-50 dark:bg-slate-900 overflow-hidden\">\n      <MainView />\n    </div>\n  );\n}\n</file>\n\n<file path=\"src/components/Sidebar.tsx\">\nimport { Home, ListTodo, FolderKanban, Calendar, Settings } from 'lucide-react';\n\nexport function Sidebar() {\n  return (\n    <nav className=\"w-72 bg-white dark:bg-slate-800 p-4\">\n      <Home size={20} />\n    </nav>\n  );\n}\n</file>\n",
+  "expect": {
+    "create": [
+      {
+        "path": "src/App.tsx",
+        "content": "import React, { useState } from 'react';\nimport { MainView } from './components/MainView';\n\nexport default function App() {\n  return (\n    <div className=\"min-h-screen bg-gray-50 dark:bg-slate-900 overflow-hidden\">\n      <MainView />\n    </div>\n  );\n}"
+      },
+      {
+        "path": "src/components/Sidebar.tsx",
+        "content": "import { Home, ListTodo, FolderKanban, Calendar, Settings } from 'lucide-react';\n\nexport function Sidebar() {\n  return (\n    <nav className=\"w-72 bg-white dark:bg-slate-800 p-4\">\n      <Home size={20} />\n    </nav>\n  );\n}"
+      }
+    ],
+    "edit": [
+      {
+        "path": "src/App.tsx",
+        "content": "import React, { useState } from 'react';\nimport { MainView } from './components/MainView';\n\nexport default function App() {\n  return (\n    <div className=\"min-h-screen bg-gray-50 dark:bg-slate-900 overflow-hidden\">\n      <MainView />\n    </div>\n  );\n}"
+      },
+      {
+        "path": "src/components/Sidebar.tsx",
+        "content": "import { Home, ListTodo, FolderKanban, Calendar, Settings } from 'lucide-react';\n\nexport function Sidebar() {\n  return (\n    <nav className=\"w-72 bg-white dark:bg-slate-800 p-4\">\n      <Home size={20} />\n    </nav>\n  );\n}"
+      }
+    ],
+    "onlyClosed": [
+      {
+        "path": "src/App.tsx",
+        "content": "import React, { useState } from 'react';\nimport { MainView } from './components/MainView';\n\nexport default function App() {\n  return (\n    <div className=\"min-h-screen bg-gray-50 dark:bg-slate-900 overflow-hidden\">\n      <MainView />\n    </div>\n  );\n}"
+      },
+      {
+        "path": "src/components/Sidebar.tsx",
+        "content": "import { Home, ListTodo, FolderKanban, Calendar, Settings } from 'lucide-react';\n\nexport function Sidebar() {\n  return (\n    <nav className=\"w-72 bg-white dark:bg-slate-800 p-4\">\n      <Home size={20} />\n    </nav>\n  );\n}"
+      }
+    ]
+  }
+}

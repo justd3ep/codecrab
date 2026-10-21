@@ -1,0 +1,22 @@
+{
+  "name": "fenced-code",
+  "capturedAt": "2026-10-21T12:55:06.973Z",
+  "synthetic": false,
+  "note": "Captured from a real model response. The `expect` block is the extraction result at capture time; the fixture test asserts it does not change.",
+  "response": "I've implemented the dashboard as requested. Here is the entry point:\n\n```tsx\nimport React, { useState } from 'react';\nimport { TaskList } from './components/TaskList';\n\nexport default function App() {\n  const [filter, setFilter] = useState<'all' | 'open' | 'done'>('all');\n  return (\n    <div className=\"min-h-screen bg-gray-50\">\n      <TaskList filter={filter} onFilterChange={setFilter} />\n    </div>\n  );\n}\n```\n\nLet me know if you want any changes.\n",
+  "expect": {
+    "create": [
+      {
+        "path": "App.jsx",
+        "content": "import React, { useState } from 'react';\nimport { TaskList } from './components/TaskList';\n\nexport default function App() {\n  const [filter, setFilter] = useState<'all' | 'open' | 'done'>('all');\n  return (\n    <div className=\"min-h-screen bg-gray-50\">\n      <TaskList filter={filter} onFilterChange={setFilter} />\n    </div>\n  );\n}"
+      }
+    ],
+    "edit": [
+      {
+        "path": "App.jsx",
+        "content": "import React, { useState } from 'react';\nimport { TaskList } from './components/TaskList';\n\nexport default function App() {\n  const [filter, setFilter] = useState<'all' | 'open' | 'done'>('all');\n  return (\n    <div className=\"min-h-screen bg-gray-50\">\n      <TaskList filter={filter} onFilterChange={setFilter} />\n    </div>\n  );\n}"
+      }
+    ],
+    "onlyClosed": []
+  }
+}

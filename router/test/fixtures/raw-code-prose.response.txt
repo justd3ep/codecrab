@@ -1,0 +1,15 @@
+Here's the App component for your dashboard.
+
+import React, { useState } from 'react';
+import { weeklyProductivityChart } from './components/weeklyProductivityChart';
+
+export default function App() {
+  const [active, setActive] = useState('dashboard');
+  return (
+    <div className="min-h-screen flex">
+      <main className="flex-1 p-8">
+        <weeklyProductivityChart />
+      </main>
+    </div>
+  );
+}

@@ -1,0 +1,17 @@
+I've implemented the dashboard as requested. Here is the entry point:
+
+```tsx
+import React, { useState } from 'react';
+import { TaskList } from './components/TaskList';
+
+export default function App() {
+  const [filter, setFilter] = useState<'all' | 'open' | 'done'>('all');
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <TaskList filter={filter} onFilterChange={setFilter} />
+    </div>
+  );
+}
+```
+
+Let me know if you want any changes.

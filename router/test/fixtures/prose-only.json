@@ -1,0 +1,13 @@
+{
+  "name": "prose-only",
+  "capturedAt": "2026-10-21T12:55:07.408Z",
+  "synthetic": false,
+  "note": "A response that should produce NO files. The prose-only case is a plain explanation; the raw-code-prose case is code the extractor rejected. Both pin that the router writes nothing rather than writing a broken file.",
+  "response": "I can help with that. To build a task management dashboard with React and Tailwind, you'll want:\n\n1. A sidebar for navigation\n2. A top bar with search\n3. Cards showing task statistics\n\nThe key design consideration is keeping the layout responsive. Let me know if you'd like me to generate the full implementation.\n",
+  "expect": {
+    "create": [],
+    "edit": [],
+    "onlyClosed": []
+  },
+  "expectNoFiles": true
+}
