@@ -42,6 +42,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 	{ file: 'check-undefined-symbol.ts', what: 'the undefined-symbol scanner analysis' },
 	{ file: 'check-chaining-defect.ts',  what: 'the chained-call analysis' },
 	{ file: 'verify-golden-fixtures.ts', what: 'the golden fixtures — the whole extraction path' },
+	{
+		file: 'verify-parity-no-output-prompt.ts',
+		what: 'the parity of the buildNoOutputPrompt extraction',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
@@ -79,7 +83,7 @@ interface Result {
 	error?: string;
 }
 
-function runScript(file: string): Promise<{ passed: number; failed: number; ok: boolean; error?: string }> {
+function runScript(file: string): Promise<{ passed: number; failed: number; ok: boolean; error?: string; skipped?: string }> {
 	return new Promise(resolve => {
 		const proc = spawn(
 			process.execPath,
@@ -93,6 +97,16 @@ function runScript(file: string): Promise<{ passed: number; failed: number; ok: 
 		const timer = setTimeout(() => { proc.kill(); }, 300000);
 		proc.on('close', code => {
 			clearTimeout(timer);
+			// A script that announces a skip is reported as SKIPPED, not
+			// as a passing script with zero assertions. A zero-assertion
+			// "pass" looks identical to a script that protects something —
+			// which is the exact failure this safety net is built to avoid.
+			if (/=== SKIPPED:/.test(out)) {
+				const reason = out.match(/=== SKIPPED: (.*?) ===/)?.[1]?.trim() ?? 'no reason given';
+				resolve({ passed: 0, failed: 0, ok: true, skipped: reason });
+				return;
+			}
+
 			const m = out.match(/(\d+)\s+passed,\s*(\d+)\s+failed/);
 			if (!m) {
 				resolve({
@@ -147,7 +161,11 @@ async function main() {
 		results.push({ file: s.file, what: s.what, ...r, durationMs: dur });
 
 		if (r.ok) {
+			if (r.skipped) {
+			console.log(`   SKIP  ${r.skipped}`);
+		} else {
 			console.log(`  ${String(r.passed).padStart(3)} passed  (${dur}ms)`);
+		}
 		} else {
 			console.log(`  ${r.failed > 0 ? `${r.failed} FAILED` : 'ERROR'}  (${dur}ms)`);
 			if (r.error) {
