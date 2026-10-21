@@ -254,8 +254,10 @@ export function extractFallbackEdits(text: string, openFiles?: string[], workspa
 export interface JsxSymbolIssue {
 	file: string;
 	component: string;
-	kind: 'missing_import' | 'missing_file';
+	kind: 'missing_import' | 'missing_file' | 'missing_function' | 'orphan_file' | 'prop_mismatch' | 'missing_map' | 'no_output';
 	importPath?: string;
+	missingFileTarget?: string;
+	functionName?: string;
 }
 
 export function validateJsxSymbols(
@@ -263,8 +265,27 @@ export function validateJsxSymbols(
 	workspaceRoot: string,
 ): JsxSymbolIssue[] {
 	const issues: JsxSymbolIssue[] = [];
+
+		// An EMPTY input is not "everything is fine" — it is "we looked at
+		// nothing". Reporting success here is how a run that produced ZERO
+		// files was logged as "all JSX symbols OK" and returned a clean 200.
+		//
+		// This is a distinct kind because the remedy is different: a JSX symbol
+		// problem needs a symbol repair, whereas no output at all needs the
+		// model to actually emit code.
+		if (generatedFiles.length === 0) {
+			issues.push({
+				file: '(no files)',
+				component: '(none)',
+				kind: 'no_output',
+			});
+			return issues;
+		}
+
+	// All relative paths available in this response (normalized to forward slashes)
 	const responsePathsRel = new Set(generatedFiles.map(f => f.path.replace(/\\/g, '/')));
 
+	// React built-in component names — never need an explicit import
 	const REACT_BUILTINS = new Set([
 		'React', 'Fragment', 'StrictMode', 'Suspense', 'Profiler',
 	]);
@@ -274,10 +295,24 @@ export function validateJsxSymbols(
 		'/index.tsx', '/index.jsx', '/index.ts', '/index.js',
 	];
 
+	const JS_KEYWORDS = new Set([
+		'if', 'for', 'while', 'switch', 'catch', 'return', 'typeof', 'instanceof', 'import', 'super', 'new', 'export', 'default'
+	]);
+	const COMMON_BUILTINS = new Set([
+		'useState', 'useEffect', 'useRef', 'useCallback', 'useMemo', 'useContext', 'useReducer',
+		'React', 'console', 'window', 'document', 'localStorage', 'sessionStorage',
+		'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+		'parseInt', 'parseFloat', 'isNaN', 'isFinite', 'Math', 'Date', 'JSON',
+		'Array', 'Object', 'String', 'Number', 'Boolean', 'RegExp', 'Map', 'Set',
+		'Promise', 'Error', 'TypeError', 'fetch', 'alert', 'confirm', 'prompt',
+		'encodeURIComponent', 'decodeURIComponent', 'btoa', 'atob',
+	]);
+
 	for (const { path: filePath, content } of generatedFiles) {
 		const ext = path.extname(filePath).toLowerCase();
 		if (!['.tsx', '.jsx'].includes(ext)) continue;
 
+		// ── Extract PascalCase JSX component names ──────────────────────────
 		const usedComponents = new Set<string>();
 		const jsxTagRe = /<([A-Z][A-Za-z0-9]*)(?:\s|\s*\/?>)/g;
 		let m: RegExpExecArray | null;
@@ -288,14 +323,16 @@ export function validateJsxSymbols(
 		while ((m = iconRefRe.exec(content)) !== null) {
 			if (m[1]) usedComponents.add(m[1]);
 		}
-		if (usedComponents.size === 0) continue;
 
-		const importedSymbols = new Map<string, string>();
+		// ── Extract imported symbols → importPath ───────────────────────────
+		const importedSymbols = new Map<string, string>(); // symbol → raw import path
 
+		// default: import Foo from './Foo'
 		const defRe = /import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"]([^'"]+)['"]/g;
 		while ((m = defRe.exec(content)) !== null) {
 			if (m[1] && m[2]) importedSymbols.set(m[1], m[2]);
 		}
+		// named: import { Foo, Bar as B } from './foo'
 		const namedRe = /import\s+\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/g;
 		while ((m = namedRe.exec(content)) !== null) {
 			const iPath = m[2]!;
@@ -304,6 +341,7 @@ export function validateJsxSymbols(
 				.filter(Boolean);
 			for (const name of names) importedSymbols.set(name, iPath);
 		}
+		// namespace: import * as Icons from './icons'
 		const nsRe = /import\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"]([^'"]+)['"]/g;
 		while ((m = nsRe.exec(content)) !== null) {
 			if (m[1] && m[2]) importedSymbols.set(m[1], m[2]);
@@ -312,12 +350,14 @@ export function validateJsxSymbols(
 		for (const comp of usedComponents) {
 			if (REACT_BUILTINS.has(comp)) continue;
 
+			// Check 1: symbol must be imported
 			if (!importedSymbols.has(comp)) {
 				console.log(`[Validator] missing ${comp} in ${filePath}`);
 				issues.push({ file: filePath, component: comp, kind: 'missing_import' });
 				continue;
 			}
 
+			// Check 2 & 3: import path must resolve to a real file
 			const importPath = importedSymbols.get(comp)!;
 			let resolvedBase: string;
 			if (importPath.startsWith('@/') || importPath.startsWith('~/')) {
@@ -326,7 +366,7 @@ export function validateJsxSymbols(
 				const fileDir = path.dirname(filePath).replace(/\\/g, '/');
 				resolvedBase = path.normalize(path.join(fileDir, importPath)).replace(/\\/g, '/');
 			} else {
-				continue;
+				continue; // skip node_modules
 			}
 
 			const existsInResponse = RESOLVE_EXTS.some(e =>
@@ -340,8 +380,137 @@ export function validateJsxSymbols(
 			});
 
 			if (!existsInResponse && !existsOnDisk) {
+				const targetExt = path.extname(resolvedBase) ? '' : '.tsx';
+				const missingFileTarget = resolvedBase + targetExt;
 				console.log(`[Validator] missing file: ${resolvedBase} (import "${importPath}" → <${comp} /> in ${filePath})`);
-				issues.push({ file: filePath, component: comp, kind: 'missing_file', importPath });
+				issues.push({ file: filePath, component: comp, kind: 'missing_file', importPath, missingFileTarget });
+			}
+		}
+
+		// ── Check for undeclared standalone function calls ─────────────────
+		const declaredSymbols = new Set<string>(['React']);
+		for (const name of importedSymbols.keys()) declaredSymbols.add(name);
+
+		const funcDeclRe = /(?:function|const|let|var)\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*(?:=|:[^=]+=\s*)?(?:\(|=)/g;
+		while ((m = funcDeclRe.exec(content)) !== null) declaredSymbols.add(m[1]!);
+
+		const arrDestructRe = /(?:const|let|var)\s*\[\s*([A-Za-z0-9_$,\s]+)\s*\]/g;
+		while ((m = arrDestructRe.exec(content)) !== null) {
+			for (const part of m[1]!.split(',')) {
+				const sym = part.trim();
+				if (sym) declaredSymbols.add(sym);
+			}
+		}
+
+		const objDestructRe = /(?:const|let|var)\s*\{\s*([A-Za-z0-9_$,\s:]+)\s*\}\s*=/g;
+		while ((m = objDestructRe.exec(content)) !== null) {
+			for (const part of m[1]!.split(',')) {
+				const sym = part.trim().split(':')[0]?.trim();
+				if (sym) declaredSymbols.add(sym);
+			}
+		}
+
+		const cleanCode = content
+			.replace(/\/\*[\s\S]*?\*\//g, '')
+			.replace(/\/\/.*/g, '')
+			.replace(/'(?:\\.|[^'\\])*'/g, "''")
+			.replace(/"(?:\\.|[^"\\])*"/g, '""');
+
+		const callRe = /(?:^|[^.\w$])([A-Za-z_$][A-Za-z0-9_$]*)\s*\(/g;
+		const seenMissingFuncs = new Set<string>();
+		while ((m = callRe.exec(cleanCode)) !== null) {
+			const sym = m[1]!;
+			if (JS_KEYWORDS.has(sym) || COMMON_BUILTINS.has(sym) || declaredSymbols.has(sym) || seenMissingFuncs.has(sym)) continue;
+			seenMissingFuncs.add(sym);
+			console.log(`[Validator] undeclared function call "${sym}()" in ${filePath}`);
+			issues.push({ file: filePath, component: sym, kind: 'missing_function', functionName: sym });
+		}
+	}
+
+	// ── Check 4: Orphan component detection ────────────────────────────────
+	const allImportedPaths = new Set<string>();
+	for (const { path: fp, content: fc } of generatedFiles) {
+		const fDir = path.dirname(fp).replace(/\\/g, '/');
+		const impMatchRe = /import\s+[\s\S]*?from\s+['"]([^'"]+)['"]/g;
+		let im: RegExpExecArray | null;
+		while ((im = impMatchRe.exec(fc)) !== null) {
+			const rawPath = im[1]!;
+			if (rawPath.startsWith('.')) {
+				const normTarget = path.normalize(path.join(fDir, rawPath)).replace(/\\/g, '/');
+				allImportedPaths.add(normTarget);
+				for (const ext of RESOLVE_EXTS) allImportedPaths.add(normTarget + ext);
+			}
+		}
+	}
+
+	for (const { path: filePath } of generatedFiles) {
+		const normFp = filePath.replace(/\\/g, '/');
+		if (normFp.includes('/components/') && (normFp.endsWith('.tsx') || normFp.endsWith('.jsx'))) {
+			const noExt = normFp.replace(/\.[^/.]+$/, '');
+			const isImported = allImportedPaths.has(normFp) || allImportedPaths.has(noExt);
+			if (!isImported) {
+				console.log(`[Validator] orphan component detected: ${normFp} is never imported in App.tsx or parent components`);
+				issues.push({
+					file: filePath,
+					component: path.basename(filePath, path.extname(filePath)),
+					kind: 'orphan_file',
+					missingFileTarget: filePath
+				});
+			}
+		}
+	}
+
+	// ── Check 5: Prop contract & array mapping validation ──────────────────
+	const fileMap = new Map<string, string>();
+	for (const f of generatedFiles) {
+		fileMap.set(f.path.replace(/\\/g, '/'), f.content);
+	}
+
+	for (const { path: parentPath, content: parentContent } of generatedFiles) {
+		const pDir = path.dirname(parentPath).replace(/\\/g, '/');
+		const compCallRe = /<([A-Z][A-Za-z0-9]*)\s+([^>]*?)(?:\/?>)/g;
+		let cm: RegExpExecArray | null;
+		while ((cm = compCallRe.exec(parentContent)) !== null) {
+			const compName = cm[1]!;
+			const rawPropsStr = cm[2]!;
+			if (REACT_BUILTINS.has(compName)) continue;
+
+			const passedPropMatches = rawPropsStr.matchAll(/([a-zA-Z_$][a-zA-Z0-9_$]*)(?:=|\s)/g);
+			const passedProps = Array.from(passedPropMatches).map(p => p[1]!).filter(p => p !== 'key' && p !== 'className');
+			if (passedProps.length === 0) continue;
+
+			for (const ext of RESOLVE_EXTS) {
+				const candidatePath = path.normalize(path.join(pDir, 'components', compName + ext)).replace(/\\/g, '/');
+				const candidateDirect = path.normalize(path.join(pDir, compName + ext)).replace(/\\/g, '/');
+				const targetPath = fileMap.has(candidatePath) ? candidatePath : fileMap.has(candidateDirect) ? candidateDirect : null;
+				if (targetPath) {
+					const childContent = fileMap.get(targetPath)!;
+					for (const p of passedProps) {
+						const hasProp = new RegExp(`\\b${p}\\b`).test(childContent);
+						if (!hasProp) {
+							console.log(`[Validator] prop mismatch: <${compName}> passed "${p}", but ${targetPath} does not declare it.`);
+							issues.push({
+								file: targetPath,
+								component: compName,
+								kind: 'prop_mismatch',
+								functionName: p,
+								missingFileTarget: targetPath
+							});
+						} else if (/^(?:habits|tasks|items|bookmarks|todos|transactions|rows|products|cards|records|elements)$/i.test(p)) {
+							if (!childContent.includes('.map(') && !childContent.includes('.forEach(')) {
+								console.log(`[Validator] missing array mapping: ${targetPath} receives array "${p}" but contains no .map()`);
+								issues.push({
+									file: targetPath,
+									component: compName,
+									kind: 'missing_map',
+									functionName: p,
+									missingFileTarget: targetPath
+								});
+							}
+						}
+					}
+					break;
+				}
 			}
 		}
 	}
@@ -387,33 +556,51 @@ export function buildJsxRepairPrompt(issues: JsxSymbolIssue[]): string {
 		byFile.get(iss.file)!.push(iss);
 	}
 
+	const missingFilesToGenerate = new Set<string>();
+
 	const lines: string[] = [
 		'<validation_errors>',
-		'JSX symbol validation failed. The following components are broken:',
+		'Frontend code validation failed with the following critical errors:',
 		'',
 	];
 	for (const [file, fileIssues] of byFile) {
 		lines.push(`File: ${file}`);
 		for (const iss of fileIssues) {
 			if (iss.kind === 'missing_import') {
-				lines.push(`  - <${iss.component} /> used but NOT imported.`);
+				lines.push(`  - Component <${iss.component} /> used but NOT imported.`);
 				lines.push(`    Fix: add  import ${iss.component} from "./${iss.component}";`);
-			} else {
-				lines.push(`  - <${iss.component} /> import path "${iss.importPath}" → file does not exist.`);
-				lines.push(`    Fix: create the missing file OR correct the import path.`);
+			} else if (iss.kind === 'missing_file') {
+				lines.push(`  - Component <${iss.component} /> was imported from "${iss.importPath}", but "${iss.missingFileTarget || iss.importPath}" was NEVER generated!`);
+				if (iss.missingFileTarget) missingFilesToGenerate.add(iss.missingFileTarget);
+			} else if (iss.kind === 'missing_function') {
+				lines.push(`  - Function "${iss.functionName}()" is called, but it is NEVER declared, defined, or imported.`);
+				lines.push(`    Fix: define "const ${iss.functionName} = ..." or import it.`);
+			} else if (iss.kind === 'orphan_file') {
+				lines.push(`  - Component file "${iss.file}" was generated, but it is NEVER imported or rendered anywhere.`);
+				lines.push(`    Fix: import and render <${iss.component} /> in its parent container or src/App.tsx, or delete it.`);
+			} else if (iss.kind === 'prop_mismatch') {
+				lines.push(`  - Component <${iss.component} /> is passed prop "${iss.functionName}", but "${iss.file}" does NOT declare "${iss.functionName}" in its props interface.`);
+				lines.push(`    Fix: update ${iss.file} props interface to accept "${iss.functionName}".`);
+			} else if (iss.kind === 'missing_map') {
+				lines.push(`  - Component <${iss.component} /> in "${iss.file}" receives array prop "${iss.functionName}", but does NOT map over it.`);
+				lines.push(`    Fix: update ${iss.file} to map over "${iss.functionName}" (e.g. {${iss.functionName}.map(...)}) to render the child items.`);
 			}
 		}
 		lines.push('');
 	}
-	lines.push(
-		'Rules:',
-		'  1. Every JSX component must be imported before use.',
-		'  2. Every import path must resolve to a file in this response or the workspace.',
-		'  3. Re-emit ONLY the file(s) listed above that need fixing using <file path="...">...</file> format. Do NOT re-emit other already completed files.',
-		'</validation_errors>',
-		'',
-		'[Validator] repairing — output only the fixed file(s) now.',
-	);
+
+	lines.push('Requirements for resolution:');
+	if (missingFilesToGenerate.size > 0) {
+		lines.push(`  1. You MUST generate the following missing component file(s) right now:`);
+		for (const mf of missingFilesToGenerate) {
+			lines.push(`     <file path="${mf}">\n     // Complete working React implementation\n     </file>`);
+		}
+	}
+	lines.push('  2. Ensure all referenced helper functions, props, and state variables are declared in the component where they are used.');
+	lines.push('  3. Output ONLY the missing or corrected files as valid <file path="...">...</file> blocks.');
+	lines.push('</validation_errors>');
+	lines.push('');
+	lines.push('[Validator] output the required files now.');
 	return lines.join('\n');
 }
 
