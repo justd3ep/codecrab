@@ -46,6 +46,14 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-parity-no-output-prompt.ts',
 		what: 'the parity of the buildNoOutputPrompt extraction',
 	},
+	{
+		file: 'verify-parity-jsx-pair.ts',
+		what: 'the parity of the JSX pair extraction',
+	},
+	{
+		file: 'verify-parity-jsx-pair-mutation.ts',
+		what: 'the JSX pair parity test catches every mutation',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
