@@ -9,6 +9,7 @@
 import path from 'path';
 import type { LlamaModel } from 'node-llama-cpp';
 import type { AdvisorV2Result } from '../planner.js';
+import { parseAdvisorJson } from './advisorJson.js';
 
 // ---------------------------------------------------------------------------
 // 1. UI Component / Interaction / Design / Framework Patterns
@@ -94,10 +95,9 @@ const VALID_INTENTS: AdvisorIntent[] = [
 
 export function parseAdvisorIntent(raw: string): AdvisorIntent | null {
 	const stripped = raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, '').trim();
-	const match = stripped.match(/\{[^{}]*\}/);
-	if (!match) { console.warn('[Advisor] No JSON found.'); return null; }
+	const obj = parseAdvisorJson(stripped);
+	if (!obj) { console.warn('[Advisor] No JSON found.'); return null; }
 	try {
-		const obj = JSON.parse(match[0]);
 		const intent = obj.intent as string;
 		if (!VALID_INTENTS.includes(intent as AdvisorIntent)) {
 			console.warn(`[Advisor] Unknown intent value: "${intent}"`);
@@ -111,12 +111,14 @@ export function parseAdvisorIntent(raw: string): AdvisorIntent | null {
 	}
 }
 
-export function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: AdvisorV2Result } | null {
+export 
+
+function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: AdvisorV2Result } | null {
 	const stripped = raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, '').trim();
-	const match = stripped.match(/\{[\s\S]*\}/);
-	if (!match) { console.warn('[AdvisorV2] No JSON found.'); return null; }
+	// Tolerant parse: a truncated Advisor response still yields its fields.
+	const obj = parseAdvisorJson(stripped);
+	if (!obj) { console.warn('[AdvisorV2] No JSON found.'); return null; }
 	try {
-		const obj = JSON.parse(match[0]);
 		const intentRaw = obj.intent as string;
 		if (!VALID_INTENTS.includes(intentRaw as AdvisorIntent)) {
 			console.warn(`[AdvisorV2] Unknown intent: "${intentRaw}"`);
@@ -131,11 +133,19 @@ export function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: Adviso
 			database: obj.database,
 			orm: obj.orm,
 			authentication: obj.authentication,
-			requiredFeatures: Array.isArray(obj.requiredFeatures) ? obj.requiredFeatures : undefined,
-			modules: Array.isArray(obj.modules) ? obj.modules : undefined,
-			estimatedFiles: typeof obj.estimatedFiles === 'number' ? obj.estimatedFiles : undefined,
+			...(Array.isArray(obj.requiredFeatures)
+				? { requiredFeatures: obj.requiredFeatures as string[] }
+				: {}),
+			...(Array.isArray(obj.modules)
+				? { modules: obj.modules as string[] }
+				: {}),
+			...(typeof obj.estimatedFiles === 'number'
+				? { estimatedFiles: obj.estimatedFiles }
+				: {}),
 			generationStrategy: obj.generationStrategy,
-			confidence: typeof obj.confidence === 'number' ? obj.confidence : undefined,
+			...(typeof obj.confidence === 'number'
+				? { confidence: obj.confidence }
+				: {}),
 		};
 		console.log(`[AdvisorV2] intent=${intentRaw} arch=${v2.architecture ?? '?'} modules=[${(v2.modules ?? []).join(',')}] features=[${(v2.requiredFeatures ?? []).join(',')}]`);
 		return { intent: intentRaw as AdvisorIntent, v2 };

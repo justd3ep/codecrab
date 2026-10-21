@@ -10,7 +10,9 @@ import { Disposable } from '../../../../base/common/lifecycle.js';
 import { Emitter, Event } from '../../../../base/common/event.js';
 import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
 import { registerSingleton, InstantiationType } from '../../../../platform/instantiation/common/extensions.js';
+import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
 import { IChatMessage, IFileContext, ISpecialistModel } from './codecrabAiService.js';
+import { CodeCrabConfigKeys } from './codecrabConfiguration.js';
 
 export interface IContextUsageData {
 	used: number;
@@ -56,7 +58,6 @@ export interface IRouterHealthResponse {
 	context?: IContextUsageData;
 	models: IRouterModelInfo[];
 }
-
 // ---------------------------------------------------------------------------
 // Service interface
 // ---------------------------------------------------------------------------
@@ -149,24 +150,80 @@ export class RouterNotConnectedError extends Error {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// Phase 1 stub implementation
-// ---------------------------------------------------------------------------
+// -------------------------------------------------------------------------------------------
+// Helpers
+// -------------------------------------------------------------------------------------------
 
+/**
+ * Normalize a user-supplied router URL.
+ *
+ * - Strips a trailing slash so `${url}/health` never becomes `//health`.
+ * - Defaults to `http://` when the scheme is missing, otherwise the browser
+ *   would try to resolve `localhost:3141` as a relative path and fail with
+ *   "Failed to fetch".
+ */
+export function normalizeRouterUrl(raw: string | undefined): string {
+	const trimmed = (raw ?? '').trim();
+	if (!trimmed) {
+		return 'http://localhost:3141';
+	}
+	const withScheme = /^https?:\/\//i.test(trimmed) ? trimmed : `http://${trimmed}`;
+	return withScheme.replace(/\/+$/, '');
+}
+
+/**
+ * Decide whether a thrown value means "the router is not reachable".
+ *
+ * The workbench runs in Chromium, whose fetch failures surface as
+ * `TypeError: Failed to fetch` — Node's `ECONNREFUSED` / "fetch failed"
+ * wording never appears. The previous check only looked for the Node
+ * wording, so a genuinely-offline router produced a raw "Failed to fetch"
+ * stack trace instead of the helpful "router is not running" message.
+ */
+export function isRouterUnreachable(error: any): boolean {
+	if (!error) {
+		return false;
+	}
+	if (error.name === 'AbortError') {
+		return false;
+	}
+	const code = error.cause?.code ?? error.code;
+	if (code === 'ECONNREFUSED' || code === 'ECONNRESET' || code === 'ENOTFOUND' || code === 'EHOSTUNREACH') {
+		return true;
+	}
+	const message = String(error.message ?? error).toLowerCase();
+	return message.includes('failed to fetch')
+		|| message.includes('fetch failed')
+		|| message.includes('econnrefused')
+		|| message.includes('networkerror')
+		|| message.includes('load failed');
+}
+
+// -------------------------------------------------------------------------------------------
+// Implementation
+// -------------------------------------------------------------------------------------------
 export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterClient {
 	declare readonly _serviceBrand: undefined;
 
 	/**
-	 * Phase 2: This URL will come from a workspace configuration setting.
-	 * For now it is hardcoded to the default router port.
+	 * Base URL of the router.
+	 *
+	 * Resolved from the `codecrab.routerUrl` setting (default
+	 * `http://localhost:3141`). Previously this was hardcoded, which made the
+	 * registered setting a no-op and broke the moment the port changed.
 	 */
-	readonly routerUrl = 'http://localhost:3141';
+	readonly routerUrl: string;
 
 	private readonly _onDidChangeContextUsage = this._register(new Emitter<IContextUsageData>());
 	readonly onDidChangeContextUsage: Event<IContextUsageData> = this._onDidChangeContextUsage.event;
 
-	constructor() {
+	constructor(
+		@IConfigurationService private readonly _configurationService: IConfigurationService,
+	) {
 		super();
+		this.routerUrl = normalizeRouterUrl(
+			this._configurationService.getValue<string>(CodeCrabConfigKeys.RouterUrl) ?? 'http://localhost:3141'
+		);
 	}
 
 	// Phase 1 stub — router not built yet
@@ -221,7 +278,7 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 			});
 
 			if (!res.ok) {
-				throw new Error(`Router error: ${res.statusText}`);
+				throw new Error(`Router error: ${res.status} ${res.statusText}`);
 			}
 
 			if (res.body) {
@@ -238,61 +295,96 @@ export class CodeCrabRouterClient extends Disposable implements ICodeCrabRouterC
 					buffer = lines.pop() || ''; // Keep the last, potentially incomplete line
 					
 					for (const line of lines) {
-						let trimmed = line.trim();
-						if (!trimmed) continue;
-						if (trimmed.startsWith('data: ')) {
-							trimmed = trimmed.substring(6).trim();
+						const parsed = this._parseChunk(line);
+						if (!parsed) { continue; }
+						if (parsed.contextUsage) {
+							this._onDidChangeContextUsage.fire(parsed.contextUsage);
 						}
-						if (!trimmed || trimmed === '[DONE]') continue;
-						try {
-							const data = JSON.parse(trimmed);
-							if (data.type === 'context_usage' && typeof data.used === 'number') {
-								this._onDidChangeContextUsage.fire({
-									used: data.used,
-									total: data.total ?? 8192,
-									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100),
-									model: data.model
-								});
-							}
-							if (data.message?.content) {
-								yield data.message.content;
-							}
-						} catch (e) {
-							// Ignore parse errors for corrupt chunks
+						if (parsed.content) {
+							yield parsed.content;
 						}
 					}
 				}
 
+				// Flush whatever is left in the buffer
 				if (buffer.trim()) {
-					try {
-						let bTrimmed = buffer.trim();
-						if (bTrimmed.startsWith('data: ')) bTrimmed = bTrimmed.substring(6).trim();
-						if (bTrimmed && bTrimmed !== '[DONE]') {
-							const data = JSON.parse(bTrimmed);
-							if (data.type === 'context_usage' && typeof data.used === 'number') {
-								this._onDidChangeContextUsage.fire({
-									used: data.used,
-									total: data.total ?? 8192,
-									percent: data.percent ?? Math.round((data.used / (data.total ?? 8192)) * 100),
-									model: data.model
-								});
-							}
-							if (data.message?.content) {
-								yield data.message.content;
-							}
+					const parsed = this._parseChunk(buffer);
+					if (parsed) {
+						if (parsed.contextUsage) {
+							this._onDidChangeContextUsage.fire(parsed.contextUsage);
 						}
-					} catch (e) {}
+						if (parsed.content) {
+							yield parsed.content;
+						}
+					}
 				}
 			}
 		} catch (error: any) {
 			if (error.name === 'AbortError') { return; }
-			if (error.cause?.code === 'ECONNREFUSED' || error.message.includes('fetch failed')) {
+			if (isRouterUnreachable(error)) {
 				throw new RouterNotConnectedError();
 			}
 			throw error;
 		} finally {
 			disposable.dispose();
 		}
+	}
+
+	/**
+	 * Parse one line of the router's response stream.
+	 *
+	 * The router speaks three shapes on the same connection:
+	 *   1. NDJSON  `{"message":{"content":"..."}}`      — the normal pipeline
+	 *   2. NDJSON  `{"type":"context_usage", ...}`      — telemetry
+	 *   3. SSE     `data: {"choices":[{"delta":{"content":"..."}}]}` — the
+	 *      clarification path, and the `data: [DONE]` sentinel
+	 *
+	 * The old parser only understood (1) and (2), so the clarification reply
+	 * was silently dropped and the user saw an empty response.
+	 */
+	private _parseChunk(line: string): { content?: string; contextUsage?: IContextUsageData } | null {
+		let trimmed = line.trim();
+		if (!trimmed) { return null; }
+
+		if (trimmed.startsWith('data:')) {
+			trimmed = trimmed.substring(5).trim();
+		}
+		if (!trimmed || trimmed === '[DONE]') { return null; }
+
+		let data: any;
+		try {
+			data = JSON.parse(trimmed);
+		} catch {
+			// Not JSON — ignore malformed chunk rather than killing the stream.
+			return null;
+		}
+		if (!data || typeof data !== 'object') { return null; }
+
+		// (2) context usage telemetry
+		if (data.type === 'context_usage' && typeof data.used === 'number') {
+			const total = data.total ?? 8192;
+			return {
+				contextUsage: {
+					used: data.used,
+					total,
+					percent: data.percent ?? Math.round((data.used / total) * 100),
+					model: data.model
+				}
+			};
+		}
+
+		// (3) OpenAI-compatible delta
+		const delta = data.choices?.[0]?.delta?.content;
+		if (typeof delta === 'string' && delta.length > 0) {
+			return { content: delta };
+		}
+
+		// (1) router pipeline chunk
+		if (typeof data.message?.content === 'string' && data.message.content.length > 0) {
+			return { content: data.message.content };
+		}
+
+		return null;
 	}
 
 	// Phase 3 implementation

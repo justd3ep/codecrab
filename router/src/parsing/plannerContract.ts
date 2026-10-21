@@ -8,6 +8,7 @@
 
 import type { ValidationContract } from '../validator.js';
 import type { UserScope } from './constraintParser.js';
+import type { StackProfile } from '../routing/stackProfile.js';
 
 export interface PlannerContract {
 	scope: 'backend' | 'frontend' | 'fullstack';
@@ -98,7 +99,11 @@ export function buildPlannerContract(msg: string, advisorIntent: string, userSco
 	return { scope, architecture, framework, language, requiredFeatures, requiredFolders, estimatedFiles };
 }
 
-export function plannerContractToValidationContract(pc: PlannerContract, userScope: UserScope): ValidationContract {
+export function plannerContractToValidationContract(
+	pc: PlannerContract,
+	userScope: UserScope,
+	stack?: StackProfile,
+): ValidationContract {
 	const scope: ValidationContract['scope'] =
 		userScope === 'BACKEND_ONLY' ? 'backend'
 			: userScope === 'FRONTEND_ONLY' ? 'frontend'
@@ -115,5 +120,8 @@ export function plannerContractToValidationContract(pc: PlannerContract, userSco
 		requiredFolders: pc.requiredFolders,
 		expectedFiles: [],
 		estimatedFiles: pc.estimatedFiles,
+		// The requested stack becomes a binding contract: the validator enforces
+		// single-file / no-libraries / plain-HTML requirements after generation.
+		...(stack ? { stack } : {}),
 	};
 }

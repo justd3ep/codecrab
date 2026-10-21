@@ -29,3 +29,18 @@ src/config/config.local.js
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Generated project artifacts.
+#
+# The scratch/ directory holds verification scripts and analysis notes, but a
+# test run that scaffolds a project must NEVER write its output into the
+# repository. Generated code belongs in the eval directory
+# (D:\fedora backup\test), outside the repo.
+#
+# These patterns are a safety net: if a script ever writes a generated
+# project here, it is ignored rather than committed.
+scratch/.live-check/
+scratch/.p0-ws/
+scratch/*/node_modules/
+scratch/.*-backup-*/
+*.backup-*/

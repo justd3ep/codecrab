@@ -47,12 +47,73 @@ export async function verifyBuildStatus(workspaceRoot: string): Promise<{ passed
 }
 
 /**
+ * Stage the files an agent turn produced — and nothing else.
+ *
+ * Two rules, both learned the hard way:
+ *
+ *  1. NEVER `git add .` — it stages deletions. A run that removed or
+ *     replaced an existing file would make that removal permanent.
+ *  2. NEVER stage a deletion at all. If the agent deleted a file, the
+ *     deletion stays in the working tree for the user to review.
+ *
+ * When `writtenFiles` is given, exactly those paths are staged. When it is
+ * not, the modified and newly-created files are derived from
+ * `git status --porcelain` — skipping every entry marked as deleted.
+ *
+ * Returns the number of paths staged.
+ */
+async function stageAgentFiles(workspaceRoot: string, writtenFiles?: string[]): Promise<number> {
+	const paths: string[] = [];
+
+	if (writtenFiles && writtenFiles.length > 0) {
+		for (const f of writtenFiles) {
+			// Skip anything that no longer exists on disk — a missing file is
+			// a deletion, and deletions are never staged.
+			if (!fs.existsSync(path.join(workspaceRoot, f))) continue;
+			paths.push(f);
+		}
+	} else {
+		// Fall back to the porcelain status, minus deletions.
+		const { stdout } = await execPromise('git status --porcelain', { cwd: workspaceRoot });
+		for (const line of (stdout || '').split('\n')) {
+			if (!line.trim()) continue;
+			const code = line.slice(0, 2);
+			const file = line.slice(3).trim();
+			if (!file) continue;
+			// 'D' in either column means deleted. Never stage those.
+			if (code.includes('D')) continue;
+			// Renames appear as "R  old -> new"; stage the new path.
+			const target = file.includes(' -> ') ? file.split(' -> ').pop()! : file;
+			paths.push(target);
+		}
+	}
+
+	if (paths.length === 0) return 0;
+
+	// Stage them one at a time so a single bad path cannot abort the batch
+	// and leave the index half-updated.
+	let staged = 0;
+	for (const p of paths) {
+		try {
+			await execPromise(`git add -- "${p}"`, { cwd: workspaceRoot });
+			staged++;
+		} catch (e: any) {
+			console.warn(`[GitHarness] Could not stage "${p}": ${e?.message || e}`);
+		}
+	}
+	console.log(`[GitHarness] Staged ${staged} agent-written file(s); deletions were NOT staged.`);
+	return staged;
+}
+
+/**
  * Automatically creates an atomic git commit after an agent turn.
  */
 export async function commitHarnessTurn(
 	workspaceRoot: string,
 	mode: 'create' | 'edit' | 'needs_context',
 	userRequest: string,
+	/** Files the agent actually produced. When provided, ONLY these are staged. */
+	writtenFiles?: string[],
 ): Promise<{ committed: boolean; hash?: string; message?: string; buildStatus?: { passed: boolean; message: string } }> {
 	try {
 		const ready = await ensureGitRepo(workspaceRoot);
@@ -67,7 +128,22 @@ export async function commitHarnessTurn(
 			return { committed: false, buildStatus };
 		}
 
-		await execPromise('git add .', { cwd: workspaceRoot });
+		// Stage ONLY what the agent produced.
+		//
+		// NEVER `git add .`: it stages deletions as well, so a run that
+		// removed or replaced an existing file made that removal permanent.
+		// In the test repo, commit 0aea0e8 deleted a working Kanban app
+		// (src/KanbanBoard.tsx, src/KanbanColumn.tsx, src/types/kanban.ts)
+		// and replaced src/App.tsx with a stub — because `git add .` staged
+		// the deletions and the commit made them permanent.
+		//
+		// Rule: stage the specific paths the agent wrote, and never stage a
+		// deletion.
+		const staged = await stageAgentFiles(workspaceRoot, writtenFiles);
+		if (staged === 0) {
+			console.log('[GitHarness] No agent-written files to stage — nothing committed.');
+			return { committed: false, buildStatus };
+		}
 
 		let commitMsg = '';
 		if (mode === 'create') {

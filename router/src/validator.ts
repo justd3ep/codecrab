@@ -39,6 +39,7 @@ import { exec } from 'child_process';
 import util from 'util';
 import { classifyDependency, DependencyStatus, isImportError } from './dependencyStatus.js';
 import type { ExecutionGraph } from './planner.js';
+import type { StackProfile } from './routing/stackProfile.js';
 
 const execPromise = util.promisify(exec);
 
@@ -60,6 +61,12 @@ export interface ValidationContract {
 	requiredFolders: string[];
 	expectedFiles: string[];
 	estimatedFiles: number;
+	/**
+	 * The stack the user actually asked for (single file, no libraries, plain
+	 * HTML, ...). When present the validator ENFORCES it: wrong file count,
+	 * forbidden imports, React leakage and syntax errors are hard errors.
+	 */
+	stack?: StackProfile;
 }
 
 export type IssueKind =
@@ -95,7 +102,7 @@ export interface ValidationResult {
 // Logging
 // ---------------------------------------------------------------------------
 
-function log(msg: string): void  { console.log(`[Validator] ${msg}`); }
+function log(msg: string): void { console.log(`[Validator] ${msg}`); }
 function warn(msg: string): void { console.warn(`[Validator] WARN: ${msg}`); }
 
 // ---------------------------------------------------------------------------
@@ -108,30 +115,30 @@ interface FeatureSpec {
 }
 
 const FEATURE_WEIGHTS: Record<string, FeatureSpec> = {
-	jwt:                { weight: 10, patterns: [/jsonwebtoken|jwt\.sign|jwt\.verify|createJwt|generateToken/i] },
-	refresh_tokens:     { weight: 10, patterns: [/refresh.?token|refreshToken|rotateToken/i] },
-	repository:         { weight: 15, patterns: [/class\s+\w+Repository\b|implements\s+I?\w*Repository\b|@InjectRepository/i] },
-	service_layer:      { weight: 15, patterns: [/class\s+\w+Service\b|@Injectable\(\)|@Service\(\)/i] },
-	uploads:            { weight:  5, patterns: [/multer|diskStorage|memoryStorage|upload\.\w+/i] },
-	logging:            { weight:  2, patterns: [/winston|pino|morgan|bunyan|log\.info|log\.error/i] },
-	pagination:         { weight:  2, patterns: [/\bpage\b.*\blimit\b|\boffset\b.*\blimit\b|\bskip\b.*\btake\b|\bpaginate\b/i] },
-	email:              { weight:  5, patterns: [/nodemailer|sendgrid|mailgun|sendEmail|transporter\.send/i] },
-	payments:           { weight: 10, patterns: [/stripe|paypal|razorpay|braintree|payment_intent/i] },
-	rbac:               { weight:  8, patterns: [/role.*guard|permission.*check|@Roles\(|checkPermission|isAdmin/i] },
-	oauth:              { weight: 10, patterns: [/passport\.use|GoogleStrategy|GithubStrategy|oauth/i] },
-	password_reset:     { weight:  5, patterns: [/resetPassword|passwordReset|forgot.?password|reset.?token/i] },
-	email_verification: { weight:  5, patterns: [/verifyEmail|emailVerification|verify.?token|confirmEmail/i] },
-	transactions:       { weight:  8, patterns: [/\$transaction|\.transaction\(|BEGIN.*COMMIT|beginTransaction/i] },
-	dto:                { weight:  3, patterns: [/class\s+\w+Dto\b|\.dto\.ts|@IsString\(\)|@IsEmail\(\)|@IsNotEmpty\(\)/i] },
-	bcrypt:             { weight:  5, patterns: [/bcrypt\.hash|bcrypt\.compare|argon2\.hash/i] },
-	middleware:         { weight:  3, patterns: [/app\.use\(|router\.use\(|@UseGuards\(|@UseInterceptors\(/i] },
+	jwt: { weight: 10, patterns: [/jsonwebtoken|jwt\.sign|jwt\.verify|createJwt|generateToken/i] },
+	refresh_tokens: { weight: 10, patterns: [/refresh.?token|refreshToken|rotateToken/i] },
+	repository: { weight: 15, patterns: [/class\s+\w+Repository\b|implements\s+I?\w*Repository\b|@InjectRepository/i] },
+	service_layer: { weight: 15, patterns: [/class\s+\w+Service\b|@Injectable\(\)|@Service\(\)/i] },
+	uploads: { weight: 5, patterns: [/multer|diskStorage|memoryStorage|upload\.\w+/i] },
+	logging: { weight: 2, patterns: [/winston|pino|morgan|bunyan|log\.info|log\.error/i] },
+	pagination: { weight: 2, patterns: [/\bpage\b.*\blimit\b|\boffset\b.*\blimit\b|\bskip\b.*\btake\b|\bpaginate\b/i] },
+	email: { weight: 5, patterns: [/nodemailer|sendgrid|mailgun|sendEmail|transporter\.send/i] },
+	payments: { weight: 10, patterns: [/stripe|paypal|razorpay|braintree|payment_intent/i] },
+	rbac: { weight: 8, patterns: [/role.*guard|permission.*check|@Roles\(|checkPermission|isAdmin/i] },
+	oauth: { weight: 10, patterns: [/passport\.use|GoogleStrategy|GithubStrategy|oauth/i] },
+	password_reset: { weight: 5, patterns: [/resetPassword|passwordReset|forgot.?password|reset.?token/i] },
+	email_verification: { weight: 5, patterns: [/verifyEmail|emailVerification|verify.?token|confirmEmail/i] },
+	transactions: { weight: 8, patterns: [/\$transaction|\.transaction\(|BEGIN.*COMMIT|beginTransaction/i] },
+	dto: { weight: 3, patterns: [/class\s+\w+Dto\b|\.dto\.ts|@IsString\(\)|@IsEmail\(\)|@IsNotEmpty\(\)/i] },
+	bcrypt: { weight: 5, patterns: [/bcrypt\.hash|bcrypt\.compare|argon2\.hash/i] },
+	middleware: { weight: 3, patterns: [/app\.use\(|router\.use\(|@UseGuards\(|@UseInterceptors\(/i] },
 };
 
 // Architecture → required folder patterns
 const ARCH_FOLDERS: Record<string, string[]> = {
 	repository: ['controllers', 'services', 'repositories'],
-	mvc:        ['models', 'controllers'],
-	clean:      ['domain', 'application', 'infrastructure'],
+	mvc: ['models', 'controllers'],
+	clean: ['domain', 'application', 'infrastructure'],
 };
 
 // ---------------------------------------------------------------------------
@@ -141,20 +148,20 @@ const ARCH_FOLDERS: Record<string, string[]> = {
 const SRC_BARE_EXTS = new Set(['.tsx', '.jsx', '.ts', '.js', '.css', '.scss', '.less']);
 
 const BARE_SRC_NAMES: Record<string, string> = {
-	'app.tsx':    'src/App.tsx',
-	'app.jsx':    'src/App.jsx',
-	'app.ts':     'src/App.ts',
-	'app.js':     'src/App.js',
-	'main.tsx':   'src/main.tsx',
-	'main.jsx':   'src/main.jsx',
-	'main.ts':    'src/main.ts',
-	'main.js':    'src/main.js',
-	'index.tsx':  'src/index.tsx',
-	'index.ts':   'src/index.ts',
-	'style.css':  'src/style.css',
+	'app.tsx': 'src/App.tsx',
+	'app.jsx': 'src/App.jsx',
+	'app.ts': 'src/App.ts',
+	'app.js': 'src/App.js',
+	'main.tsx': 'src/main.tsx',
+	'main.jsx': 'src/main.jsx',
+	'main.ts': 'src/main.ts',
+	'main.js': 'src/main.js',
+	'index.tsx': 'src/index.tsx',
+	'index.ts': 'src/index.ts',
+	'style.css': 'src/style.css',
 	'styles.css': 'src/styles.css',
-	'index.css':  'src/index.css',
-	'app.css':    'src/App.css',
+	'index.css': 'src/index.css',
+	'app.css': 'src/App.css',
 };
 
 function normalizePath(filePath: string): string {
@@ -919,15 +926,15 @@ function detectFramework(files: GeneratedFile[]): Framework {
 	const hasViteHtml = files.some(f => f.path === 'index.html' && /type=["']module["']/.test(f.content) && /src\/main/.test(f.content));
 	const hasSrcMainTsx = paths.has('src/main.tsx') || paths.has('src/main.jsx');
 	const hasSrcIndexTsx = paths.has('src/index.tsx') || paths.has('src/index.jsx');
-	const hasAppPageTsx  = paths.has('app/page.tsx')  || paths.has('app/page.jsx');
-	const hasAppLayout   = paths.has('app/layout.tsx') || paths.has('app/layout.jsx');
+	const hasAppPageTsx = paths.has('app/page.tsx') || paths.has('app/page.jsx');
+	const hasAppLayout = paths.has('app/layout.tsx') || paths.has('app/layout.jsx');
 	const hasCRAEntry = files.some(f => f.path === 'public/index.html');
 	const hasCreateRoot = files.some(f => /createRoot\s*\(/.test(f.content));
 	const hasRenderLegacy = files.some(f => /ReactDOM\.render\s*\(/.test(f.content));
 	if (hasCreateRoot && hasRenderLegacy) warn('mixed ReactDOM.render + createRoot detected');
 	if (hasSrcIndexTsx && hasSrcMainTsx) warn('both index.tsx and main.tsx present — possible mixed convention');
 	const isVite = hasViteHtml || hasSrcMainTsx;
-	const isCRA  = hasCRAEntry || hasSrcIndexTsx;
+	const isCRA = hasCRAEntry || hasSrcIndexTsx;
 	const isNext = hasAppPageTsx || hasAppLayout;
 	if (isNext && !isVite && !isCRA) return 'next';
 	if (isVite && !isCRA) return 'vite';
@@ -1046,10 +1053,10 @@ function resolveLocalImport(importPath: string, fromFile: string, files: Generat
  * When graph + committedPaths are provided, only Missing imports produce warnings.
  */
 function pass6ImportValidation(
-	files:          GeneratedFile[],
-	workspaceRoot:  string,
-	issues:         ValidationIssue[],
-	graph?:         ExecutionGraph,
+	files: GeneratedFile[],
+	workspaceRoot: string,
+	issues: ValidationIssue[],
+	graph?: ExecutionGraph,
 	committedPaths?: Set<string>,
 ): GeneratedFile[] {
 	const LOCAL_IMPORT_RE = /import\s+(?:[\w{}\s*,]+\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/).+?)['"]/g;
@@ -1164,20 +1171,20 @@ function classifyLayer(filePath: string): 'route' | 'controller' | 'service' | '
 
 // Which symbols must NOT appear at which layers
 const LAYER_VIOLATIONS: Array<{ pattern: RegExp; allowedLayer: string; label: string }> = [
-	{ pattern: /\bbcrypt\.(hash|compare)\s*\(/,       allowedLayer: 'service',    label: 'bcrypt belongs in Service layer' },
-	{ pattern: /\bjwt\.(sign|verify)\s*\(/,           allowedLayer: 'service',    label: 'jwt.sign/verify belongs in Service layer' },
-	{ pattern: /\bsendEmail\s*\(|\.sendMail\s*\(/,    allowedLayer: 'service',    label: 'email sending belongs in Service layer' },
+	{ pattern: /\bbcrypt\.(hash|compare)\s*\(/, allowedLayer: 'service', label: 'bcrypt belongs in Service layer' },
+	{ pattern: /\bjwt\.(sign|verify)\s*\(/, allowedLayer: 'service', label: 'jwt.sign/verify belongs in Service layer' },
+	{ pattern: /\bsendEmail\s*\(|\.sendMail\s*\(/, allowedLayer: 'service', label: 'email sending belongs in Service layer' },
 	{ pattern: /\bprisma\.\w+\.(findMany|findUnique|findFirst|create|update|delete|upsert)\s*\(/, allowedLayer: 'repository', label: 'Prisma queries belong in Repository layer' },
-	{ pattern: /\.find\s*\(|\.findOne\s*\(|\.save\s*\(|\.deleteOne\s*\(/,  allowedLayer: 'repository', label: 'Mongoose queries belong in Repository layer' },
+	{ pattern: /\.find\s*\(|\.findOne\s*\(|\.save\s*\(|\.deleteOne\s*\(/, allowedLayer: 'repository', label: 'Mongoose queries belong in Repository layer' },
 	{ pattern: /pool\.query\s*\(|db\.query\s*\(|client\.query\s*\(/, allowedLayer: 'repository', label: 'Raw DB queries belong in Repository layer' },
 ];
 
 // Illegal direct import patterns between layers
 const ILLEGAL_IMPORTS: Array<{ from: string; to: string; message: string }> = [
-	{ from: 'route',      to: 'repository', message: 'Route imports directly from Repository (must go through Service)' },
-	{ from: 'route',      to: 'model',      message: 'Route imports directly from Model (must go through Service/Repository)' },
+	{ from: 'route', to: 'repository', message: 'Route imports directly from Repository (must go through Service)' },
+	{ from: 'route', to: 'model', message: 'Route imports directly from Model (must go through Service/Repository)' },
 	{ from: 'controller', to: 'repository', message: 'Controller imports directly from Repository (must go through Service)' },
-	{ from: 'controller', to: 'model',      message: 'Controller imports directly from Model (must go through Service/Repository)' },
+	{ from: 'controller', to: 'model', message: 'Controller imports directly from Model (must go through Service/Repository)' },
 ];
 
 function pass9LayerBoundaryValidator(files: GeneratedFile[], issues: ValidationIssue[]): void {
@@ -1288,19 +1295,34 @@ function pass11RouteSize(files: GeneratedFile[], issues: ValidationIssue[]): voi
 
 function extractDefinedSymbols(content: string): Set<string> {
 	const syms = new Set<string>();
-	const re = /(?:^|\n)\s*(?:export\s+)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/g;
-	const constRe = /(?:^|\n)\s*(?:export\s+)?const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+	// function / class declarations.
+	// `export default function X` and `export async function X` are included:
+	// the previous pattern missed the `default` keyword, so a perfectly
+	// ordinary `export default function authMiddleware()` was reported as an
+	// undefined symbol.
+	const re = /(?:^|\n)\s*(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:function|class)\s+([A-Za-z_$][A-Za-z0-9_$]*)/g;
+	const constRe = /(?:^|\n)\s*(?:export\s+(?:default\s+)?)?const\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*=/g;
+	// Class and object methods.
+	//
+	// `async getAllUsers() {` and `getX(): T {` are DEFINITIONS, not calls.
+	// The previous pattern only knew about `function`/`class`/`const`, so
+	// every method declaration was reported as an undefined symbol — five of
+	// the six `undefined_symbol` errors in the real backend run were exactly
+	// this. The pattern requires an indented line (so it only matches inside
+	// a class or object body) and a `{` or a return type after the params.
+	const methodRe = /(?:^|\n)[ \t]+(?:public\s+|private\s+|protected\s+|readonly\s+|static\s+|override\s+|abstract\s+|async\s+|get\s+|set\s+)*([A-Za-z_$][A-Za-z0-9_$]*)\s*\([^)]*\)\s*(?::[^;{]+)?\s*\{/g;
 	let m: RegExpExecArray | null;
 	while ((m = re.exec(content)) !== null) if (m[1]) syms.add(m[1]);
 	while ((m = constRe.exec(content)) !== null) if (m[1]) syms.add(m[1]);
+	while ((m = methodRe.exec(content)) !== null) if (m[1]) syms.add(m[1]);
 	return syms;
 }
 
 function extractNamedImports(content: string): Set<string> {
 	const syms = new Set<string>();
 	const namedRe = /import\s+\{([^}]+)\}\s+from\s+['"][^'"]+['"]/g;
-	const defRe   = /import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]/g;
-	const nsRe    = /import\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]/g;
+	const defRe = /import\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]/g;
+	const nsRe = /import\s+\*\s+as\s+([A-Za-z_$][A-Za-z0-9_$]*)\s+from\s+['"][^'"]+['"]/g;
 	let m: RegExpExecArray | null;
 	while ((m = namedRe.exec(content)) !== null) {
 		m[1]!.split(',').forEach(s => { const name = s.trim().split(/\s+as\s+/).pop()!.trim(); if (name) syms.add(name); });
@@ -1344,7 +1366,20 @@ function pass12UndefinedSymbols(files: GeneratedFile[], workspaceRoot: string, i
 		'data', 'result', 'Date', 'RegExp', 'Array', 'Object', 'String', 'Number', 'Boolean',
 		'Symbol', 'BigInt', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Error', 'TypeError', 'RangeError',
 		'SyntaxError', 'Buffer', 'URL', 'URLSearchParams', 'fetch', 'Headers', 'Request', 'Response',
-		'FormData', 'AbortController', 'Blob'
+		'FormData', 'AbortController', 'Blob',
+		// JavaScript keywords. A keyword is never an undefined symbol, but the
+		// call regex matches `if (` and `catch (` just like a function call.
+		'if', 'for', 'while', 'switch', 'catch', 'return', 'function', 'await', 'do', 'else',
+		'try', 'throw', 'typeof', 'delete', 'void', 'in', 'of', 'case', 'break', 'continue',
+		'yield', 'new', 'instanceof', 'this', 'super', 'default', 'with', 'debugger',
+		// Common object methods that are not free functions.
+		'push', 'pop', 'shift', 'unshift', 'slice', 'splice', 'concat', 'join', 'split',
+		'replace', 'replaceAll', 'trim', 'trimStart', 'trimEnd', 'toUpperCase', 'toLowerCase',
+		'substring', 'substr', 'indexOf', 'lastIndexOf', 'includes', 'startsWith', 'endsWith',
+		'match', 'matchAll', 'test', 'padStart', 'padEnd', 'repeat', 'charAt', 'charCodeAt',
+		'keys', 'values', 'entries', 'forEach', 'map', 'filter', 'reduce', 'find', 'findIndex',
+		'some', 'every', 'flat', 'flatMap', 'sort', 'reverse', 'has', 'get', 'set', 'add',
+		'delete', 'clear', 'size', 'log', 'warn', 'error', 'info', 'debug', 'trace'
 	]);
 
 	for (const f of files) {
@@ -1355,16 +1390,72 @@ function pass12UndefinedSymbols(files: GeneratedFile[], workspaceRoot: string, i
 		const localDefined = extractDefinedSymbols(f.content);
 
 		// 1. Calls: await someFunc() or await SomeClass.someFunc() or someFunc()
-		const callRe = /\b(?:await\s+)?([A-Za-z_$][A-Za-z0-9_$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\(/g;
+		//
+		// Three fixes, all for false positives on CORRECT code:
+		//
+		//  a) `(?<![.\w$])` — the identifier must not be preceded by a dot.
+		//     Without it, the scan restarts at a method name after a closing
+		//     paren (`res.status(401).json(...)` reported `json`) or after an
+		//     optional chain (`req.headers.a?.split(...)` reported `split`).
+		//     A METHOD is not an undefined free symbol; its receiver is.
+		//
+		//  b) `(?:\??\.[A-Za-z_$]...)*` — the chain group now spans `?.`, so
+		//     an optional-chained call is attributed to its head identifier.
+		//
+		//  c) The chain is CAPTURED (group 2) so that a call to a method on a
+		//     known local object can be reported by its METHOD name. Without
+		//     this, `this.repo.findAllMissing()` was attributed to `this` and
+		//     the genuinely-undefined method was never reported. The validator
+		//     must not trade a false positive for a false negative.
+		const callRe = /(?<![.\w$])(?:await\s+)?([A-Za-z_$][A-Za-z0-9_$]*)((?:\??\.[A-Za-z_$][A-Za-z0-9_$]*)*)\s*\(/g;
 		let m: RegExpExecArray | null;
 		while ((m = callRe.exec(f.content)) !== null) {
-			const sym = m[1]!;
-			if (SKIP_SYMS.has(sym) || localImports.has(sym) || localDefined.has(sym) || globalSymbols.has(sym)) continue;
+			const head = m[1]!;
+			const chain = m[2] ?? '';
+			// Decide what to report:
+			//  - a bare call `foo()`            -> report `foo`
+			//  - a call on a KNOWN local (`this.x.y()`) -> report the method name
+			//  - a call on an unknown receiver   -> report the head
+			let sym = head;
+			if (chain) {
+				const segments = chain.split('.').map(s => s.replace(/^\?\./, '').trim()).filter(Boolean);
+				const methodName = segments[segments.length - 1];
+				// Report the METHOD only when the receiver is an object we own:
+				// `this` or a locally declared class/const. A DEFAULT import
+				// (`import jwt from 'jsonwebtoken'`) is a third-party library —
+				// its methods are not ours to police, and we do not know its API
+				// surface. Reporting `jwt.verify` as undefined would be a new
+				// false positive of exactly the kind this fix removes.
+				const receiverIsOurs =
+					head === 'this' ||
+					localDefined.has(head) ||
+					globalSymbols.has(head);
+				if (receiverIsOurs && methodName) {
+					// The receiver is ours; the METHOD may not exist. Report it.
+					sym = methodName;
+				} else {
+					// Library or unknown receiver: the head is the symbol we
+					// cannot resolve.
+					sym = head;
+				}
+			}
+			// Only the REPORTED symbol is checked against SKIP_SYMS.
+			//
+			// The previous form also skipped on `head`, which silently dropped
+			// every call with a chain whose head was `this` — so
+			// `this.repo.findAllMissing()`, a genuinely undefined method, was
+			// never reported. A false positive is better than a false
+			// negative: the repair loop chases phantoms, but it cannot chase
+			// errors it was never told about.
+			if (SKIP_SYMS.has(sym)) continue;
+			if (localImports.has(sym) || localDefined.has(sym) || globalSymbols.has(sym)) continue;
 			issues.push({ kind: 'undefined_symbol', file: f.path, message: `"${sym}" called or referenced but not defined or imported`, severity: 'error' });
 		}
 
 		// 2. New instantiations: new SomeClass() or new somePackage.SomeClass()
-		const newRe = /\bnew\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\(/g;
+		// Same dot handling as the call regex: `new a.b.C()` is attributed to
+		// its head identifier, and a method name is never a free symbol.
+		const newRe = /(?<![.\w$])new\s+([A-Za-z_$][A-Za-z0-9_$]*)(?:\??\.[A-Za-z_$][A-Za-z0-9_$]*)*\s*\(/g;
 		while ((m = newRe.exec(f.content)) !== null) {
 			const sym = m[1]!;
 			if (SKIP_SYMS.has(sym) || localImports.has(sym) || localDefined.has(sym) || globalSymbols.has(sym)) continue;
@@ -1382,7 +1473,7 @@ function pass14DeadCode(files: GeneratedFile[], issues: ValidationIssue[]): void
 		const ext = path.extname(f.path).toLowerCase();
 		if (!['.ts', '.tsx', '.js', '.jsx'].includes(ext)) continue;
 		if (/main\.(ts|tsx|js)|index\.(ts|tsx|js)|app\.(ts|tsx|js)|server\.ts|\.config\./i.test(f.path)) continue;
-		const base     = f.path.replace(/\.(ts|tsx|js|jsx)$/, '');
+		const base = f.path.replace(/\.(ts|tsx|js|jsx)$/, '');
 		const basename = path.basename(base);
 		const aliasBase = base.startsWith('src/') ? '@/' + base.slice(4) : '';
 		const imported = files.some(other => {
@@ -1409,10 +1500,10 @@ function pass14DeadCode(files: GeneratedFile[], issues: ValidationIssue[]): void
  * When graph + committedPaths are provided, only Missing imports produce errors.
  */
 function pass13DependencyValidator(
-	files:           GeneratedFile[],
-	workspaceRoot:   string,
-	issues:          ValidationIssue[],
-	graph?:          ExecutionGraph,
+	files: GeneratedFile[],
+	workspaceRoot: string,
+	issues: ValidationIssue[],
+	graph?: ExecutionGraph,
 	committedPaths?: Set<string>,
 ): void {
 	const LOCAL_IMPORT_RE = /import\s+(?:[\w{}\s*,]+\s+from\s+)?['"]((?:\.\.?\/|@\/|~\/).+?)['"]/g;
@@ -1430,9 +1521,9 @@ function pass13DependencyValidator(
 				const status = classifyDependency(importPath, f.path, graph, committedPaths, workspaceRoot);
 				if (!isImportError(status)) continue;
 				issues.push({
-					kind:     'missing_import',
-					file:     f.path,
-					message:  `Cannot resolve local import "${importPath}" — file missing from graph and workspace`,
+					kind: 'missing_import',
+					file: f.path,
+					message: `Cannot resolve local import "${importPath}" — file missing from graph and workspace`,
 					severity: 'error',
 				});
 				continue;
@@ -1443,19 +1534,19 @@ function pass13DependencyValidator(
 			if (importPath.startsWith('@/') || importPath.startsWith('~/')) {
 				resolved = path.normalize(path.join('src', importPath.slice(2))).replace(/\\/g, '/');
 			} else {
-				const fromDir  = path.dirname(f.path);
+				const fromDir = path.dirname(f.path);
 				resolved = path.normalize(path.join(fromDir, importPath)).replace(/\\/g, '/');
 			}
-			const inFiles  = RESOLVE_EXTS.some(ext2 => files.some(g => g.path.replace(/\\/g, '/') === resolved + ext2 || g.path.replace(/\\/g, '/') === resolved));
+			const inFiles = RESOLVE_EXTS.some(ext2 => files.some(g => g.path.replace(/\\/g, '/') === resolved + ext2 || g.path.replace(/\\/g, '/') === resolved));
 			if (inFiles) continue;
 			const onDisk = RESOLVE_EXTS.some(ext2 => {
 				try { return fs.existsSync(path.join(workspaceRoot, resolved + ext2)); } catch { return false; }
 			});
 			if (!onDisk) {
 				issues.push({
-					kind:     'missing_import',
-					file:     f.path,
-					message:  `Cannot resolve local import "${importPath}" — file missing from generated output and workspace`,
+					kind: 'missing_import',
+					file: f.path,
+					message: `Cannot resolve local import "${importPath}" — file missing from generated output and workspace`,
 					severity: 'error',
 				});
 			}
@@ -1537,11 +1628,11 @@ function pass15WorkspaceCollision(files: GeneratedFile[], workspaceRoot: string,
 // ---------------------------------------------------------------------------
 
 const SECURITY_CHECKS: Array<{ re: RegExp; message: string }> = [
-	{ re: /Math\.random\(\)/,                                                  message: 'Math.random() for token generation — use crypto.randomBytes()' },
-	{ re: /JWT_SECRET\s*[=:]\s*['"][^'"]{1,20}['"]/,                          message: 'Hardcoded JWT secret — use process.env' },
-	{ re: /crypto\.createHash\(['"]md5['"]|crypto\.createHash\(['"]sha1['"]/,  message: 'MD5/SHA1 for hashing — use bcrypt or SHA-256' },
-	{ re: /eval\s*\(|new Function\s*\(/,                                       message: 'eval()/new Function() — remote code execution risk' },
-	{ re: /cors\(\)(?!\s*\{)|origin:\s*['"]\*['"]/,                            message: 'CORS wildcard origin — restrict in production' },
+	{ re: /Math\.random\(\)/, message: 'Math.random() for token generation — use crypto.randomBytes()' },
+	{ re: /JWT_SECRET\s*[=:]\s*['"][^'"]{1,20}['"]/, message: 'Hardcoded JWT secret — use process.env' },
+	{ re: /crypto\.createHash\(['"]md5['"]|crypto\.createHash\(['"]sha1['"]/, message: 'MD5/SHA1 for hashing — use bcrypt or SHA-256' },
+	{ re: /eval\s*\(|new Function\s*\(/, message: 'eval()/new Function() — remote code execution risk' },
+	{ re: /cors\(\)(?!\s*\{)|origin:\s*['"]\*['"]/, message: 'CORS wildcard origin — restrict in production' },
 ];
 
 function pass16Security(files: GeneratedFile[], issues: ValidationIssue[]): void {
@@ -1596,7 +1687,7 @@ function pass15ReactValidation(files: GeneratedFile[]): GeneratedFile[] {
 	if (reactFiles.length === 0) return files;
 	if (!files.some(f => /createRoot\s*\(/.test(f.content))) warn('no createRoot() — React entry may be missing');
 	const routerFiles = files.filter(f => hasRouterImport(f.content));
-	const reactCount  = files.filter(f => ['.tsx', '.jsx'].includes(path.extname(f.path).toLowerCase())).length;
+	const reactCount = files.filter(f => ['.tsx', '.jsx'].includes(path.extname(f.path).toLowerCase())).length;
 	if (routerFiles.length > 0 && reactCount <= 1) {
 		warn(`react-router imported but only ${reactCount} React file(s) — removing router imports`);
 		return files.map(f => {
@@ -1778,6 +1869,19 @@ async function pass17CompileValidation(files: GeneratedFile[], workspaceRoot: st
 
 function pass18ProjectCompleteness(files: GeneratedFile[], contract: ValidationContract | undefined, issues: ValidationIssue[]): void {
 	if (!contract || contract.estimatedFiles <= 0) return;
+
+	// A single-file request produces exactly ONE file. The generic estimate
+	// (features/folders based) does not apply, and flagging it as "incomplete"
+	// would push the model into emitting extra files.
+	if (contract.stack?.singleFile) {
+		if (files.length === 0) {
+			issues.push({ kind: 'completeness', message: 'Single-file request produced no file at all.', severity: 'error' });
+		} else {
+			log(`completeness: single-file request -> ${files.length} file(s) - OK`);
+		}
+		return;
+	}
+
 	const threshold = Math.floor(contract.estimatedFiles * 0.5);
 	if (files.length < threshold) {
 		issues.push({ kind: 'completeness', message: `Only ${files.length} files generated — expected ~${contract.estimatedFiles} (min ${threshold}). Generation incomplete.`, severity: 'error' });
@@ -1789,6 +1893,284 @@ function pass18ProjectCompleteness(files: GeneratedFile[], contract: ValidationC
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// PASS 19 — Stack Contract (enforces what the user actually asked for)
+// ---------------------------------------------------------------------------
+
+/** Extracts every import/require specifier from a source blob. */
+function extractImportSpecifiers(content: string): string[] {
+	const out: string[] = [];
+	const staticRe = /(?:^|[\n;])\s*(?:import\s+(?:[^'";]*?\s+from\s+)?|export\s+(?:\*|\{[^}]*\})\s+from\s+|require\s*\(\s*)['"]([^'"]+)['"]/g;
+	let m: RegExpExecArray | null;
+	while ((m = staticRe.exec(content)) !== null) out.push(m[1]!);
+	const dynamicRe = /\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
+	while ((m = dynamicRe.exec(content)) !== null) out.push(m[1]!);
+	return out;
+}
+
+/** "react-dom/client" → "react-dom"; "@scope/pkg/sub" → "@scope/pkg". */
+function barePackageName(spec: string): string {
+	if (spec.startsWith('@')) {
+		const parts = spec.split('/');
+		return parts.slice(0, 2).join('/');
+	}
+	return spec.split('/')[0] ?? spec;
+}
+
+/** React / JSX / TypeScript markers that must not appear in a plain-stack file. */
+const REACT_LEAK_RE = /(?:\bimport\s+React\b|\bfrom\s+['"]react(?:\/[^'"]*)?['"]|\bclassName\s*=|\buseState\s*\(|\buseEffect\s*\(|\buseRef\s*\(|\buseMemo\s*\(|\buseCallback\s*\(|\bexport\s+default\s+function)/;
+
+/**
+ * Pass 19: Stack contract.
+ *
+ * The generator used to ignore the requested stack entirely — a "single-file
+ * HTML/CSS/JS, no libraries" request produced a React + Vite + Tailwind project
+ * with 12 files. Nothing checked it. This pass makes the contract binding:
+ *
+ *  - single-file request  → exactly one file, and it must be the named file
+ *  - "no libraries"       → no bare-module imports, no CDN/external resources
+ *  - plain stack          → no React/JSX markers leaking into the output
+ */
+function pass19StackContract(
+	files: GeneratedFile[],
+	contract: ValidationContract | undefined,
+	issues: ValidationIssue[],
+): void {
+	const stack = contract?.stack;
+	if (!stack) return;
+
+	const plain = stack.kind === 'vanilla' || stack.kind === 'single-file';
+
+	// ── File count / file name ──────────────────────────────────────────────
+	if (stack.singleFile && files.length > 1) {
+		issues.push({
+			kind: 'scope_violation',
+			message: `Single-file request but ${files.length} files were generated (${files.map(f => f.path).join(', ')}). Only ${stack.targetFile ?? 'one file'} is allowed.`,
+			severity: 'error',
+		});
+	}
+	if (stack.singleFile && files.length === 1 && stack.targetFile) {
+		const actual = files[0]!.path.replace(/\\/g, '/');
+		const want = stack.targetFile.replace(/\\/g, '/');
+		if (actual !== want && !actual.endsWith('/' + want)) {
+			issues.push({
+				kind: 'scope_violation',
+				file: files[0]!.path,
+				message: `Expected the single file to be "${want}" but got "${actual}".`,
+				severity: 'error',
+			});
+		}
+	}
+
+	for (const f of files) {
+		const ext = path.extname(f.path).toLowerCase();
+
+		// ── Import policy ───────────────────────────────────────────────────
+		for (const spec of extractImportSpecifiers(f.content)) {
+			if (spec.startsWith('.') || spec.startsWith('/') || spec.startsWith('node:')) continue;
+			const pkg = barePackageName(spec);
+			if (stack.noThirdPartyImports) {
+				issues.push({
+					kind: 'scope_violation',
+					file: f.path,
+					message: `Import "${spec}" is not allowed — the request forbids third-party libraries. Use browser built-ins only.`,
+					severity: 'error',
+				});
+			} else if (stack.forbiddenLibraries.includes(pkg)) {
+				issues.push({
+					kind: 'scope_violation',
+					file: f.path,
+					message: `Import "${spec}" is not allowed for the requested stack (${stack.kind}).`,
+					severity: 'error',
+				});
+			}
+		}
+
+		// ── External resources in HTML ──────────────────────────────────────
+		if (ext === '.html') {
+			const extRes = f.content.match(/<(?:script[^>]*\bsrc|link[^>]*\bhref)\s*=\s*["'](https?:\/\/[^"']+)["']/i);
+			if (extRes && (stack.noThirdPartyImports || plain)) {
+				issues.push({
+					kind: 'scope_violation',
+					file: f.path,
+					message: `External resource "${extRes[1]}" is not allowed — the request forbids third-party libraries/CDN.`,
+					severity: 'error',
+				});
+			}
+		}
+
+		// ── Unrendered template placeholders ──────────────────────────────
+		// A static single-file app must contain REAL markup. Handlebars/Mustache
+		// ("{{#each todo}}", "{{id}}") or EJS ("<% %>") leaking into the output
+		// means the model emitted a server-side template instead of a working
+		// page — the browser renders the braces literally and shows no cards.
+		if (plain) {
+			const tpl = f.content.match(/\{\{\s*[#/^]?[\w.]|\{%\s*\w|<%[\s=]/);
+			if (tpl) {
+				issues.push({
+					kind: 'scope_violation',
+					file: f.path,
+					message: `Unrendered template placeholder found ("${tpl[0]}") — this is a static file, generate real markup and real values, never template syntax.`,
+					severity: 'error',
+				});
+			}
+		}
+
+		// ── React / JSX leakage into a plain-stack deliverable ─────────────
+		if (plain) {
+			const leak = f.content.match(REACT_LEAK_RE);
+			if (leak) {
+				issues.push({
+					kind: 'scope_violation',
+					file: f.path,
+					message: `React/JSX syntax ("${leak[0]}") found in a plain HTML/CSS/JS deliverable. The request did not ask for React.`,
+					severity: 'error',
+				});
+			}
+			if (/\bimport\s+\w+\s+from\s+['"][^'"]+['"]/.test(f.content)) {
+				issues.push({
+					kind: 'scope_violation',
+					file: f.path,
+					message: `Import statement found in a plain HTML/CSS/JS deliverable — inline the script instead.`,
+					severity: 'error',
+				});
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PASS 20 — Syntax gate (node --check)
+// ---------------------------------------------------------------------------
+
+/**
+ * Parses a JS snippet with node and returns the first error line, or null.
+ * Uses a temp file so both CommonJS and ESM syntax are accepted.
+ */
+async function nodeSyntaxError(code: string): Promise<string | null> {
+	const isModule = /(^|[\n;])\s*(?:import\s|export\s)/.test(code);
+	const ext = isModule ? 'mjs' : 'js';
+	const tmp = path.join(os.tmpdir(), `crabcode-syntax-${Date.now()}-${Math.random().toString(36).slice(2)}.${ext}`);
+	try {
+		fs.writeFileSync(tmp, code, 'utf-8');
+		await execPromise(`node --check "${tmp}"`, { timeout: 20000 });
+		return null;
+	} catch (e: any) {
+		const stderr = String(e?.stderr || e?.message || '');
+		const line = stderr.split('\n').map((l: string) => l.trim()).filter(Boolean).slice(0, 3).join(' | ');
+		return line || 'invalid syntax';
+	} finally {
+		try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Requirement probes — does the output actually cover what was asked?
+// ---------------------------------------------------------------------------
+
+/**
+ * Each probe: [request-signal regex, evidence regex, label, severity].
+ * The request signal is matched against the user's own words; the evidence
+ * regex is matched against the generated code. A requirement that the user
+ * spelled out but that leaves no trace in the code is a silent failure.
+ */
+const REQUIREMENT_PROBES: Array<{ signal: RegExp; evidence: RegExp; label: string; severity: 'error' | 'warning'; hint: string }> = [
+	{ signal: /\bdrag(?:ging)?[\s-]?and[\s-]?drop|\bdraggable\b|\bdrag\b/i, evidence: /draggable|dragstart|dragover|ondrag/i, label: 'drag and drop', severity: 'error', hint: 'Add draggable="true" on cards, a dragstart handler that calls e.dataTransfer.setData("text/plain", id), a dragover handler that calls e.preventDefault(), and a drop handler that moves the card.' },
+	{ signal: /\blocalstorage\b|\bpersist(?:ence|ent)?\b|\brestore on reload\b/i, evidence: /localStorage/i, label: 'localStorage persistence', severity: 'error', hint: 'Save the state with localStorage.setItem(...) on every change and read it back with localStorage.getItem(...) inside a try/catch on load.' },
+	{ signal: /prefers-color-scheme|\bdark\b.{0,20}\blight\b|\btheme toggle\b/i, evidence: /prefers-color-scheme|data-theme|prefers-color/i, label: 'theme toggle', severity: 'error', hint: 'Use CSS custom properties for both themes, a window.matchMedia("(prefers-color-scheme: dark)") check for the first load, and a toggle button that flips document.documentElement.dataset.theme.' },
+	{ signal: /\baria\b|\blive region\b|\bannounc/i, evidence: /aria-|role\s*=/i, label: 'ARIA / live region', severity: 'error', hint: 'Add an element like <div id="live" role="status" aria-live="polite"></div> and set its textContent when something moves or changes.' },
+	{ signal: /\balt\s*\+\s*arrow|\barrow keys?\b/i, evidence: /altKey/i, label: 'Alt+Arrow keyboard move', severity: 'error', hint: 'Add a keydown listener on the board that checks e.altKey together with e.key === "ArrowLeft" / "ArrowRight" / "ArrowUp" / "ArrowDown" and moves the focused card.' },
+	{ signal: /\bkeyboard\b|\bfocus (?:cards?|items?) with tab\b|\btab\b/i, evidence: /keydown|keyup|tabindex/i, label: 'keyboard accessibility', severity: 'error', hint: 'Make cards focusable with tabindex="0" and handle keydown/keyup so the board is fully usable without a mouse.' },
+	{ signal: /\bresponsive\b|\bstack under\b|\bbreakpoint\b|\d{3,4}\s*px\b/i, evidence: /@media/i, label: 'responsive layout', severity: 'warning', hint: 'Add a @media (max-width: 700px) block that switches the column grid to a single stacked column.' },
+	{ signal: /\banimat/i, evidence: /@keyframes|animation|transition/i, label: 'animation', severity: 'warning', hint: 'Animate insertion/removal with transform/opacity transitions (or @keyframes) — never with height or top.' },
+	{ signal: /\binline edit\b|\bedit\b/i, evidence: /contenteditable|dblclick|edit/i, label: 'inline edit', severity: 'warning', hint: 'Add a dblclick handler on the card that turns the title into an editable input and saves it on Enter/blur.' },
+	{ signal: /\bdelete\b|\bremove\b/i, evidence: /delete|remove/i, label: 'delete', severity: 'warning', hint: 'Add a delete button per card that removes the card from the state and re-renders.' },
+];
+
+/**
+ * Pass 19b: requirement coverage for plain-stack deliverables.
+ *
+ * The generic FEATURE_WEIGHTS table only knows a fixed set of backend/React
+ * features, so a request like "Alt+Arrow keys" or "ARIA live region" was
+ * never checked. This probes the user's own wording against the code.
+ */
+function pass19bRequirementProbes(
+	files: GeneratedFile[],
+	contract: ValidationContract | undefined,
+	issues: ValidationIssue[],
+): void {
+	const stack = contract?.stack;
+	if (!stack) return;
+	const plain = stack.kind === 'vanilla' || stack.kind === 'single-file';
+	if (!plain) return;
+
+	const request = stack.request || '';
+	if (!request) return;
+
+	const all = files.map(f => f.content).join('\n');
+
+	for (const probe of REQUIREMENT_PROBES) {
+		if (!probe.signal.test(request)) continue;
+		if (probe.evidence.test(all)) continue;
+		issues.push({
+			kind: 'missing_coverage',
+			message: `Requirement "${probe.label}" was requested but there is no evidence of it in the generated code. ${probe.hint}`,
+			severity: probe.severity,
+		});
+	}
+}
+
+/**
+ * Pass 20: Syntax validation for plain-JS artifacts.
+ *
+ * `tsc` cannot check a standalone .js/.html file, which is why broken inline
+ * scripts used to reach disk unnoticed. For plain-stack deliverables every
+ * <script> block is parsed with `node --check` before it is accepted.
+ */
+async function pass20SyntaxCheck(
+	files: GeneratedFile[],
+	contract: ValidationContract | undefined,
+	issues: ValidationIssue[],
+): Promise<void> {
+	const stack = contract?.stack;
+	if (!stack) return;
+	const plain = stack.kind === 'vanilla' || stack.kind === 'single-file';
+	if (!plain) return;
+
+	for (const f of files) {
+		const ext = path.extname(f.path).toLowerCase();
+		const scripts: Array<{ code: string; label: string }> = [];
+
+		if (ext === '.js' || ext === '.mjs') {
+			scripts.push({ code: f.content, label: f.path });
+		} else if (ext === '.html') {
+			const re = /<script(?![^>]*\bsrc\s*=)([^>]*)>([\s\S]*?)<\/script>/gi;
+			let m: RegExpExecArray | null;
+			let idx = 0;
+			while ((m = re.exec(f.content)) !== null) {
+				const attrs = m[1] || '';
+				const code = m[2] || '';
+				if (!code.trim()) continue;
+				if (/type\s*=\s*["'](?:application\/json|text\/template|text\/plain|importmap)["']/i.test(attrs)) continue;
+				idx++;
+				scripts.push({ code, label: `${f.path} <script #${idx}>` });
+			}
+		}
+
+		for (const s of scripts) {
+			const err = await nodeSyntaxError(s.code);
+			if (err) {
+				issues.push({
+					kind: 'compile_error',
+					file: f.path,
+					message: `Syntax error in ${s.label}: ${err}`,
+					severity: 'error',
+				});
+			}
+		}
+	}
+}
 
 // Public API — project-level validator (unchanged)
 export async function runPostGenerationValidator(
@@ -1840,6 +2222,13 @@ export async function runPostGenerationValidator(
 	result = pass15ReactValidation(result);
 	result = pass16HtmlCssValidation(result, framework);
 
+	// ── Stack contract + syntax gate (errors) ────────────────────────────────
+	// Enforces the stack the user actually requested (single file, no libs,
+	// plain HTML) and rejects artifacts that do not even parse.
+	pass19StackContract(result, contract, issues);                  // error
+	pass19bRequirementProbes(result, contract, issues);             // error/warning
+	await pass20SyntaxCheck(result, contract, issues);              // error
+
 	// ── Compile validation — gated on zero structural errors ──────────────────
 	const structuralErrors = issues.filter(i => i.severity === 'error').length;
 	if (structuralErrors === 0) {
@@ -1855,12 +2244,12 @@ export async function runPostGenerationValidator(
 		log('pass18ProjectCompleteness: skipped (edit mode — single file modification)');
 	}
 
-	const errors   = issues.filter(i => i.severity === 'error');
+	const errors = issues.filter(i => i.severity === 'error');
 	const warnings = issues.filter(i => i.severity === 'warning');
-	const passed   = errors.length === 0;
+	const passed = errors.length === 0;
 
 	console.log(`[Validator] ===== DONE — ${result.length} file(s) | ${errors.length} error(s) | ${warnings.length} warning(s) | Coverage: ${coverageScore}/${coverageMax} =====\n`);
-	errors.forEach(e   => console.log(`  ❌ [${e.kind}] ${e.file ? e.file + ': ' : ''}${e.message}`));
+	errors.forEach(e => console.log(`  ❌ [${e.kind}] ${e.file ? e.file + ': ' : ''}${e.message}`));
 	warnings.forEach(w => console.log(`  ⚠️  [${w.kind}] ${w.file ? w.file + ': ' : ''}${w.message}`));
 
 	return { passed, files: result, issues, coverageScore, coverageMax };
@@ -1884,10 +2273,10 @@ export async function runPostGenerationValidator(
  * @param committedPaths Optional set of already-committed paths.
  */
 export async function runLocalFileValidator(
-	file:            GeneratedFile,
-	workspaceRoot:   string,
-	contract?:       ValidationContract,
-	graph?:          ExecutionGraph,
+	file: GeneratedFile,
+	workspaceRoot: string,
+	contract?: ValidationContract,
+	graph?: ExecutionGraph,
 	committedPaths?: Set<string>,
 ): Promise<ValidationResult> {
 	const issues: ValidationIssue[] = [];
@@ -1913,12 +2302,20 @@ export async function runLocalFileValidator(
 	pass16Security(files, issues);                             // security warnings
 	pass17TypeScriptQuality(files, issues);                    // ts quality warnings
 
+	// ── Stack contract + syntax gate (per-file) ──────────────────────────────
+	// For single-file / plain-stack deliverables the local validator sees the
+	// WHOLE artifact, so contract violations and syntax errors must fail here
+	// and trigger the repair loop instead of reaching disk.
+	pass19StackContract(files, contract, issues);              // scope_violation errors
+	pass19bRequirementProbes(files, contract, issues);         // missing_coverage
+	await pass20SyntaxCheck(files, contract, issues);          // compile_error
+
 	// Route size (warning only — safe per-file)
 	pass11RouteSize(files, issues);
 
-	const errors   = issues.filter(i => i.severity === 'error');
+	const errors = issues.filter(i => i.severity === 'error');
 	const warnings = issues.filter(i => i.severity === 'warning');
-	const passed   = errors.length === 0;
+	const passed = errors.length === 0;
 
 	if (issues.length > 0) {
 		console.log(

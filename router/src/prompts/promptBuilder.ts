@@ -10,6 +10,8 @@ import path from 'path';
 import fs from 'fs';
 import type { AgentMode } from '../routing/agentMode.js';
 import { getGitLogSummarySync } from '../gitHarness.js';
+import { detectStackProfile } from '../routing/stackProfile.js';
+import type { StackProfile } from '../routing/stackProfile.js';
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -57,6 +59,8 @@ export interface PromptRouterContext {
 	/** Raw content of package.json, if available */
 	packageJson: string | undefined;
 	openFiles: string[] | undefined;
+	/** Stack + hard constraints derived from the user's request. */
+	profile?: StackProfile;
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +225,15 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 	const loaded: Array<{ name: string; reason: string }> = [];
 	const skipped: string[] = [];
 
+	// ── Stack profile ────────────────────────────────────────────────────────
+	// "single file", "vanilla", "no libraries", "native ... only" must win over
+	// the legacy "every frontend request is a React app" default.
+	const profile = ctx.profile ?? detectStackProfile(userMessage, {
+		workspaceHasReact: workspaceHasTsx(workspaceRoot),
+		packageJson,
+	});
+	const plainStack = profile.kind === 'vanilla' || profile.kind === 'single-file';
+
 	if (workspaceRoot) {
 		const tree = buildDirectoryTree(workspaceRoot);
 		const fileCount = tree.split('\n').filter(l => l.trim() && !l.includes('/')).length;
@@ -243,24 +256,33 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		if (reason) console.log(`[PromptRouter] SKIP fe/${name}: ${reason}`);
 	};
 
-	load('agent', 'always loaded');
-	load('typescript', 'always loaded');
+	if (plainStack) {
+		load('agent-plain', `stack=${profile.kind} — plain HTML/CSS/JS, no framework`);
+	} else {
+		load('agent', 'always loaded');
+		load('typescript', 'always loaded');
+	}
 
-	if (mode === 'create') load('create-mode', 'mode=create');
-	else if (mode === 'edit') load('edit-mode', 'mode=edit');
+	if (mode === 'create') {
+		if (plainStack) load('create-mode-plain', 'mode=create (plain stack)');
+		else load('create-mode', 'mode=create');
+	} else if (mode === 'edit') load('edit-mode', 'mode=edit');
 	else load('needs-context-mode', 'mode=needs_context');
 
 	const pkgHasReact = pkg.includes('"react"') || pkg.includes('"react-dom"');
 	const fsHasTsx = workspaceHasTsx(workspaceRoot);
 	const activeIsTsx = activeFile ? ['.tsx', '.jsx'].includes(path.extname(activeFile).toLowerCase()) : false;
 	const openFilesTsx = openFiles.some(f => ['.tsx', '.jsx'].includes(path.extname(f).toLowerCase()));
-	const hasReactKeywords = /react|tsx|jsx|kanban|trello|dashboard|frontend|component|tailwind|vite/.test(msg);
-	const isReact = pkgHasReact || fsHasTsx || activeIsTsx || openFilesTsx || hasReactKeywords || mode === 'create';
+	// NOTE: domain words (kanban/dashboard/frontend) are NOT stack signals.
+	const hasReactKeywords = /react|tsx|jsx/.test(msg);
+	const isReact = !plainStack && (pkgHasReact || fsHasTsx || activeIsTsx || openFilesTsx
+		|| (!workspaceRoot && hasReactKeywords)
+		|| (hasReactKeywords && mode === 'create'));
 
 	const activeExt = activeFile ? path.extname(activeFile).toLowerCase() : '';
 	const isHtmlOnly = !isReact && activeExt === '.html';
 
-	const isTailwind = [
+	const isTailwind = !plainStack && [
 		pkg.includes('tailwindcss'),
 		msg.includes('tailwind'),
 		workspaceRoot ? fs.existsSync(path.join(workspaceRoot, 'tailwind.config.js')) ||
@@ -276,27 +298,42 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		msg.includes('resource'),
 	].some(Boolean);
 
-	if (isReact) {
-		const reactReason = pkgHasReact ? 'package.json contains react/react-dom'
-			: fsHasTsx ? 'workspace contains .tsx/.jsx files'
-				: activeIsTsx ? 'active file is .tsx/.jsx'
-					: openFilesTsx ? 'open file is .tsx/.jsx'
-						: hasReactKeywords ? 'frontend keyword match'
-							: 'default create mode stack';
-		load('react', reactReason);
+	if (plainStack) {
+		skip('react', `stack=${profile.kind} — plain HTML/CSS/JS, no framework requested`);
+		skip('tailwind', 'plain stack — no CSS framework');
+		skip('refine', 'plain stack — no data framework');
+		// html.md / css.md / javascript.md are mutually exclusive ("output only
+		// HTML" / "output CSS only" / "return JavaScript only") and a single-file
+		// deliverable contains all three at once.
+		const editingHtml = mode === 'edit' && activeFile
+			&& path.extname(activeFile).toLowerCase() === '.html';
+		if (editingHtml) load('html', 'editing an existing .html file');
+		else skip('html', 'plain stack — the file contains HTML + CSS + JS together');
+		skip('css', 'plain stack — the file contains HTML + CSS + JS together');
+		skip('javascript', 'plain stack — the file contains HTML + CSS + JS together');
 	} else {
-		skip('react', 'no react/react-dom in package.json, no .tsx files in workspace');
+		if (isReact) {
+			const reactReason = pkgHasReact ? 'package.json contains react/react-dom'
+				: fsHasTsx ? 'workspace contains .tsx/.jsx files'
+					: activeIsTsx ? 'active file is .tsx/.jsx'
+						: openFilesTsx ? 'open file is .tsx/.jsx'
+							: hasReactKeywords ? 'frontend keyword match'
+								: 'default create mode stack';
+			load('react', reactReason);
+		} else {
+			skip('react', 'no react/react-dom in package.json, no .tsx files in workspace');
+		}
+
+		if (isTailwind) load('tailwind', 'tailwindcss dependency or tailwind.config.js or keyword');
+		else skip('tailwind');
+
+		if (isRefine) load('refine', '@refinedev/* dependency or keyword "refine"');
+		else skip('refine');
+
+		if (isHtmlOnly) load('html', 'activeFile is .html and project is NOT React');
+		else if (!isReact) skip('html', 'not an HTML-only project');
+		else skip('html', 'BLOCKED — React project detected');
 	}
-
-	if (isTailwind) load('tailwind', 'tailwindcss dependency or tailwind.config.js or keyword');
-	else skip('tailwind');
-
-	if (isRefine) load('refine', '@refinedev/* dependency or keyword "refine"');
-	else skip('refine');
-
-	if (isHtmlOnly) load('html', 'activeFile is .html and project is NOT React');
-	else if (!isReact) skip('html', 'not an HTML-only project');
-	else skip('html', 'BLOCKED — React project detected');
 
 	const FEATURE_KEYWORDS: Record<string, string[]> = {
 		forms: ['login', 'register', 'signup', 'form', 'submit', 'validation', 'email', 'password', 'otp', 'zod', 'react-hook-form'],
@@ -308,14 +345,28 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		chart: ['chart', 'graph', 'analytics', 'dashboard metrics', 'pie', 'bar', 'line'],
 	};
 
+	// Feature guides are React-flavoured; for a plain stack only the
+	// framework-free variants are loaded.
+	const PLAIN_FEATURE_PROMPTS: Record<string, string> = { kanban: 'kanban-plain' };
+
 	for (const [feature, keywords] of Object.entries(FEATURE_KEYWORDS)) {
 		const triggerKw = keywords.find(k => msg.includes(k));
-		if (triggerKw) {
-			load(feature, `keyword: ${triggerKw}`);
-			console.log(`[PromptRouter] ${feature} -> keyword ${triggerKw}`);
-		} else {
+		if (!triggerKw) {
 			skip(feature);
+			continue;
 		}
+		if (plainStack) {
+			const plainPrompt = PLAIN_FEATURE_PROMPTS[feature];
+			if (plainPrompt) {
+				load(plainPrompt, `keyword: ${triggerKw} (plain stack)`);
+				console.log(`[PromptRouter] ${plainPrompt} -> keyword ${triggerKw}`);
+			} else {
+				skip(feature, 'plain stack — React-specific feature guide');
+			}
+			continue;
+		}
+		load(feature, `keyword: ${triggerKw}`);
+		console.log(`[PromptRouter] ${feature} -> keyword ${triggerKw}`);
 	}
 
 	if (isReact && workspaceRoot) {
@@ -351,7 +402,23 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		} catch { /* ignore */ }
 	}
 
-	if (installedPkgs.length > 0) {
+	if (plainStack) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'NO-DEPENDENCY RULES (plain HTML / CSS / JS)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'CRITICAL BOUNDARIES:',
+			'1. Do NOT import anything. No `import`, no `require`, no ES module specifiers.',
+			'2. Do NOT add a `<script src="https://cdn...">` or an external `<link>` stylesheet.',
+			'3. Do NOT create package.json / node_modules / a bundler config.',
+			'4. All logic lives in ONE inline <script> block; all styles in ONE inline <style> block.',
+			'5. Use only browser built-ins: document, window, localStorage, matchMedia,',
+			'   fetch, setTimeout, requestAnimationFrame, DragEvent, KeyboardEvent, Event.',
+			'6. If a UI affordance is needed (icons, toasts, modals) implement it with',
+			'   plain elements + CSS — never reference an icon font or an icon package.',
+		].join('\n'));
+	} else if (installedPkgs.length > 0) {
 		parts.push([
 			'',
 			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
@@ -387,6 +454,19 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'7. NO FAKE UTILITIES: Never import from "@/utils/..." unless you generate that file in this response. Inline helpers locally.',
 			'8. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
 		].join('\n'));
+	}
+
+	// ── HARD CONSTRAINTS (injected last — strongest signal for the model) ───
+	if (profile.constraints.length > 0) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'HARD CONSTRAINTS — THE USER EXPLICITLY REQUESTED THIS (NON-NEGOTIABLE)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			...profile.constraints,
+			'VIOLATING ANY OF THE ABOVE MAKES THE ANSWER WRONG.',
+		].join('\n'));
+		console.log(`[PromptRouter] Hard constraints injected (${profile.constraints.length})`);
 	}
 
 	console.log('\nPROMPTS LOADED:');
@@ -536,6 +616,7 @@ export function buildSystemPrompt(
 	packageJson?: string,
 	openFiles?: string[],
 	readWriteMode?: 'read' | 'write',
+	profile?: StackProfile,
 ): string {
 	if (!hasWorkspace) {
 		const role = currentSpecialist === 'be' ? 'backend engineering' : 'frontend development';
@@ -544,7 +625,10 @@ export function buildSystemPrompt(
 
 	let prompt = '';
 	if (currentSpecialist === 'fe') {
-		prompt = buildFESystemPrompt({ userMessage, mode, activeFile, workspaceRoot, packageJson, openFiles });
+		prompt = buildFESystemPrompt({
+			userMessage, mode, activeFile, workspaceRoot, packageJson, openFiles,
+			...(profile ? { profile } : {}),
+		});
 	} else {
 		prompt = buildBESystemPrompt(userMessage, mode, activeFile, workspaceRoot);
 	}

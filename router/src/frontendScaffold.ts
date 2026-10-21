@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-
+import type { StackProfile } from './routing/stackProfile.js';
 
 /**
  * Merges an existing package.json string with incoming package.json content.
@@ -154,15 +154,98 @@ echo "Setup complete! Run 'npm run dev' to launch application."
  * package.json, index.html, vite.config.ts, tsconfig.json, tailwind.config.js,
  * postcss.config.js, src/main.tsx, src/style.css, init.sh, features.json, and progress.txt.
  * Returns an array of file paths that were created.
+ *
+ * STACK GATING: the React + Vite + TypeScript + Tailwind toolchain is only
+ * scaffolded when the request actually asks for a React/framework app. A request
+ * for a plain / single-file HTML+CSS+JS deliverable must NOT get package.json,
+ * vite.config.ts, tailwind.config.js, src/ — those files push the model into
+ * emitting React/TSX and break "single file / no libraries" requirements.
  */
-export function ensureFrontendScaffold(workspaceRoot: string, userPrompt: string): string[] {
+/**
+ * Copy the existing source of a workspace to a timestamped backup before
+ * the scaffold writes into it.
+ *
+ * The scaffold is designed for an EMPTY workspace. When it is pointed at a
+ * directory that already holds a working project, it can overwrite files
+ * the user cares about — the live check caught the model emitting
+ * `<file path=".gitignore">` and clobbering the scaffold's own file.
+ *
+ * The backup goes OUTSIDE the workspace, so it is never scaffolded,
+ * committed, or overwritten by the run that created it.
+ *
+ * Returns the backup directory, or null when there was nothing to back up.
+ */
+function backupExistingWorkspace(workspaceRoot: string, label: string): string | null {
+	try {
+		if (!fs.existsSync(workspaceRoot)) return null;
+
+		// Collect the existing source files worth protecting.
+		const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.cache', 'coverage']);
+		const SKIP_EXT = new Set(['.log', '.lock', '.tmp', '.tsbuildinfo']);
+		const toBackup: string[] = [];
+
+		const walk = (dir: string, depth: number): void => {
+			if (depth > 6) return;
+			for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+				if (SKIP_DIRS.has(entry.name)) continue;
+				const p = path.join(dir, entry.name);
+				if (entry.isDirectory()) { walk(p, depth + 1); continue; }
+				if (SKIP_EXT.has(path.extname(entry.name).toLowerCase())) continue;
+				toBackup.push(p);
+			}
+		};
+		walk(workspaceRoot, 0);
+
+		// Nothing meaningful there — no need to back up an empty directory.
+		const meaningful = toBackup.filter(f => {
+			const rel = path.relative(workspaceRoot, f);
+			return rel !== 'package.json' && rel !== 'package-lock.json';
+		});
+		if (meaningful.length === 0) return null;
+
+		const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+		const backupDir = path.join(path.dirname(workspaceRoot), `.${path.basename(workspaceRoot)}.backup-${stamp}`);
+		fs.mkdirSync(backupDir, { recursive: true });
+
+		for (const f of meaningful) {
+			const rel = path.relative(workspaceRoot, f);
+			const dest = path.join(backupDir, rel);
+			fs.mkdirSync(path.dirname(dest), { recursive: true });
+			fs.copyFileSync(f, dest);
+		}
+		console.log(`[Scaffold] Backed up ${meaningful.length} existing file(s) to ${backupDir} before scaffolding.`);
+		return backupDir;
+	} catch (e: any) {
+		console.warn(`[Scaffold] Backup failed (continuing): ${e?.message || e}`);
+		return null;
+	}
+}
+
+export function ensureFrontendScaffold(
+	workspaceRoot: string,
+	userPrompt: string,
+	profile?: StackProfile,
+): string[] {
 	if (!workspaceRoot) return [];
 	const created: string[] = [];
+
+	// ── Stack gate: no React toolchain for plain / single-file requests ──────
+	if (profile && (profile.kind === 'vanilla' || profile.kind === 'single-file')) {
+		console.log(
+			`[FrontendScaffold] SKIPPED React scaffold — stack=${profile.kind}` +
+			` (signals: ${profile.signals.join(', ')}). Plain HTML/CSS/JS deliverable: no package.json, no vite/tailwind config, no src/.`,
+		);
+		return [];
+	}
 
 	try {
 		if (!fs.existsSync(workspaceRoot)) {
 			fs.mkdirSync(workspaceRoot, { recursive: true });
 		}
+
+		// Protect any existing project before the scaffold writes into it.
+		backupExistingWorkspace(workspaceRoot, 'frontend');
+
 		const srcDir = path.join(workspaceRoot, 'src');
 		if (!fs.existsSync(srcDir)) {
 			fs.mkdirSync(srcDir, { recursive: true });
@@ -398,6 +481,43 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 			console.log('[FrontendScaffold] Created src/main.tsx');
 		}
 
+		// 7b. src/App.tsx (placeholder)
+		//
+		// src/main.tsx imports './App', so the project does not compile
+		// without it. The scaffold is the one thing guaranteed to run on
+		// every create request, so it must never leave a broken build.
+		//
+		// The placeholder is deliberately minimal: it imports nothing that
+		// does not exist, so it compiles as-is. The model overwrites it when
+		// it emits its own App.tsx; if the model never does, the project
+		// still builds (a blank page beats a broken build).
+		const appTsxPath = path.join(srcDir, 'App.tsx');
+		if (!fs.existsSync(appTsxPath)) {
+			const appTsxContent = `import React from 'react';
+
+/**
+ * Placeholder entry point.
+ *
+ * This file exists so the scaffolded project compiles. Replace it with the
+ * real application view.
+ */
+export default function App() {
+  return (
+    <div className="min-h-screen bg-gray-50 dark:bg-slate-900">
+      <main className="p-8">
+        <h1 className="text-2xl font-semibold text-slate-900 dark:text-slate-100">
+          Your app goes here
+        </h1>
+      </main>
+    </div>
+  );
+}
+`;
+			fs.writeFileSync(appTsxPath, appTsxContent, 'utf-8');
+			created.push('src/App.tsx');
+			console.log('[FrontendScaffold] Created src/App.tsx (placeholder)');
+		}
+
 		// 8. src/style.css
 		const styleCssPath = path.join(srcDir, 'style.css');
 		if (!fs.existsSync(styleCssPath)) {
@@ -579,6 +699,10 @@ export function ensureBackendScaffold(workspaceRoot: string, userPrompt: string)
 		if (!fs.existsSync(workspaceRoot)) {
 			fs.mkdirSync(workspaceRoot, { recursive: true });
 		}
+
+		// Protect any existing project before the scaffold writes into it.
+		backupExistingWorkspace(workspaceRoot, 'backend');
+
 		const srcDir = path.join(workspaceRoot, 'src');
 		if (!fs.existsSync(srcDir)) {
 			fs.mkdirSync(srcDir, { recursive: true });

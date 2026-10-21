@@ -7,3 +7,5 @@ start-router.bat
 start-wrapper.bat
 stop.bat
 stop.sh
+router/scratch/
+plans/

@@ -26,6 +26,7 @@ import { ProxyChannel } from '../../base/parts/ipc/common/ipc.js';
 import { Client as NodeIPCClient } from '../../base/parts/ipc/common/ipc.net.js';
 import { connect as nodeIPCConnect, serve as nodeIPCServe, Server as NodeIPCServer, XDG_RUNTIME_DIR } from '../../base/parts/ipc/node/ipc.net.js';
 import { CodeApplication } from './app.js';
+import { ensureRouterRunning } from './codecrabRouterSupervisor.js';
 import { localize } from '../../nls.js';
 import { IConfigurationService } from '../../platform/configuration/common/configuration.js';
 import { ConfigurationService } from '../../platform/configuration/common/configurationService.js';
@@ -122,6 +123,16 @@ class CodeMain {
 				const lifecycleMainService = accessor.get(ILifecycleMainService);
 				const fileService = accessor.get(IFileService);
 				const loggerService = accessor.get(ILoggerService);
+
+				// CodeCrab: make sure the local Model Router is up before the
+				// workbench starts talking to it. Without this the chat panel
+				// fails with an opaque "TypeError: Failed to fetch" whenever the
+				// router is not already running. This never blocks startup.
+				ensureRouterRunning(environmentMainService.appRoot, 'http://localhost:3141', {
+					info: m => logService.info(m),
+					warn: m => logService.warn(m),
+					error: m => logService.error(m),
+				}).catch(() => { /* supervisor never rejects */ });
 
 				// Create the main IPC server by trying to be the server
 				// If this throws an error it means we are not the first

@@ -12,9 +12,9 @@ import { em, indexWorkspace, updateFile, deleteFiles, syncWorkspace, retrieveCon
 import { tier2Retrieve, patchTier2Caches, shouldSkipFEPhase, cleanupArtifacts, patchCachesFromArtifact } from './rag/index.js';
 import { buildArtifactFromFiles, writeArtifact, deleteArtifact } from './rag/artifact.js';
 import { runPostGenerationValidator } from './validator.js';
-import type { ValidationContract, ValidationIssue } from './validator.js';
+import type { ValidationContract, ValidationIssue, GeneratedFile } from './validator.js';
 import { selectTopDependencyFiles, buildDependencyContextBlock } from './dependencySelector.js';
-import { buildFERepairPrompt } from './repairEngine.js';
+import { buildFERepairPrompt, buildPlainStackRepairPrompt } from './repairEngine.js';
 import { inspectWorkspace } from './workspaceInspector.js';
 import { buildExecutionGraph, nextPendingNode, isGraphComplete, graphSummary, markNodeFailed } from './planner.js';
 import type { AdvisorV2Result, ExecutionGraph } from './planner.js';
@@ -22,17 +22,21 @@ import { resolveCapabilities, loadCapabilityPrompts, buildCapabilitySystemPrompt
 import { runIncrementalEngine, shouldUseIncrementalEngine } from './incrementalEngine.js';
 
 // ── Async Job System (Phase 4) ─────────────────────────────────────────────
-import { EventBus }         from './core/eventBus.js';
-import { Logger }           from './logging/logger.js';
-import { ModelManager }     from './models/modelManager.js';
-import { JobService }       from './jobs/jobService.js';
-import { RecoveryManager }  from './jobs/recoveryManager.js';
-import { makeJobRoutes }    from './router/jobRoutes.js';
+import { EventBus } from './core/eventBus.js';
+import { Logger } from './logging/logger.js';
+import { ModelManager } from './models/modelManager.js';
+import { JobService } from './jobs/jobService.js';
+import { RecoveryManager } from './jobs/recoveryManager.js';
+import { makeJobRoutes } from './router/jobRoutes.js';
 import { makeHealthRoutes } from './router/healthRoutes.js';
-import config               from '@/config/index.js';
+import config from '@/config/index.js';
 import { activeContextUsage, updateContextUsage, setEffectiveContextSize, effectiveContextSize } from './telemetry/contextUsage.js';
 import { ensureFrontendScaffold, ensureBackendScaffold, mergePackageJson, mergeInitSh } from './frontendScaffold.js';
 import { runAdvisorProjectSummary, runAdvisorLoopDecomposition } from './routing/intentClassifier.js';
+import { detectStackProfile } from './routing/stackProfile.js';
+import type { StackProfile } from './routing/stackProfile.js';
+import { diagnoseResponse, buildTruncationContinuationPrompt, buildProseOutputPrompt } from './generation/responseDiagnosis.js';
+import { parseAdvisorJson } from './routing/advisorJson.js';
 
 // ---------------------------------------------------------------------------
 // Constraint Parser — runs BEFORE advisor, highest priority
@@ -66,6 +70,48 @@ const FRONTEND_ONLY_PATTERNS = [
 	/\bonly\s+(?:the\s+)?(?:frontend|ui)\b/i,
 	/\buse\s+mock\s+(?:data|api|functions)\b/i,
 ];
+
+/**
+ * Files the SCAFFOLD owns. A model-authored version must not replace
+ * them during a create request.
+ *
+ * The live check caught the model emitting a `<file path=".gitignore">`
+ * block, which the router happily wrote over the scaffold's file. The
+ * content was identical, so no harm — but a model that emitted a broken
+ * `vite.config.ts` or `tsconfig.json` would break the project it had just
+ * built.
+ *
+ * `package.json` and `init.sh` are NOT here: they go through a MERGE, not
+ * a blind overwrite, which is the correct behaviour.
+ *
+ * `src/App.tsx` is deliberately absent: the model is supposed to write it
+ * (the scaffold only creates a placeholder).
+ */
+const SCAFFOLD_OWNED_FILES = new Set([
+	'.gitignore',
+	'index.html',
+	'vite.config.ts',
+	'vite.config.js',
+	'tsconfig.json',
+	'tailwind.config.js',
+	'tailwind.config.ts',
+	'postcss.config.js',
+	'src/main.tsx',
+	'src/main.jsx',
+	'src/style.css',
+]);
+
+/**
+ * Should this write be blocked because it would overwrite a scaffold file?
+ *
+ * Only for CREATE requests. An edit request may legitimately need to
+ * change vite.config.ts.
+ */
+export function wouldClobberScaffold(relPath: string, isCreateRequest: boolean): boolean {
+	if (!isCreateRequest) return false;
+	const normalised = relPath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+	return SCAFFOLD_OWNED_FILES.has(normalised);
+}
 
 function parseUserScope(msg: string): UserScope {
 	const isFullStack = /\bfull[\s-]?stack\b/i.test(msg) ||
@@ -180,7 +226,11 @@ function buildPlannerContract(msg: string, advisorIntent: string, userScope?: Us
 	return { scope, architecture, framework, language, requiredFeatures, requiredFolders, estimatedFiles };
 }
 
-function plannerContractToValidationContract(pc: PlannerContract, userScope: UserScope): ValidationContract {
+function plannerContractToValidationContract(
+	pc: PlannerContract,
+	userScope: UserScope,
+	stack?: StackProfile,
+): ValidationContract {
 	const scope: ValidationContract['scope'] =
 		userScope === 'BACKEND_ONLY' ? 'backend'
 			: userScope === 'FRONTEND_ONLY' ? 'frontend'
@@ -197,6 +247,9 @@ function plannerContractToValidationContract(pc: PlannerContract, userScope: Use
 		requiredFolders: pc.requiredFolders,
 		expectedFiles: [],
 		estimatedFiles: pc.estimatedFiles,
+		// The requested stack becomes a binding contract: the validator enforces
+		// single-file / no-libraries / plain-HTML requirements after generation.
+		...(stack ? { stack } : {}),
 	};
 }
 
@@ -510,7 +563,7 @@ const mm = new class ModelManager {
 			if (fs.existsSync(cfgPath)) return cfgPath;
 			throw new Error(`Configuration Error: Configured model path for ${key} does not exist: ${cfgPath}`);
 		}
-		
+
 		// 2. Fallback to auto-discovery
 		const BASE_MODELS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '../models/base');
 		if (!fs.existsSync(BASE_MODELS_DIR)) {
@@ -696,8 +749,10 @@ function getAvailableModels() {
 			ollamaTag: 'codecrab/qwen-fe',
 			id: 'codecrab/qwen-fe',
 			displayName: 'Qwen 2.5 (Frontend Specialist)',
-			domain: 'Frontend UI/UX',
-			status: 'ready',
+			// `domain` and `status` are narrow unions in the editor's
+			// ISpecialistModel type. Keep these values in sync with it.
+			domain: 'frontend',
+			status: 'idle',
 			maturity: 'alpha',
 			ramRequiredGb: 6
 		});
@@ -708,8 +763,8 @@ function getAvailableModels() {
 			ollamaTag: 'codecrab/qwen-be',
 			id: 'codecrab/qwen-be',
 			displayName: 'Qwen 2.5 (Backend Specialist)',
-			domain: 'Backend Engineering',
-			status: 'ready',
+			domain: 'backend',
+			status: 'idle',
 			maturity: 'alpha',
 			ramRequiredGb: 6
 		});
@@ -720,8 +775,8 @@ function getAvailableModels() {
 			ollamaTag: 'codecrab/base',
 			id: 'codecrab/base',
 			displayName: 'Native CodeCrab Base Model',
-			domain: 'General',
-			status: 'ready',
+			domain: 'general',
+			status: 'idle',
 			maturity: 'stable',
 			ramRequiredGb: 4
 		});
@@ -735,8 +790,16 @@ app.get('/health', (req, res) => {
 	res.json({
 		router: 'ok',
 		engine: 'node-llama-cpp',
+		// The editor's ISpecialistModel expects a narrow domain/status union.
+		// The router used to report 'ready' / 'Frontend UI/UX', which matched
+		// neither, so the model picker silently showed garbage.
+		ollama: 'connected',
 		...mm.status,
-		models: getAvailableModels()
+		context: activeContextUsage,
+		models: getAvailableModels(),
+		// Which model file was really loaded, and whether the preferred one
+		// was missing. A silent fallback hid a 3x-slower model.
+		modelResolution: config.modelResolution ?? null
 	});
 });
 
@@ -778,7 +841,7 @@ app.get('/stats', async (req, res) => {
 			const { stdout } = await execPromise('df -k / | tail -1');
 			const parts = stdout.trim().split(/\\s+/);
 			const totalKb = parseInt(parts[1] ?? '0', 10);
-			const usedKb  = parseInt(parts[2] ?? '0', 10);
+			const usedKb = parseInt(parts[2] ?? '0', 10);
 			storageTotalGb = totalKb / 1024 / 1024;
 			storageUsedGb = usedKb / 1024 / 1024;
 			storageUsagePercent = (storageUsedGb / storageTotalGb) * 100;
@@ -880,10 +943,9 @@ type AdvisorIntent =
 /** Parse {"intent":"..."} from raw advisor output. Returns null on any failure. */
 function parseAdvisorIntent(raw: string): AdvisorIntent | null {
 	const stripped = raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, '').trim();
-	const match = stripped.match(/\{[^{}]*\}/);
-	if (!match) { console.warn('[Advisor] No JSON found.'); return null; }
+	const obj = parseAdvisorJson(stripped);
+	if (!obj) { console.warn('[Advisor] No JSON found.'); return null; }
 	try {
-		const obj = JSON.parse(match[0]);
 		const intent = obj.intent as string;
 		const valid: AdvisorIntent[] = ['create_fe', 'edit_fe', 'create_be', 'edit_be', 'create_fullstack', 'edit_fullstack', 'general', 'unknown'];
 		if (!valid.includes(intent as AdvisorIntent)) {
@@ -903,13 +965,14 @@ function parseAdvisorIntent(raw: string): AdvisorIntent | null {
  * Falls back gracefully — intent field is the only required field.
  * Never throws. Returns null if intent is invalid.
  */
+
+
 function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: AdvisorV2Result } | null {
 	const stripped = raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, '').trim();
-	// Support nested JSON (advisor may output indented JSON)
-	const match = stripped.match(/\{[\s\S]*\}/);
-	if (!match) { console.warn('[AdvisorV2] No JSON found.'); return null; }
+	// Tolerant parse: a truncated Advisor response still yields its fields.
+	const obj = parseAdvisorJson(stripped);
+	if (!obj) { console.warn('[AdvisorV2] No JSON found.'); return null; }
 	try {
-		const obj = JSON.parse(match[0]);
 		const intentRaw = obj.intent as string;
 		const valid: AdvisorIntent[] = ['create_fe', 'edit_fe', 'create_be', 'edit_be', 'create_fullstack', 'edit_fullstack', 'general', 'unknown'];
 		if (!valid.includes(intentRaw as AdvisorIntent)) {
@@ -925,11 +988,19 @@ function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: AdvisorV2Resu
 			database: obj.database,
 			orm: obj.orm,
 			authentication: obj.authentication,
-			requiredFeatures: Array.isArray(obj.requiredFeatures) ? obj.requiredFeatures : undefined,
-			modules: Array.isArray(obj.modules) ? obj.modules : undefined,
-			estimatedFiles: typeof obj.estimatedFiles === 'number' ? obj.estimatedFiles : undefined,
+			...(Array.isArray(obj.requiredFeatures)
+				? { requiredFeatures: obj.requiredFeatures as string[] }
+				: {}),
+			...(Array.isArray(obj.modules)
+				? { modules: obj.modules as string[] }
+				: {}),
+			...(typeof obj.estimatedFiles === 'number'
+				? { estimatedFiles: obj.estimatedFiles }
+				: {}),
 			generationStrategy: obj.generationStrategy,
-			confidence: typeof obj.confidence === 'number' ? obj.confidence : undefined,
+			...(typeof obj.confidence === 'number'
+				? { confidence: obj.confidence }
+				: {}),
 		};
 		console.log(`[AdvisorV2] intent=${intentRaw} arch=${v2.architecture ?? '?'} modules=[${(v2.modules ?? []).join(',')}] features=[${(v2.requiredFeatures ?? []).join(',')}]`);
 		return { intent: intentRaw as AdvisorIntent, v2 };
@@ -957,18 +1028,24 @@ async function runAdvisor(userRequest: string, v2 = false): Promise<any> {
 	try {
 		const advisorModel = await mm.acquire('advisor');
 		// 2048 ctx: ample room for system prompt (~400 tok), multi-paragraph user requests (~300 tok), and JSON output (~200 tok)
-		const advisorCtx = await advisorModel.createContext({ contextSize: 2048 });
+		// 4096 ctx: the planner prompt (~500 tok) + a long user request
+		// (~400 tok) + the full V2 JSON payload (~400 tok) fits comfortably.
+		// At 2048 the advisor ran out of room on detailed requests.
+		const advisorCtx = await advisorModel.createContext({ contextSize: 4096 });
 		const seq = advisorCtx.getSequence();
 
 		// Build Qwen3 chat template + /no_think to suppress chain-of-thought mode.
 		// Pre-filling <think>\n\n</think> forces the model to skip reasoning and output JSON directly.
 		const fullPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n<|im_start|>user\n${userRequest} /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n`;
 		const inputTokens = advisorModel.tokenize(fullPrompt);
-		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 2048`);
+		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 4096`);
 
 		// evaluate(inputTokens) both evals the prompt AND generates next tokens.
-		// For V2, we allow up to 500 chars (rich JSON is larger than {"intent":"..."})
+		// The V2 payload is much larger than {"intent":"..."} — it carries
+		// framework, language, architecture, modules, requiredFeatures,
+		// estimatedFiles, confidence and generationStrategy.
 		let raw = '';
+		let hitCap = false;
 		const eosToken = advisorModel.tokens.eos;
 		for await (const token of seq.evaluate(inputTokens, { temperature: 0 })) {
 			const text = advisorModel.detokenize([token]);
@@ -977,10 +1054,16 @@ async function runAdvisor(userRequest: string, v2 = false): Promise<any> {
 			// Stop when JSON is closed — simple heuristic
 			const depth = (raw.match(/\{/g) ?? []).length - (raw.match(/\}/g) ?? []).length;
 			if (depth <= 0 && raw.includes('{')) break;
-			if (raw.length > 600) break; // safety cap
+			// Safety cap. 2000 chars fits the full V2 payload; the old 600
+			// cut it mid-array, which is what truncated the live-check run.
+			if (raw.length > 2000) { hitCap = true; break; }
 		}
 
-		console.log('[Advisor] Raw output:', raw.trim().slice(0, 150));
+		if (hitCap) {
+			console.warn(`[Advisor] Output hit the 2000-char cap — the JSON may be incomplete.`);
+		}
+		// Log the FULL output. The old 150-char slice hid the truncation.
+		console.log('[Advisor] Raw output:', raw.trim());
 		await advisorCtx.dispose();
 
 		if (v2) {
@@ -1316,6 +1399,8 @@ interface PromptRouterContext {
 	/** Raw content of package.json, if available */
 	packageJson: string | undefined;
 	openFiles: string[] | undefined;
+	/** Stack + hard constraints derived from the user's request. */
+	profile?: StackProfile;
 }
 
 // ---------------------------------------------------------------------------
@@ -1342,6 +1427,16 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 	const loaded: Array<{ name: string; reason: string }> = [];
 	const skipped: string[] = [];
 
+	// ── Stack profile ────────────────────────────────────────────────────────
+	// Derived from the request (single file / vanilla / no libraries / native
+	// APIs only). It decides the prompt set, the scaffold, and the validation
+	// contract. Without it every request was treated as a React app.
+	const profile = ctx.profile ?? detectStackProfile(userMessage, {
+		workspaceHasReact: workspaceHasTsx(workspaceRoot),
+		packageJson,
+	});
+	const plainStack = profile.kind === 'vanilla' || profile.kind === 'single-file';
+
 	// ── Empty workspace guard ────────────────────────────────────────────────
 	if (workspaceRoot) {
 		const tree = buildDirectoryTree(workspaceRoot);
@@ -1365,13 +1460,19 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		if (reason) console.log(`[PromptRouter] SKIP fe/${name}: ${reason}`);
 	};
 
-	// ── 1. Base prompts (always) ────────────────────────────────────────────
-	load('agent', 'always loaded');
-	load('typescript', 'always loaded');
+	// ── 1. Base prompts (stack-aware) ───────────────────────────────────────
+	if (plainStack) {
+		load('agent-plain', `stack=${profile.kind} — plain HTML/CSS/JS, no framework`);
+	} else {
+		load('agent', 'always loaded');
+		load('typescript', 'always loaded');
+	}
 
 	// ── 2. Mode (exactly one) ───────────────────────────────────────────────
-	if (mode === 'create') load('create-mode', 'mode=create');
-	else if (mode === 'edit') load('edit-mode', 'mode=edit');
+	if (mode === 'create') {
+		if (plainStack) load('create-mode-plain', 'mode=create (plain stack)');
+		else load('create-mode', 'mode=create');
+	} else if (mode === 'edit') load('edit-mode', 'mode=edit');
 	else load('needs-context-mode', 'mode=needs_context');
 
 	// ── 3. React detection — filesystem-first, keyword-confirmed ────────────
@@ -1381,16 +1482,16 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 	const fsHasTsx = workspaceHasTsx(workspaceRoot);
 	const activeIsTsx = activeFile ? ['.tsx', '.jsx'].includes(path.extname(activeFile).toLowerCase()) : false;
 	const openFilesTsx = openFiles.some(f => ['.tsx', '.jsx'].includes(path.extname(f).toLowerCase()));
-	const isReact = pkgHasReact || fsHasTsx || activeIsTsx || openFilesTsx
+	const isReact = !plainStack && (pkgHasReact || fsHasTsx || activeIsTsx || openFilesTsx
 		// keyword fallback only when no workspace present
-		|| (!workspaceRoot && (msg.includes('react') || msg.includes('tsx') || msg.includes('jsx')));
+		|| (!workspaceRoot && (msg.includes('react') || msg.includes('tsx') || msg.includes('jsx'))));
 
 	// ── 4. HTML-only — ONLY when activeFile is .html AND project is NOT React
 	const activeExt = activeFile ? path.extname(activeFile).toLowerCase() : '';
 	const isHtmlOnly = !isReact && activeExt === '.html';
 
 	// ── 5. Tailwind detection ────────────────────────────────────────────────
-	const isTailwind = [
+	const isTailwind = !plainStack && [
 		pkg.includes('tailwindcss'),
 		msg.includes('tailwind'),
 		workspaceRoot ? fs.existsSync(path.join(workspaceRoot, 'tailwind.config.js')) ||
@@ -1408,27 +1509,46 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 	].some(Boolean);
 
 	// Deterministic load order: react → tailwind → refine → html
-	if (isReact) {
-		const reactReason = pkgHasReact ? 'package.json contains react/react-dom'
-			: fsHasTsx ? 'workspace contains .tsx/.jsx files'
-				: activeIsTsx ? 'active file is .tsx/.jsx'
-					: openFilesTsx ? 'open file is .tsx/.jsx'
-						: 'keyword (no workspace)';
-		load('react', reactReason);
+	if (plainStack) {
+		// Plain stack: never load React/Tailwind/Refine guidance — those prompts
+		// push the model into className/JSX/useState and contradict the request.
+		skip('react', `stack=${profile.kind} — plain HTML/CSS/JS, no framework requested`);
+		skip('tailwind', 'plain stack — no CSS framework');
+		skip('refine', 'plain stack — no data framework');
+		// html.md / css.md / javascript.md are mutually exclusive ("output only
+		// HTML" / "output CSS only" / "return JavaScript only") and a single-file
+		// deliverable contains all three at once. Loading them together produces
+		// contradictory instructions AND burns ~1.5k tokens of the window.
+		// Only the HTML guide is safe, and only when editing an existing .html.
+		const editingHtml = mode === 'edit' && activeFile
+			&& path.extname(activeFile).toLowerCase() === '.html';
+		if (editingHtml) load('html', 'editing an existing .html file');
+		else skip('html', 'plain stack — the file contains HTML + CSS + JS together');
+		skip('css', 'plain stack — the file contains HTML + CSS + JS together');
+		skip('javascript', 'plain stack — the file contains HTML + CSS + JS together');
 	} else {
-		skip('react', 'no react/react-dom in package.json, no .tsx files in workspace');
+		if (isReact) {
+			const reactReason = pkgHasReact ? 'package.json contains react/react-dom'
+				: fsHasTsx ? 'workspace contains .tsx/.jsx files'
+					: activeIsTsx ? 'active file is .tsx/.jsx'
+						: openFilesTsx ? 'open file is .tsx/.jsx'
+							: 'keyword (no workspace)';
+			load('react', reactReason);
+		} else {
+			skip('react', 'no react/react-dom in package.json, no .tsx files in workspace');
+		}
+
+		if (isTailwind) load('tailwind', 'tailwindcss dependency or tailwind.config.js or keyword');
+		else skip('tailwind');
+
+		if (isRefine) load('refine', '@refinedev/* dependency or keyword "refine"');
+		else skip('refine');
+
+		// html MUST NOT load for React projects
+		if (isHtmlOnly) load('html', 'activeFile is .html and project is NOT React');
+		else if (!isReact) skip('html', 'not an HTML-only project');
+		else skip('html', 'BLOCKED — React project detected');
 	}
-
-	if (isTailwind) load('tailwind', 'tailwindcss dependency or tailwind.config.js or keyword');
-	else skip('tailwind');
-
-	if (isRefine) load('refine', '@refinedev/* dependency or keyword "refine"');
-	else skip('refine');
-
-	// html MUST NOT load for React projects
-	if (isHtmlOnly) load('html', 'activeFile is .html and project is NOT React');
-	else if (!isReact) skip('html', 'not an HTML-only project');
-	else skip('html', 'BLOCKED — React project detected');
 
 	// ── 7. Feature prompts — deterministic keyword maps ──────────────────────
 	const FEATURE_KEYWORDS: Record<string, string[]> = {
@@ -1441,14 +1561,28 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		chart: ['chart', 'graph', 'analytics', 'dashboard metrics', 'pie', 'bar', 'line'],
 	};
 
+	// Feature prompts are React-flavoured (className, useState, zustand, TanStack
+	// Table). For a plain stack only the framework-free variants are loaded.
+	const PLAIN_FEATURE_PROMPTS: Record<string, string> = { kanban: 'kanban-plain' };
+
 	for (const [feature, keywords] of Object.entries(FEATURE_KEYWORDS)) {
 		const triggerKw = keywords.find(k => msg.includes(k));
-		if (triggerKw) {
-			load(feature, `keyword: ${triggerKw}`);
-			console.log(`[PromptRouter] ${feature} -> keyword ${triggerKw}`);
-		} else {
+		if (!triggerKw) {
 			skip(feature);
+			continue;
 		}
+		if (plainStack) {
+			const plainPrompt = PLAIN_FEATURE_PROMPTS[feature];
+			if (plainPrompt) {
+				load(plainPrompt, `keyword: ${triggerKw} (plain stack)`);
+				console.log(`[PromptRouter] ${plainPrompt} -> keyword ${triggerKw}`);
+			} else {
+				skip(feature, 'plain stack — React-specific feature guide');
+			}
+			continue;
+		}
+		load(feature, `keyword: ${triggerKw}`);
+		console.log(`[PromptRouter] ${feature} -> keyword ${triggerKw}`);
 	}
 
 	// ── 8. Response validator ────────────────────────────────────────────────
@@ -1485,7 +1619,23 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		} catch { /* ignore */ }
 	}
 
-	if (installedPkgs.length > 0) {
+	if (plainStack) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'NO-DEPENDENCY RULES (plain HTML / CSS / JS)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'CRITICAL BOUNDARIES:',
+			'1. Do NOT import anything. No `import`, no `require`, no ES module specifiers.',
+			'2. Do NOT add a `<script src="https://cdn...">` or an external `<link>` stylesheet.',
+			'3. Do NOT create package.json / node_modules / a bundler config.',
+			'4. All logic lives in ONE inline <script> block; all styles in ONE inline <style> block.',
+			'5. Use only browser built-ins: document, window, localStorage, matchMedia,',
+			'   fetch, setTimeout, requestAnimationFrame, DragEvent, KeyboardEvent, Event.',
+			'6. If a UI affordance is needed (icons, toasts, modals) implement it with',
+			'   plain elements + CSS — never reference an icon font or an icon package.',
+		].join('\n'));
+	} else if (installedPkgs.length > 0) {
 		parts.push([
 			'',
 			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
@@ -1519,8 +1669,24 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 	}
 
 	// ── 10. Scope-Adaptive Architecture Rules ────────────────────────────────
-	const asksForSingleFile = /keep all state in src\/app\.tsx|single page|single file|simple|widget/i.test(userMessage);
-	if (asksForSingleFile) {
+	const asksForSingleFile = !plainStack
+		&& /keep all state in src\/app\.tsx|single page|single file|simple|widget/i.test(userMessage);
+	if (plainStack) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'PLAIN STACK ARCHITECTURE RULES',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'1. ONE ARTIFACT: the deliverable is a single HTML document with inline <style> and inline <script>.',
+			'2. NO FRAMEWORK: no React, no JSX, no TypeScript, no className, no useState, no import/export.',
+			'3. NO BUILD: the file must work when opened directly (file://) — no bundler, no dev server.',
+			'4. SEMANTIC MARKUP: real elements (section, ul/li, button, form), not a div soup.',
+			'5. EVERY ID YOU QUERY MUST EXIST in your own markup — no dead getElementById targets.',
+			'6. EVERY HANDLER MUST BE WIRED — a button without a listener is a defect.',
+			'7. DEFINE BEFORE USE: every function and const must be declared before it is used at runtime.',
+			'8. NO PLACEHOLDERS: no TODO, no "implementation goes here", no empty handlers.',
+		].join('\n'));
+	} else if (asksForSingleFile) {
 		parts.push([
 			'',
 			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
@@ -1547,6 +1713,21 @@ function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'5. FULL REQUIREMENT COVERAGE: Every requirement requested by the user must be implemented with real interactive state and handlers.',
 			'6. NO PHANTOM WRAPPERS: src/App.tsx MUST be the real main view holding application state (useState), layouts, navigation/sidebar, and child views. NEVER output a tiny 5-10 line wrapper that delegates to an ungenerated <MainView /> or <DashboardView />. Either compose the modular components inside src/App.tsx, or if you extract a container component, you MUST emit that component in <file path="...">.',
 		].join('\n'));
+	}
+
+	// ── 11. HARD CONSTRAINTS (from the detected stack) ───────────────────────
+	// Injected LAST on purpose: it is the most recent instruction the model
+	// sees, so it wins over any generic guidance loaded above.
+	if (profile.constraints.length > 0) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'HARD CONSTRAINTS — THE USER EXPLICITLY REQUESTED THIS (NON-NEGOTIABLE)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			...profile.constraints,
+			'VIOLATING ANY OF THE ABOVE MAKES THE ANSWER WRONG.',
+		].join('\n'));
+		console.log(`[PromptRouter] Hard constraints injected (${profile.constraints.length})`);
 	}
 
 	// ── Debug log ────────────────────────────────────────────────────────────
@@ -1686,6 +1867,7 @@ function buildSystemPrompt(
 	packageJson?: string,
 	openFiles?: string[],
 	readWriteMode?: 'read' | 'write',
+	profile?: StackProfile,
 ): string {
 	if (!hasWorkspace) {
 		const role = currentSpecialist === 'be' ? 'backend engineering' : 'frontend development';
@@ -1694,7 +1876,10 @@ function buildSystemPrompt(
 
 	let prompt = '';
 	if (currentSpecialist === 'fe') {
-		prompt = buildFESystemPrompt({ userMessage, mode, activeFile, workspaceRoot, packageJson, openFiles });
+		prompt = buildFESystemPrompt({
+			userMessage, mode, activeFile, workspaceRoot, packageJson, openFiles,
+			...(profile ? { profile } : {}),
+		});
 	} else {
 		prompt = buildBESystemPrompt(userMessage, mode, activeFile, workspaceRoot);
 	}
@@ -1910,29 +2095,52 @@ function extractFallbackEdits(text: string, openFiles?: string[], workspaceRoot?
 	}
 
 	// Pattern 3: Code fenced block — any ```lang ... ```
-	if (mode !== 'create') {
+	//
+	// Previously gated on `mode !== 'create'`. That gate is what caused the
+	// dashboard failure: the FE model emitted raw code with NO fences and NO
+	// <file> tags, so Pattern 0 found nothing, Pattern 3 was disabled, and
+	// Pattern 4 was also disabled — the whole response was discarded and the
+	// run was reported as success.
+	//
+	// The rescue patterns must be available in create mode too. A fenced
+	// block in a create response is still code worth keeping.
+	{
 		const p3f = /```(?:jsx|tsx|javascript|js|typescript|ts|css|html|vue|svelte|json|sh|bash)\r?\n([\s\S]+?)```/g;
 		while ((match = p3f.exec(text)) !== null) {
 			const code = match[1]!.trim();
-			if (code.length > 30 && !seenPaths.size) {
+			// > 30 chars of content, and the inferred path must not already
+			// be taken — a second React block would infer the same path and
+			// is correctly dropped rather than clobbering the first.
+			if (code.length > 30) {
 				const targetPath = inferFilePath(code, openFiles, workspaceRoot, userPrompt);
 				if (targetPath && !seenPaths.has(targetPath)) {
 					seenPaths.add(targetPath);
 					edits.push({ path: targetPath, content: code });
+					console.log(`[Router] Pattern 3: fenced block → "${targetPath}" (${code.length} chars)`);
 				}
 			}
 		}
 	}
 
 	// Pattern 4 (CRITICAL): Raw unfenced code detection
-	// The Qwen 3B model outputs raw code without any code fences or tool tags.
+	// The Qwen models output raw code without any code fences or tool tags.
 	// Detect if the response IS code by checking for structural markers.
-	if (edits.length === 0 && workspaceRoot && mode !== 'create') {
+	//
+	// Previously gated on `mode !== 'create'`. Disabled here, it was the
+	// single reason a fully-written dashboard was thrown away. The gate was
+	// presumably intended for edit mode (where a fragment is not a whole
+	// file), but in create mode a code response with no wrapper is exactly
+	// the case this pattern exists to handle.
+	//
+	// extractRawCode() already rejects prose (it requires a >= 0.6 code-line
+	// ratio and a > 30 char body), so enabling it is safe: an explanation
+	// with no code in it will not match.
+	if (edits.length === 0 && workspaceRoot) {
 		const code = extractRawCode(text);
 		if (code && code.length > 30) {
 			const targetPath = inferFilePath(code, openFiles, workspaceRoot, userPrompt);
 			if (targetPath) {
-				console.log(`[Router] Fallback P4: detected raw unfenced code → ${targetPath}`);
+				console.log(`[Router] Fallback P4: detected raw unfenced code → ${targetPath} (${code.length} chars)`);
 				edits.push({ path: targetPath, content: code });
 			}
 		}
@@ -1950,7 +2158,7 @@ function extractFallbackEdits(text: string, openFiles?: string[], workspaceRoot?
 interface JsxSymbolIssue {
 	file: string;
 	component: string;
-	kind: 'missing_import' | 'missing_file' | 'missing_function' | 'orphan_file' | 'prop_mismatch' | 'missing_map';
+	kind: 'missing_import' | 'missing_file' | 'missing_function' | 'orphan_file' | 'prop_mismatch' | 'missing_map' | 'no_output';
 	importPath?: string;
 	missingFileTarget?: string;
 	functionName?: string;
@@ -1961,6 +2169,22 @@ function validateJsxSymbols(
 	workspaceRoot: string,
 ): JsxSymbolIssue[] {
 	const issues: JsxSymbolIssue[] = [];
+
+		// An EMPTY input is not "everything is fine" — it is "we looked at
+		// nothing". Reporting success here is how a run that produced ZERO
+		// files was logged as "all JSX symbols OK" and returned a clean 200.
+		//
+		// This is a distinct kind because the remedy is different: a JSX symbol
+		// problem needs a symbol repair, whereas no output at all needs the
+		// model to actually emit code.
+		if (generatedFiles.length === 0) {
+			issues.push({
+				file: '(no files)',
+				component: '(none)',
+				kind: 'no_output',
+			});
+			return issues;
+		}
 
 	// All relative paths available in this response (normalized to forward slashes)
 	const responsePathsRel = new Set(generatedFiles.map(f => f.path.replace(/\\/g, '/')));
@@ -2200,6 +2424,43 @@ function validateJsxSymbols(
 }
 
 /** Build a repair prompt from JSX symbol validation issues. */
+/**
+ * The model produced a response from which no file could be parsed.
+ *
+ * This is a DIFFERENT failure from a symbol problem: the code was never
+ * emitted, so there is nothing to repair. The prompt restates the output
+ * contract explicitly and asks for the files again.
+ */
+function buildNoOutputPrompt(mode: AgentMode): string {
+const contract = `You did not output any file blocks. Your previous response could not be parsed.
+
+Output EVERY file as a complete block using exactly this format:
+<file path="src/Component.tsx">
+...the complete file content...
+</file>
+
+Rules:
+  - Every file MUST be wrapped in <file path="...">...</file>.
+  - Do NOT wrap the code in markdown fences.
+  - Do NOT add explanations, commentary, or prose before or after the blocks.
+  - Emit the COMPLETE file, not a fragment.
+  - Emit ALL requested files, not just the first one.`;
+
+if (mode === 'edit') {
+return `${contract}
+
+<validation_errors>
+No file blocks were found in your previous response. Re-emit the edited file(s) using the <file path="..."> format.
+</validation_errors>`;
+}
+
+return `${contract}
+
+<validation_errors>
+No file blocks were found in your previous response. Re-emit ALL requested files using the <file path="..."> format.
+</validation_errors>`;
+}
+
 function buildJsxRepairPrompt(issues: JsxSymbolIssue[]): string {
 	const byFile = new Map<string, JsxSymbolIssue[]>();
 	for (const iss of issues) {
@@ -2713,7 +2974,9 @@ function executeToolCall(
 	openFiles?: string[],
 	lastUserMsg?: string,
 	intent?: string,
-	readWriteMode?: 'read' | 'write'
+	readWriteMode?: 'read' | 'write',
+	/** True for a create request — the scaffold owns its config files. */
+	isCreateRequest?: boolean
 ): ToolResult {
 	const resolvedPath = path.resolve(workspaceRoot, tool.arguments.path || '.');
 
@@ -2812,6 +3075,19 @@ function executeToolCall(
 					console.warn(`[Writer] ⚠️ IDENTICAL CONTENT — LLM generated the same code as disk. No change will be visible.`);
 					console.log(`[Writer] Existing first 200: ${oldContent.slice(0, 200).replace(/\n/g, '␊')}`);
 					console.log(`[Writer] Generated first 200: ${content.slice(0, 200).replace(/\n/g, '␊')}`);
+				}
+
+				// ── P1.7: never let a create request clobber the scaffold ──────
+				if (wouldClobberScaffold(relPath, isCreateRequest === true)) {
+					console.warn(
+						`[Writer] ⛔ BLOCKED: "${relPath}" is scaffold-owned — the model's version was NOT written.`,
+					);
+					console.log(`[Writer] Scaffold version kept. Model's first 150: ${content.slice(0, 150).replace(/\n/g, '␊')}`);
+					// Report it, but keep going: the model's OTHER files still land.
+					return {
+						success: true,
+						output: `Skipped: ${relPath} is owned by the project scaffold and was left unchanged.`,
+					};
 				}
 
 				fs.writeFileSync(resolvedPath, content, 'utf-8');
@@ -3160,7 +3436,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 		const { messages, stream, openFiles, contextSize: rawContextSize } = req.body;
 		const hasWorkspace = workspaceRoot && fs.existsSync(workspaceRoot);
 
-		const requestedContextSize = Math.max(
+		let requestedContextSize = Math.max(
 			1024,
 			Math.min(
 				65536,
@@ -3220,6 +3496,35 @@ app.post('/v1/chat/completions', async (req, res) => {
 		}
 
 		const lastUserMsg = messages?.[messages.length - 1]?.content || '';
+
+		// ── Stack profile (computed once per request) ───────────────────────
+		// Derived from the user's own words: "single file", "vanilla", "no
+		// libraries", "native ... only", "react". It decides whether we
+		// scaffold a React toolchain, which prompts the model gets, and which
+		// validation contract is enforced on the result.
+		const stackProfile = detectStackProfile(lastUserMsg, {
+			workspaceHasReact: hasWorkspace && workspaceHasTsx(workspaceRoot),
+			packageJson: pkgContent,
+		});
+		const plainStack = stackProfile.kind === 'vanilla' || stackProfile.kind === 'single-file';
+
+		// ── Generation budget sized to the deliverable ─────────────────────
+		// A single-file app is ONE big file (6-10k tokens). With the default 8k
+		// window the model is cut off mid-file, which is exactly how a truncated
+		// index.html with a syntax error ends up on disk.
+		if (requestedContextSize < stackProfile.minContextSize) {
+			console.log(`[Router] Context ${requestedContextSize} -> ${stackProfile.minContextSize} (stack=${stackProfile.kind})`);
+			requestedContextSize = stackProfile.minContextSize;
+			setEffectiveContextSize(requestedContextSize);
+		}
+		const genMaxTokens = Math.min(
+			stackProfile.recommendedMaxTokens,
+			Math.max(2048, requestedContextSize - 4096),
+		);
+
+		// A single-file deliverable is one big artifact that a small model rarely
+		// gets right in one shot — give it more repair rounds.
+		const AGENT_ITERATIONS = stackProfile.kind === 'single-file' ? 10 : MAX_AGENT_ITERATIONS;
 		if (workspaceRoot) {
 			const referencedFiles = extractReferencedFiles(lastUserMsg, workspaceRoot);
 			const alreadySeen = new Set(openFiles || []);
@@ -3332,10 +3637,18 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 		// --- PLANNER CONTRACT (deterministic, no model call) ---
 		const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent, userScope);
-		const validationContract = plannerContractToValidationContract(plannerContract, userScope);
+		const validationContract = plannerContractToValidationContract(plannerContract, userScope, stackProfile);
 
 		// filesModified is shared between incremental engine and the monolithic fallback loop
 		const filesModified: string[] = [];
+		// Files written by the SCAFFOLD (package.json, tsconfig, init.sh, ...).
+		// These are NOT the deliverable — they are the project skeleton. Keeping
+		// them separate is what lets the summary say "12 files on disk, 0 of them
+		// generated" instead of the flat, misleading "12 files written".
+		const scaffoldedFiles = new Set<string>();
+		// Last attempt that failed validation — used for a best-effort write when
+		// the iteration budget runs out, so the user is never left with nothing.
+		let lastFailedEdits: GeneratedFile[] = [];
 
 
 		// ---------------------------------------------------------------
@@ -3349,8 +3662,9 @@ app.post('/v1/chat/completions', async (req, res) => {
 				if (workspaceRoot) {
 					const beBootstrapped = ensureBackendScaffold(workspaceRoot, lastUserMsg);
 					for (const f of beBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+					for (const f of beBootstrapped) scaffoldedFiles.add(f);
 					if (beBootstrapped.length > 0) {
-						try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
+						try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch { }
 						console.log(`[Router] VNext pipeline bootstrapped ${beBootstrapped.length} backend foundation files.`);
 					}
 				}
@@ -3412,7 +3726,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 						res,
 						signal: controller.signal,
 						contextSize: requestedContextSize,
-						maxTokensPerFile: MAX_TOKENS,
+						maxTokensPerFile: genMaxTokens,
 						onFileCommitted(node, content) {
 							if (!filesModified.includes(node.path)) filesModified.push(node.path);
 						},
@@ -3462,7 +3776,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 					const feModelIncr = await mm.acquire('frontend');
 					const feMode = determineMode(lastUserMsg, 'fe', backendFileCount, frontendFileCount);
 					const feActiveFile = openFiles?.[0];
-					const feSysPromptI = buildSystemPrompt(lastUserMsg, hasWorkspace, feMode, 'fe', feActiveFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
+					const feSysPromptI = buildSystemPrompt(lastUserMsg, hasWorkspace, feMode, 'fe', feActiveFile, workspaceRoot, pkgContent, openFiles, readWriteMode, stackProfile);
 					const feCtxIncr = await feModelIncr.createContext({ contextSize: requestedContextSize });
 					context = feCtxIncr;
 					const feSessionIncr = new LlamaChatSession({ contextSequence: feCtxIncr.getSequence(), systemPrompt: feSysPromptI });
@@ -3483,14 +3797,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 						const initTok = Math.max(feSessionIncr?.sequence?.nextTokenIndex || 0, promptTok);
 						updateContextUsage(initTok, requestedContextSize, 'frontend');
 						streamEvent(res, { type: 'context_usage', used: initTok, total: requestedContextSize, percent: Math.min(100, Math.round((initTok / requestedContextSize) * 100)), model: 'frontend' });
-					} catch {}
+					} catch { }
 
-					for (let feI = 0; feI < MAX_AGENT_ITERATIONS; feI++) {
+					for (let feI = 0; feI < AGENT_ITERATIONS; feI++) {
 						if (controller.signal.aborted) break;
 						let feRespI = '';
 						let feChunkCountI = 0;
 						await feSessionIncr.prompt(feI === 0 ? fePromptIncr : fePromptIncr, {
-							maxTokens: MAX_TOKENS,
+							maxTokens: genMaxTokens,
 							repeatPenalty: { penalty: REPEAT_PENALTY, lastTokens: REPEAT_PENALTY_TOKENS, penalizeNewLine: false },
 							signal: controller.signal,
 							stopOnAbortSignal: true,
@@ -3505,7 +3819,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 											updateContextUsage(liveTok, requestedContextSize, 'frontend');
 											streamEvent(res, { type: 'context_usage', used: liveTok, total: requestedContextSize, percent: Math.min(100, Math.round((liveTok / requestedContextSize) * 100)), model: 'frontend' });
 										}
-									} catch {}
+									} catch { }
 								}
 							},
 						});
@@ -3515,13 +3829,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 								updateContextUsage(finTok, requestedContextSize, 'frontend');
 								streamEvent(res, { type: 'context_usage', used: finTok, total: requestedContextSize, percent: Math.min(100, Math.round((finTok / requestedContextSize) * 100)), model: 'frontend' });
 							}
-						} catch {}
+						} catch { }
 						if (!workspaceRoot) break;
 						const feEdits = extractFallbackEdits(feRespI, openFiles, workspaceRoot, lastUserMsg, feMode);
 						if (feEdits.length > 0) {
 							for (const edit of feEdits) {
 								streamEvent(res, { type: 'progress', stage: 'write', message: `Writing \`${edit.path}\`...`, file: edit.path });
-								const feWR = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode);
+								const feWR = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode, rawAdvisorIntent?.startsWith('create_') === true);
 								if (feWR.success) {
 									if (!filesModified.includes(edit.path)) filesModified.push(edit.path);
 									streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
@@ -3533,7 +3847,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 					}
 
 					if (filesModified.length > 0) {
-						streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.length} file(s) updated` });
+						streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.filter(f => !scaffoldedFiles.has(f)).length} file(s) generated` });
 						streamChunk(res, `\n**Files updated:**\n${filesModified.map(f => `- \`${f}\``).join('\n')}\n`);
 					}
 
@@ -3587,12 +3901,14 @@ app.post('/v1/chat/completions', async (req, res) => {
 				const beBootstrapped = ensureBackendScaffold(workspaceRoot, lastUserMsg);
 				bootstrappedCount += beBootstrapped.length;
 				for (const f of beBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+				for (const f of beBootstrapped) scaffoldedFiles.add(f);
 			}
 			// Frontend scaffolding when FE is active or prompt has frontend signals
 			if (currentSpecialist === 'fe' || intent === 'frontend' || (intent === 'general' && promptNeedsFrontend(lastUserMsg))) {
-				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
+				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg, stackProfile);
 				bootstrappedCount += feBootstrapped.length;
 				for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+				for (const f of feBootstrapped) scaffoldedFiles.add(f);
 			}
 			if (bootstrappedCount > 0) {
 				try {
@@ -3605,7 +3921,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 		console.log(`[Router] Phase 1 Specialist=${currentSpecialist}, Mode=${mode}`);
 
 		const activeFile = openFiles && openFiles.length > 0 ? openFiles[0] : undefined;
-		let systemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, currentSpecialist, activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
+		let systemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, currentSpecialist, activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode, stackProfile);
 
 		context = await activeModel.createContext({ contextSize: requestedContextSize });
 		let session = new LlamaChatSession({
@@ -3709,7 +4025,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 		let compactionRetryDone = false;
 		let loopRecoveryCount = 0;
 
-		for (let iteration = 0; iteration < MAX_AGENT_ITERATIONS; iteration++) {
+		for (let iteration = 0; iteration < AGENT_ITERATIONS; iteration++) {
 			console.log(`[Router] --- Agentic iteration ${iteration + 1} ---`);
 
 			if (controller.signal.aborted) {
@@ -3734,7 +4050,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 			controller.signal.addEventListener('abort', onGlobalAbort);
 
 			await session.prompt(currentPrompt, {
-				maxTokens: MAX_TOKENS,
+				maxTokens: genMaxTokens,
 				repeatPenalty: {
 					penalty: REPEAT_PENALTY,
 					lastTokens: REPEAT_PENALTY_TOKENS,
@@ -3765,7 +4081,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 								// Check 75% cutoff threshold
 								const COMPACTION_THRESHOLD = Math.round(activeContextSize * 0.75); // 6,144 tokens
-								if (liveTokens >= COMPACTION_THRESHOLD && !compactionTriggered && iteration < MAX_AGENT_ITERATIONS - 1) {
+								if (liveTokens >= COMPACTION_THRESHOLD && !compactionTriggered && iteration < AGENT_ITERATIONS - 1) {
 									compactionTriggered = true;
 									console.log(`[Router] 75% cutoff reached (${liveTokens}/${activeContextSize} tokens). Halting ${modelLabel} generator for auto-compaction.`);
 									iterController.abort();
@@ -3813,7 +4129,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 				if (workspaceRoot && fullResponse.length > 0) {
 					const completedEdits = extractFallbackEdits(fullResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
 					for (const edit of completedEdits) {
-						const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode);
+						const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode, rawAdvisorIntent?.startsWith('create_') === true);
 						if (wr.success && !filesModified.includes(edit.path)) {
 							filesModified.push(edit.path);
 							streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
@@ -3822,7 +4138,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 					}
 				}
 
-				if (loopRecoveryCount < 3 && iteration < MAX_AGENT_ITERATIONS - 1) {
+				if (loopRecoveryCount < 3 && iteration < AGENT_ITERATIONS - 1) {
 					loopRecoveryCount++;
 
 					// Extract the looping file if matched
@@ -3914,7 +4230,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 				if (workspaceRoot && fullResponse.length > 0) {
 					const completedEdits = extractFallbackEdits(fullResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
 					for (const edit of completedEdits) {
-						const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode);
+						const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode, rawAdvisorIntent?.startsWith('create_') === true);
 						if (wr.success && !filesModified.includes(edit.path)) {
 							filesModified.push(edit.path);
 							streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
@@ -4018,6 +4334,27 @@ app.post('/v1/chat/completions', async (req, res) => {
 			const responseTokenCount = activeModel ? activeModel.tokenize(fullResponse).length : 0;
 			console.log(`[Router] Iteration ${iteration + 1} complete. Tokens generated: ${responseTokenCount}`);
 
+			// ── Response diagnosis: truncated or prose? ─────────────────────
+			// A severed or non-code response must never be written to disk.
+			// Both cases are recoverable by re-prompting, and re-prompting is
+			// strictly better than writing a broken file and reporting success.
+			const diagnosis = diagnoseResponse(fullResponse, responseTokenCount, genMaxTokens);
+			if (diagnosis.truncated || diagnosis.prose) {
+				const canRetry = iteration < AGENT_ITERATIONS - 1 && !controller.signal.aborted;
+				if (canRetry) {
+					console.log(`[Router] Rejected response: ${diagnosis.reason}. Re-prompting.`);
+					streamEvent(res, { type: 'warning', stage: 'generate', message: diagnosis.truncated ? 'Response was cut off at the generation limit — regenerating the remaining files.' : 'The model replied with prose instead of code — asking for the files.' });
+					if (diagnosis.truncated) {
+						const emitted = fullResponse.match(/<file\s+path=["']([^"']+)["']/gi)?.map(m => m.replace(/<file\s+path=["']|["']/gi, '')) ?? [];
+						currentPrompt = buildTruncationContinuationPrompt(mode, lastUserMsg, emitted);
+					} else {
+						currentPrompt = buildProseOutputPrompt(mode, lastUserMsg);
+					}
+					continue;
+				}
+				throw new Error(`The model ${diagnosis.reason}. It could not be recovered within the iteration limit.`);
+			}
+
 			if (responseTokenCount < 30) {
 				if (justCompacted && !compactionRetryDone) {
 					compactionRetryDone = true;
@@ -4035,6 +4372,13 @@ app.post('/v1/chat/completions', async (req, res) => {
 				break;
 			}
 			justCompacted = false;
+			// P1.8 — per-file content hashes, so a file the model cannot fix
+			// is not re-prompted forever.
+			const fileHashHistory = new Map<string, string>();
+			const fileHashRepeat = new Map<string, number>();
+			const stuckFiles = new Set<string>();
+
+
 
 			// Check for identical responses (identical-response detection)
 			const trimmedResponse = fullResponse.trim();
@@ -4095,6 +4439,38 @@ app.post('/v1/chat/completions', async (req, res) => {
 							const sha12v = (s: string) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
 							const preValidatorHashes = Object.fromEntries(fallbackEdits.map(e => [e.path, sha12v(e.content)]));
 							const validationResult = await runPostGenerationValidator(fallbackEdits, workspaceRoot, validationContract, isEditMode);
+
+// ── P1.8: track per-file content hashes across iterations ────────
+							//
+			// The whole-response guard below took FIVE iterations to trip, and
+			// each iteration cost a full model load + generation. The file-level
+			// signal was already logged and unused:
+			//
+			//   [Stage4-Validator] src/App.tsx | unchanged hash=32d3418e700c
+			//
+			// If a file's hash is the same as last iteration, the model is not
+			// making progress on it. Stop asking.
+			if (typeof validationResult !== 'undefined' && validationResult) {
+				const sha12p1 = (s: string) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
+				for (const f of (validationResult.files ?? [])) {
+					const h = sha12p1(f.content);
+					const prev = fileHashHistory.get(f.path);
+					if (prev === h) {
+						const repeats = (fileHashRepeat.get(f.path) ?? 0) + 1;
+						fileHashRepeat.set(f.path, repeats);
+						if (repeats >= 2) {
+							stuckFiles.add(f.path);
+							console.warn(
+								`[Router] ⚠️ ${f.path} has not changed for ${repeats} iterations — ` +
+								`the model cannot fix it. Excluding it from the next repair prompt.`,
+							);
+						}
+					} else {
+						fileHashRepeat.set(f.path, 0);
+					}
+					fileHashHistory.set(f.path, h);
+				}
+			}
 							// Stage 4: compare validator output hashes
 							for (const f of validationResult.files) {
 								const before = preValidatorHashes[f.path];
@@ -4122,7 +4498,19 @@ app.post('/v1/chat/completions', async (req, res) => {
 								streamEvent(res, { type: 'error', stage: 'validate', message: 'Validation failed. Attempting automatic repair...' });
 							}
 
-							for (const edit of validatedEdits) {
+							// Never write files that failed validation. Broken code on disk is
+							// worse than one more repair round-trip. On the final
+							// iteration we write best-effort so the user still has
+							// something to inspect.
+							lastFailedEdits = validatedEdits;
+							const writeAnyway = iteration === AGENT_ITERATIONS - 1;
+							const writeList = (validationResult.passed || writeAnyway) ? validatedEdits : [];
+							if (writeList.length === 0 && validatedEdits.length > 0) {
+								console.log('[Router] Validation failed - skipping write, requesting repair instead.');
+								streamEvent(res, { type: 'warning', stage: 'validate', message: 'Validation failed - regenerating before writing.' });
+							}
+
+							for (const edit of writeList) {
 								// Apply fallback protection counts
 								const attempts = (fileWriteAttempts.get(edit.path) || 0) + 1;
 								fileWriteAttempts.set(edit.path, attempts);
@@ -4131,14 +4519,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 								}
 
 								streamEvent(res, { type: 'progress', stage: 'write', message: `Writing \`${edit.path}\`...`, file: edit.path });
-								const result = executeToolCall(
-									{ name: 'writeFile', arguments: { path: edit.path, content: edit.content } },
-									workspaceRoot,
-									openFiles,
-									lastUserMsg,
-									intent,
-									readWriteMode
-								);
+								const result = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode, rawAdvisorIntent?.startsWith('create_') === true);
 								if (result.success && result.output.startsWith('WRITTEN:')) {
 									if (!filesModified.includes(edit.path)) filesModified.push(edit.path);
 									streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
@@ -4159,21 +4540,68 @@ app.post('/v1/chat/completions', async (req, res) => {
 							}
 
 							if (hasErrors || !validationResult.passed) {
-								if (iteration === MAX_AGENT_ITERATIONS - 1) {
+								if (iteration === AGENT_ITERATIONS - 1) {
 									if (filesModified.length > 0) {
-										console.warn(`[Router] Max agent iterations (${MAX_AGENT_ITERATIONS}) reached, but ${filesModified.length} file(s) were successfully written to disk. Exiting repair loop gracefully.`);
-										streamChunk(res, `\n\n> Note: Validation completed after ${MAX_AGENT_ITERATIONS} steps. Generated files have been preserved on disk.\n`);
+										console.warn(`[Router] Max agent iterations (${AGENT_ITERATIONS}) reached, but ${filesModified.length} file(s) were successfully written to disk. Exiting repair loop gracefully.`);
+										streamChunk(res, `\n\n> Note: Validation completed after ${AGENT_ITERATIONS} steps. Generated files have been preserved on disk.\n`);
 										break;
 									}
-									throw new Error(`Agent Iteration Protection: Exceeded maximum iteration limit of ${MAX_AGENT_ITERATIONS} steps without finding a valid correction.`);
+									// Nothing passed validation: write the last attempt anyway so
+									// the user gets a reviewable artifact instead of an empty
+									// workspace. The failure is reported in the stream.
+									if (lastFailedEdits.length > 0) {
+										console.warn(`[Router] Max agent iterations (${AGENT_ITERATIONS}) reached with no passing validation — writing last attempt (best effort).`);
+										streamEvent(res, { type: 'warning', stage: 'complete', message: 'Validation never passed — the last attempt was written for review. Check the reported issues.' });
+										for (const edit of lastFailedEdits) {
+											const wr = executeToolCall(
+												{ name: 'writeFile', arguments: { path: edit.path, content: edit.content } },
+												workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode,
+											);
+											if (wr.success && !filesModified.includes(edit.path)) filesModified.push(edit.path);
+										}
+										break;
+									}
+									throw new Error(`Agent Iteration Protection: Exceeded maximum iteration limit of ${AGENT_ITERATIONS} steps without finding a valid correction.`);
 								}
 								// Abort guard — stop looping if client disconnected
 								if (controller.signal.aborted) break;
 
+								// ── P1.8: do not re-ask for a file the model cannot fix ──
+								//
+								// A file whose content hash has not changed for two iterations is
+								// not going to change on the third. Asking again costs a full model
+								// load + generation and produces the identical file.
+								const stuckNow = [...stuckFiles];
+								const repairableIssues = stuckNow.length > 0
+									? validationResult.issues.filter(i => !i.file || !stuckFiles.has(i.file))
+									: validationResult.issues;
+
+								if (stuckNow.length > 0) {
+									console.warn(
+										`[Router] ⚠️ Excluding stuck file(s) from the repair prompt: ${stuckNow.join(', ')}`,
+									);
+									for (const s of stuckNow) {
+										streamEvent(res, {
+											type: 'error', stage: 'validate',
+											message: `The model could not fix ${s} after several attempts — it was left unchanged.`,
+											file: s,
+										});
+									}
+								}
+
+								// Every failing file is stuck — there is nothing left to ask for.
+								// Stop instead of looping to the response-level guard.
+								if (repairableIssues.length === 0 && stuckNow.length > 0) {
+									throw new Error(
+										`Repair stalled: the model could not fix ${stuckNow.join(', ')} ` +
+										`after multiple attempts, and the content never changed.`,
+									);
+								}
+
 								// Targeted repair: feed only specific issues back to the model
 								const repairPrompt = currentSpecialist === 'fe'
-									? buildFERepairPrompt(validationResult.issues, filesModified)
-									: buildTargetedRepairPrompt(validationResult.issues, filesModified, workspaceRoot ?? '');
+									? buildFERepairPrompt(repairableIssues, filesModified)
+									: buildTargetedRepairPrompt(repairableIssues, filesModified, workspaceRoot ?? '');
 								currentPrompt = repairPrompt || `<validation_errors>\nSome files failed validation.\n${errorOutputs.join('\n')}\nRe-emit the corrected file(s).\n</validation_errors>`;
 
 								console.log(`[Router] Fallback validation failed, looping back to LLM for correction...`);
@@ -4187,7 +4615,18 @@ app.post('/v1/chat/completions', async (req, res) => {
 				if (currentSpecialist === 'fe' && workspaceRoot && !jsxRepairDoneMain && readWriteMode !== 'read') {
 					const extractedForValidation = extractFallbackEdits(fullResponse, openFiles, workspaceRoot, lastUserMsg, mode);
 					const jsxIssues = validateJsxSymbols(extractedForValidation, workspaceRoot);
-					if (jsxIssues.length > 0 && iteration < MAX_AGENT_ITERATIONS - 1 && !controller.signal.aborted) {
+					const noOutput = jsxIssues.find(i => i.kind === 'no_output');
+					if (noOutput) {
+						// Nothing was parsed out of the response. The remedy is
+						// to make the model emit code, not to repair symbols.
+						if (iteration < AGENT_ITERATIONS - 1 && !controller.signal.aborted) {
+							console.log('[Validator] no file blocks parsed from the response — re-prompting for code output.');
+							currentPrompt = buildNoOutputPrompt(mode);
+							continue;
+						}
+						throw new Error('The model did not produce any parseable file output. See the router log for the raw response.');
+					}
+					if (jsxIssues.length > 0 && iteration < AGENT_ITERATIONS - 1 && !controller.signal.aborted) {
 						jsxRepairDoneMain = true;
 						console.log(`[Validator] repairing ${jsxIssues.length} JSX issue(s) in main loop`);
 						currentPrompt = buildJsxRepairPrompt(jsxIssues);
@@ -4197,11 +4636,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 
 				// Part B — files written summary (BE-only or single-specialist)
 				if (filesModified.length > 0) {
-					streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.length} file(s) updated` });
+					streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.filter(f => !scaffoldedFiles.has(f)).length} file(s) generated` });
 					streamChunk(res, `\n**Files updated:**\n${filesModified.map(f => `- \`${f}\``).join('\n')}\n`);
 				} else if (/(?:make|create|new|edit|update|change|add to) /i.test(lastUserMsg || '')) {
 					// Fallback Protection: no file blocks generated for an explicit write request
-					if (iteration < MAX_AGENT_ITERATIONS - 1) {
+					if (iteration < AGENT_ITERATIONS - 1) {
 						console.log(`[Router] Fallback protection: Missing file blocks, looping back to LLM...`);
 						currentPrompt = `<validation_errors>\nYou did not output any valid file blocks.\n\nYou MUST use the exact <file path="...">...</file> format to generate code.\nDo not use markdown code fences.\n</validation_errors>\n\nPlease try again.`;
 						continue;
@@ -4274,7 +4713,7 @@ Continue with your task using plain text only. Do not emit any file blocks or wr
 			}
 
 			// If we reached the last iteration and the model is trying to continue (e.g. it emitted a tool call), check if files were already generated
-			if (iteration === MAX_AGENT_ITERATIONS - 1) {
+			if (iteration === AGENT_ITERATIONS - 1) {
 				if (filesModified.length > 0) {
 					console.warn(`[Router] Max agent iterations reached with active tool call, but ${filesModified.length} file(s) were written. Finishing.`);
 					break;
@@ -4298,7 +4737,8 @@ ${resultPreview}
 Continue with your task. If you need another tool, use it. Otherwise provide your final summary.`;
 		}
 
-		console.log(`[Router] BE phase finished. ${filesModified.length} file(s) written.`);
+		const generatedCount = filesModified.filter(f => !scaffoldedFiles.has(f)).length;
+		console.log(`[Router] BE phase finished. ${generatedCount} file(s) generated, ${scaffoldedFiles.size} scaffolded, ${filesModified.length} total on disk.`);
 
 		// --- Write BE artifact + patch Tier-2 caches ---
 		// Gives FE specialist deterministic context without extra LLM calls.
@@ -4360,16 +4800,17 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			console.log(`[Router] Phase 2 Specialist=${currentSpecialist}, Mode=${mode}`);
 
 			if (workspaceRoot && (mode === 'create' || advisorSaysCreate)) {
-				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg);
+				const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg, stackProfile);
 				if (feBootstrapped.length > 0) {
 					for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
-					try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch {}
+					for (const f of feBootstrapped) scaffoldedFiles.add(f);
+					try { pkgContent = fs.readFileSync(path.join(workspaceRoot, 'package.json'), 'utf-8'); } catch { }
 					console.log(`[Router] Initializer bootstrapped ${feBootstrapped.length} frontend foundation files for FE phase.`);
 				}
 			}
 
 			// Build FE system prompt with FE specialist mode
-			const feSystemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, 'fe', activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode);
+			const feSystemPrompt = buildSystemPrompt(lastUserMsg, hasWorkspace, mode, 'fe', activeFile, workspaceRoot, pkgContent, openFiles, readWriteMode, stackProfile);
 
 			// Fresh context — no shared state with BE session
 			context = await feModel.createContext({ contextSize: requestedContextSize });
@@ -4441,7 +4882,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			let feCompactionRetryDone = false;
 			let feLoopRecoveryCount = 0;
 
-			for (let feIter = 0; feIter < MAX_AGENT_ITERATIONS; feIter++) {
+			for (let feIter = 0; feIter < AGENT_ITERATIONS; feIter++) {
 				console.log(`[Router] --- FE iteration ${feIter + 1} ---`);
 				if (controller.signal.aborted) throw new Error('FE phase aborted.');
 
@@ -4456,7 +4897,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 				controller.signal.addEventListener('abort', onFeGlobalAbort);
 
 				await feSession.prompt(fePrompt, {
-					maxTokens: MAX_TOKENS,
+					maxTokens: genMaxTokens,
 					repeatPenalty: { penalty: REPEAT_PENALTY, lastTokens: REPEAT_PENALTY_TOKENS, penalizeNewLine: false },
 					signal: feIterController.signal,
 					stopOnAbortSignal: true,
@@ -4480,7 +4921,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 
 									// Check 75% cutoff threshold
 									const COMPACTION_THRESHOLD = Math.round(feContextSize * 0.75); // 6,144 tokens
-									if (liveTokens >= COMPACTION_THRESHOLD && !feCompactionTriggered && feIter < MAX_AGENT_ITERATIONS - 1) {
+									if (liveTokens >= COMPACTION_THRESHOLD && !feCompactionTriggered && feIter < AGENT_ITERATIONS - 1) {
 										feCompactionTriggered = true;
 										console.log(`[Router] FE 75% cutoff reached (${liveTokens}/${feContextSize} tokens). Halting for auto-compaction.`);
 										feIterController.abort();
@@ -4522,7 +4963,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					if (workspaceRoot && feResponse.length > 0) {
 						const completedEdits = extractFallbackEdits(feResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
 						for (const edit of completedEdits) {
-							const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode);
+							const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode, rawAdvisorIntent?.startsWith('create_') === true);
 							if (wr.success && !filesModified.includes(edit.path)) {
 								filesModified.push(edit.path);
 								streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
@@ -4531,7 +4972,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 						}
 					}
 
-					if (feLoopRecoveryCount < 3 && feIter < MAX_AGENT_ITERATIONS - 1) {
+					if (feLoopRecoveryCount < 3 && feIter < AGENT_ITERATIONS - 1) {
 						feLoopRecoveryCount++;
 
 						const pathMatch = feLoopReason.match(/path="([^"]+)"/i);
@@ -4615,7 +5056,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					if (workspaceRoot && feResponse.length > 0) {
 						const completedEdits = extractFallbackEdits(feResponse, openFiles, workspaceRoot, lastUserMsg, mode, true);
 						for (const edit of completedEdits) {
-							const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode);
+							const wr = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, 'frontend', readWriteMode, rawAdvisorIntent?.startsWith('create_') === true);
 							if (wr.success && !filesModified.includes(edit.path)) {
 								filesModified.push(edit.path);
 								streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
@@ -4713,18 +5154,36 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					// Final response — extract file blocks
 					if (workspaceRoot) {
 						const feRawEdits = extractFallbackEdits(feResponse, openFiles, workspaceRoot, lastUserMsg, mode);
-						const feValidContract = plannerContractToValidationContract(plannerContract, 'FRONTEND_ONLY');
+						const feValidContract = plannerContractToValidationContract(plannerContract, 'FRONTEND_ONLY', stackProfile);
 						const feValResult = feRawEdits.length > 0 && readWriteMode !== 'read'
 							? await runPostGenerationValidator(feRawEdits, workspaceRoot, feValidContract)
 							: null;
+
+						// ── Validation gate + repair loop ─────────────────────────
+						// Previously the validator ran but its verdict was DISCARDED:
+						// broken output was written to disk as-is. Now a failed
+						// validation sends the errors back to the model and the
+						// files are only written once they pass.
+						if (feValResult && !feValResult.passed && feIter < AGENT_ITERATIONS - 1) {
+							const feErrors = feValResult.issues.filter(i => i.severity === 'error');
+							if (feErrors.length > 0) {
+								console.log(`[Validator] FE validation failed with ${feErrors.length} error(s) — requesting repair (iteration ${feIter + 1})`);
+								streamEvent(res, {
+									type: 'warning', stage: 'validate',
+									message: `Validation failed (${feErrors.length} error(s)) — repairing...`,
+								});
+								fePrompt = plainStack
+									? buildPlainStackRepairPrompt(feErrors, stackProfile.targetFile ?? 'index.html')
+									: buildFERepairPrompt(feErrors, filesModified);
+								continue;
+							}
+						}
+
 						const fallback = feValResult ? feValResult.files : feRawEdits;
 						if (fallback.length > 0 && readWriteMode !== 'read') {
 							for (const edit of fallback) {
 								streamEvent(res, { type: 'progress', stage: 'write', message: `Writing \`${edit.path}\`...`, file: edit.path });
-								const feResult = executeToolCall(
-									{ name: 'writeFile', arguments: { path: edit.path, content: edit.content } },
-									workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode
-								);
+								const feResult = executeToolCall({ name: 'writeFile', arguments: { path: edit.path, content: edit.content } }, workspaceRoot, openFiles, lastUserMsg, intent, readWriteMode, rawAdvisorIntent?.startsWith('create_') === true);
 								if (feResult.success) {
 									if (!filesModified.includes(edit.path)) filesModified.push(edit.path);
 									streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${edit.path}\``, file: edit.path });
@@ -4738,7 +5197,18 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 					if (workspaceRoot && !feJsxRepairDone && readWriteMode !== 'read' && filesModified.length > feInitialFilesCount) {
 						const feExtracted = extractFallbackEdits(feResponse, openFiles, workspaceRoot, lastUserMsg, mode);
 						const jsxIssues = validateJsxSymbols(feExtracted, workspaceRoot);
-						if (jsxIssues.length > 0 && feIter < MAX_AGENT_ITERATIONS - 1) {
+						const noOutput = jsxIssues.find(i => i.kind === 'no_output');
+						if (noOutput) {
+							// Nothing was parsed out of the response. The remedy is
+							// to make the model emit code, not to repair symbols.
+							if (feIter < AGENT_ITERATIONS - 1) {
+								console.log('[Validator] no file blocks parsed from the response — re-prompting for code output.');
+								fePrompt = buildNoOutputPrompt(mode);
+								continue;
+							}
+							throw new Error('The model did not produce any parseable file output. See the router log for the raw response.');
+						}
+						if (jsxIssues.length > 0 && feIter < AGENT_ITERATIONS - 1) {
 							feJsxRepairDone = true;
 							console.log(`[Validator] repairing ${jsxIssues.length} JSX issue(s) in FE loop`);
 							fePrompt = buildJsxRepairPrompt(jsxIssues);
@@ -4748,7 +5218,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 
 					// If no files were written in create mode, force retry
 					if (mode === 'create' && (!workspaceRoot || filesModified.length === feInitialFilesCount)) {
-						if (feIter < MAX_AGENT_ITERATIONS - 1) {
+						if (feIter < AGENT_ITERATIONS - 1) {
 							console.log(`[Router] FE Fallback protection: Missing file blocks, looping back to LLM...`);
 							fePrompt = `<validation_errors>\nYou did not output any valid file blocks.\n\nYou MUST use the exact <file path="...">...</file> format to generate code.\nDo not use markdown code fences.\n</validation_errors>\n\nPlease try again.`;
 							continue;
@@ -4785,14 +5255,48 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 
 			// Emit fullstack completion summary
 			if (filesModified.length > 0) {
-				streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.length} file(s) updated` });
+				streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.filter(f => !scaffoldedFiles.has(f)).length} file(s) generated` });
 				streamChunk(res, `\n**Files updated:**\n${filesModified.map(f => `- \`${f}\``).join('\n')}\n`);
 			}
 		} // end if (isFullStackExecution)
 
-		res.end();
+		// ── Zero-output guard ────────────────────────────────────────────
+		// A create request that produced no application file is a FAILURE.
+		//
+		// Before P0.3 the counts were conflated, so this was invisible: the
+		// dashboard run reported "12 file(s) written" and a clean HTTP 200
+		// while the model had written ZERO application files. Twelve scaffold
+		// files were on disk and nothing was delivered.
+		//
+		// The guard is deliberately narrow:
+		//   - create mode only (an edit that changes nothing is legal)
+		//   - a workspace must be in play (a chat with no workspace is a
+		//     conversation, not a deliverable)
+		//   - the scaffold must have run (otherwise "no files" just means the
+		//     user asked a question, which is not a failure)
+		const generatedFinal = filesModified.filter(f => !scaffoldedFiles.has(f)).length;
+		if (mode === 'create' && workspaceRoot && scaffoldedFiles.size > 0 && generatedFinal === 0) {
+			const errorMsg = `The request asked for new files, but no application file was generated. `
+				+ `${scaffoldedFiles.size} scaffolding file(s) were created, but the model produced no code. `
+				+ `See the router log for the raw model response.`;
+			console.error(`[Router] ${errorMsg}`);
+			streamEvent(res, { type: 'error', stage: 'complete', message: errorMsg });
+			if (!res.writableEnded) {
+				res.write('data: [DONE]\n\n');
+				res.end();
+			}
+			if (workspaceRoot) cleanupArtifacts(workspaceRoot);
+			throw new Error(errorMsg);
+		}
+
+		// Terminate the stream with the standard sentinel so every client
+		// (OpenAI-compatible ones included) sees an explicit end-of-stream.
+		if (!res.writableEnded) {
+			res.write('data: [DONE]\n\n');
+			res.end();
+		}
 		if (workspaceRoot) cleanupArtifacts(workspaceRoot); // cleanup any remaining artifacts
-		console.log(`[Router] Request finished. ${filesModified.length} files modified.`);
+		console.log(`[Router] Request finished. ${generatedFinal} file(s) generated, ${scaffoldedFiles.size} scaffolded, ${filesModified.length} total on disk.`);
 
 
 	} catch (error: any) {
@@ -4802,7 +5306,10 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			res.status(500).json({ error: errorMsg });
 		} else {
 			streamEvent(res, { type: 'error', stage: 'complete', message: `Processing terminated: ${errorMsg}` });
-			res.end();
+			if (!res.writableEnded) {
+				res.write('data: [DONE]\n\n');
+				res.end();
+			}
 		}
 	} finally {
 		clearTimeout(timeoutId);
@@ -4890,7 +5397,7 @@ app.get('/v1/edits', (_req, res) => {
 // The new subsystem uses its own ModelManager instance (lease-based).
 // ---------------------------------------------------------------------------
 
-const _asyncBus    = new EventBus();
+const _asyncBus = new EventBus();
 const _asyncLogger = new Logger({ level: 'info', structured: false });
 _asyncLogger.attachEventBus(_asyncBus);
 

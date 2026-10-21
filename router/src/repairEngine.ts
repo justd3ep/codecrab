@@ -11,39 +11,39 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { LlamaChatSession }   from 'node-llama-cpp';
-import type { ValidationIssue }    from './validator.js';
-import type { GeneratedFile }      from './validator.js';
-import type { FileNode }           from './planner.js';
+import type { LlamaChatSession } from 'node-llama-cpp';
+import type { ValidationIssue } from './validator.js';
+import type { GeneratedFile } from './validator.js';
+import type { FileNode } from './planner.js';
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
 export const enum RepairMode {
-	MODIFY_EXISTING   = 'MODIFY_EXISTING',
-	GENERATE_MISSING  = 'GENERATE_MISSING',
-	REWIRE_IMPORTS    = 'REWIRE_IMPORTS',
+	MODIFY_EXISTING = 'MODIFY_EXISTING',
+	GENERATE_MISSING = 'GENERATE_MISSING',
+	REWIRE_IMPORTS = 'REWIRE_IMPORTS',
 	DELETE_DUPLICATES = 'DELETE_DUPLICATES',
-	SECURITY_FIX      = 'SECURITY_FIX',
-	COMPILE_FIX       = 'COMPILE_FIX',
+	SECURITY_FIX = 'SECURITY_FIX',
+	COMPILE_FIX = 'COMPILE_FIX',
 }
 
 export interface RepairJob {
-	issue:       ValidationIssue;
-	targetFile:  GeneratedFile;
-	mode:        RepairMode;
+	issue: ValidationIssue;
+	targetFile: GeneratedFile;
+	mode: RepairMode;
 	/** Content of committed dependency files — for import resolution context */
-	depContext:  string[];
-	attempt:     number;
+	depContext: string[];
+	attempt: number;
 	maxAttempts: number;
 }
 
 export interface RepairResult {
-	success:      boolean;
+	success: boolean;
 	repairedFile: GeneratedFile | null;
-	attempts:     number;
-	skipped:      boolean;    // true if maxAttempts exceeded
+	attempts: number;
+	skipped: boolean;    // true if maxAttempts exceeded
 }
 
 /**
@@ -56,11 +56,11 @@ export interface RepairResult {
  * skip              — unresolvable; give up
  */
 export type RepairDecision =
-	| { action: 'repair';            mode: RepairMode }
-	| { action: 'queue_dependency';  missingPath: string }
-	| { action: 'skip_planned';      reason: string }
+	| { action: 'repair'; mode: RepairMode }
+	| { action: 'queue_dependency'; missingPath: string }
+	| { action: 'skip_planned'; reason: string }
 	| { action: 'planner_expansion'; suggestedPath: string }
-	| { action: 'skip';              reason: string };
+	| { action: 'skip'; reason: string };
 
 // ---------------------------------------------------------------------------
 // RepairMode classification (mirrors index.ts classifyRepairMode)
@@ -113,9 +113,9 @@ export function classifyRepairMode(kind: string, message: string): RepairMode {
  * Only the planner has authority to add new files to the generation graph.
  */
 export function classifyRepairDecision(
-	issue:           import('./validator.js').ValidationIssue,
+	issue: import('./validator.js').ValidationIssue,
 	committedPaths: Set<string>,
-	plannedPaths:   Set<string>,
+	plannedPaths: Set<string>,
 ): RepairDecision {
 	if (issue.kind === 'missing_import') {
 		// Extract target path from message if possible
@@ -242,10 +242,10 @@ function extractSingleFileBlock(text: string): GeneratedFile | null {
 	const match = openTagRegex.exec(text);
 	if (!match) return null;
 
-	const filePath  = match[1]!.trim();
-	const afterTag  = text.indexOf(match[0]) + match[0].length;
-	const closeIdx  = text.indexOf('</file>', afterTag);
-	const content   = closeIdx >= 0
+	const filePath = match[1]!.trim();
+	const afterTag = text.indexOf(match[0]) + match[0].length;
+	const closeIdx = text.indexOf('</file>', afterTag);
+	const content = closeIdx >= 0
 		? text.substring(afterTag, closeIdx).trim()
 		: text.substring(afterTag).trim();
 
@@ -292,15 +292,15 @@ async function promptForRepair(
  * @returns The final repaired file (may still have unresolved warnings) or null on failure.
  */
 export async function runRepairLoop(
-	issues:         import('./validator.js').ValidationIssue[],
-	targetFile:     GeneratedFile,
-	depContext:     string[],
-	session:        LlamaChatSession,
-	maxTokens:      number,
-	signal:         AbortSignal,
-	validate:       (file: GeneratedFile) => Promise<import('./validator.js').ValidationIssue[]>,
-	budget?:        { maxLocalRepairsPerFile: number },
-	plannedPaths?:  Set<string>,
+	issues: import('./validator.js').ValidationIssue[],
+	targetFile: GeneratedFile,
+	depContext: string[],
+	session: LlamaChatSession,
+	maxTokens: number,
+	signal: AbortSignal,
+	validate: (file: GeneratedFile) => Promise<import('./validator.js').ValidationIssue[]>,
+	budget?: { maxLocalRepairsPerFile: number },
+	plannedPaths?: Set<string>,
 	committedPaths?: Set<string>,
 ): Promise<{ file: GeneratedFile; resolvedCount: number; skippedCount: number }> {
 	const maxAttempts = budget?.maxLocalRepairsPerFile ?? 3;
@@ -311,9 +311,9 @@ export async function runRepairLoop(
 		return a.severity === 'error' ? -1 : 1;
 	});
 
-	let currentFile   = { ...targetFile };
+	let currentFile = { ...targetFile };
 	let resolvedCount = 0;
-	let skippedCount  = 0;
+	let skippedCount = 0;
 
 	for (const issue of sorted) {
 		if (signal.aborted) break;
@@ -350,7 +350,7 @@ export async function runRepairLoop(
 			targetFile: currentFile,
 			mode,
 			depContext,
-			attempt:     0,
+			attempt: 0,
 			maxAttempts,
 		};
 
@@ -366,7 +366,7 @@ export async function runRepairLoop(
 			console.log(`[RepairEngine] issue=${issue.kind} mode=${mode} attempt=${attempt}/${job.maxAttempts} file=${currentFile.path}`);
 
 			const prompt = buildSingleIssueRepairPrompt(job);
-			const raw    = await promptForRepair(session, prompt, maxTokens, signal);
+			const raw = await promptForRepair(session, prompt, maxTokens, signal);
 			const repaired = extractSingleFileBlock(raw);
 
 			if (!repaired) {
@@ -376,12 +376,12 @@ export async function runRepairLoop(
 
 			// Validate the repaired file
 			const remainingIssues = await validate(repaired);
-			const thisIssueFixed  = !remainingIssues.some(
+			const thisIssueFixed = !remainingIssues.some(
 				ri => ri.kind === issue.kind && ri.message === issue.message,
 			);
 
 			if (thisIssueFixed) {
-				currentFile   = repaired;
+				currentFile = repaired;
 				issueResolved = true;
 				resolvedCount++;
 				console.log(`[RepairEngine] [RESOLVED] ${issue.kind} in ${currentFile.path}`);
@@ -407,7 +407,7 @@ export async function runRepairLoop(
  * Caps at maxFiles to avoid context overflow.
  */
 export function buildDepContext(
-	depPaths:       string[],
+	depPaths: string[],
 	committedFiles: Map<string, string>,   // path → content
 	maxFiles = 5,
 ): string[] {
@@ -616,6 +616,53 @@ export function buildTargetedRepairPrompt(
 		'  6. Move logic between layers by rewriting the affected files (routes, controller, service, repository).',
 		'  7. When moving database logic from a route to a repository, update the route → controller → service → repository chain.',
 		'</repair_instructions>',
+	);
+
+	return lines.join('\n');
+}
+
+/**
+	* buildPlainStackRepairPrompt — repair prompt for PLAIN HTML / CSS / JS work.
+	*
+	* The React repair prompt talks about src/App.tsx, React hooks and component
+	* imports. Feeding that to a model that was asked for a single vanilla HTML
+	* file pushes it back into React. This variant keeps the same error list but
+	* only talks in terms of the requested artifact.
+	*/
+export function buildPlainStackRepairPrompt(
+	issues: ValidationIssue[],
+	targetFile: string = 'index.html',
+): string {
+	const errors = issues.filter(i => i.severity === 'error');
+	if (errors.length === 0) return '';
+
+	const lines: string[] = [
+		'<validation_errors>',
+		`Validation found ${errors.length} error(s) in the generated file:`,
+		'',
+	];
+
+	for (const iss of errors) {
+		lines.push(`- [${iss.file || targetFile}] ${iss.message}`);
+	}
+
+	lines.push(
+		'',
+		'Rules for the repair:',
+		`  1. Output ONE corrected <file path="${targetFile}"> block containing the complete file.`,
+		'  2. Keep the requested stack: plain HTML + CSS + vanilla JavaScript.',
+		'     No React, no JSX, no TypeScript, no import statements, no CDN links.',
+		`  3. Do NOT create any other file. The deliverable is exactly "${targetFile}".`,
+		'  4. If the error is "more than one file", merge every piece of code into',
+		`     "${targetFile}" and emit only that file.`,
+		'  5. If the error is a syntax error, fix the exact broken statement and',
+		'     output the WHOLE file again (not a fragment).',
+		'  6. If the error is a missing import/React reference, delete that import',
+		'     and implement the behaviour with plain DOM code.',
+		'  7. Keep every requirement of the original request implemented.',
+		'</validation_errors>',
+		'',
+		'[Validator] repairing — output the corrected file now.',
 	);
 
 	return lines.join('\n');
