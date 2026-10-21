@@ -93,25 +93,40 @@ console.log('\n=== 2. P0 file:line references resolve correctly ===');
 // Phase 0.1 REMOVED the `mode !== 'create'` guards on Pattern 3 and
 // Pattern 4. These assertions therefore check that the guards are GONE,
 // not that they are present.
-check('index.ts:2031 — Pattern 3 exists and is no longer gated on create mode', () => {
-	if (find(indexTs, "// Pattern 3: Code fenced block") !== true) {
-		return 'the Pattern 3 block moved';
-	}
-	const src = read(indexTs);
+// The extraction implementation moved from src/index.ts into
+// src/generation/pipelineHelpers.ts, so the pattern blocks are looked
+// up in the COMBINED source of both files. The test does not care
+// where the implementation lives — only that the behaviour is right.
+const SOURCE_FILES = [
+	path.join(ROUTER, 'src', 'index.ts'),
+	path.join(ROUTER, 'src', 'generation', 'pipelineHelpers.ts'),
+];
+const source = (): string =>
+	SOURCE_FILES.map(f => fs.existsSync(f) ? read(f) : '').join('\n');
+
+/** Strip comments so prose mentioning a guard is not read as a guard. */
+//
+// Uses String.fromCharCode(10) rather than a '\n' literal: the patch
+// tool has repeatedly mangled backslash escapes in this file, and a
+// CRLF file leaving a trailing \r on each line does not affect the
+// substring check this helper exists for.
+const NL = String.fromCharCode(10);
+const liveLines = (text: string): string =>
+	text.split(NL).map((l: string) => l.replace(/\/\/.*/, '')).join(NL);
+
+check('Pattern 3 exists and is no longer gated on create mode', () => {
+	const src = source();
 	const i = src.indexOf('// Pattern 3: Code fenced block');
-	const window = src.slice(i, i + 1600);
-	const live = window.split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+	if (i < 0) return 'the Pattern 3 block is missing';
+	const live = liveLines(src.slice(i, i + 1600));
 	return !live.includes("mode !== 'create'") ? true : 'the P3 create-mode guard is BACK';
 });
 
-check('index.ts:2059 — Pattern 4 exists and is no longer gated on create mode', () => {
-	if (find(indexTs, "// Pattern 4 (CRITICAL)") !== true) {
-		return 'the Pattern 4 block moved';
-	}
-	const src = read(indexTs);
+check('Pattern 4 exists and is no longer gated on create mode', () => {
+	const src = source();
 	const i = src.indexOf('// Pattern 4 (CRITICAL)');
-	const window = src.slice(i, i + 1800);
-	const live = window.split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+	if (i < 0) return 'the Pattern 4 block is missing';
+	const live = liveLines(src.slice(i, i + 1800));
 	return !live.includes("mode !== 'create'") ? true : 'the P4 create-mode guard is BACK';
 });
 
@@ -166,18 +181,26 @@ check('chatRoutes.ts:158 — makeChatRoutes export', () =>
 
 console.log('\n=== 3. the claims the roadmap makes are true ===');
 
-check('P4 is genuinely gated on mode !== \'create\'', () => {
-	const i = read(indexTs).indexOf('// Pattern 4 (CRITICAL): Raw unfenced code detection');
+check('P4 is NOT gated on mode !== \'create\' (the Phase 0 fix survived the consolidation)', () => {
+	const src = source();
+	const i = src.indexOf('// Pattern 4 (CRITICAL): Raw unfenced code detection');
 	if (i < 0) return 'Pattern 4 comment not found';
-	const blk = read(indexTs).slice(i, i + 500);
-	return blk.includes("mode !== 'create'") ? true : 'Pattern 4 is NOT gated';
+	const blk = src.slice(i, i + 1800)
+		.split(String.fromCharCode(10))
+		.map(l => l.replace(/\/\/.*/, ''))
+		.join(String.fromCharCode(10));
+	return !blk.includes("mode !== 'create'") ? true : 'the P4 create-mode guard is BACK';
 });
 
-check('P3 is genuinely gated on mode !== \'create\'', () => {
-	const i = read(indexTs).indexOf('// Pattern 3: Code fenced block');
+check('P3 is NOT gated on mode !== \'create\' (the Phase 0 fix survived the consolidation)', () => {
+	const src = source();
+	const i = src.indexOf('// Pattern 3: Code fenced block');
 	if (i < 0) return 'Pattern 3 comment not found';
-	const blk = read(indexTs).slice(i, i + 400);
-	return blk.includes("mode !== 'create'") ? true : 'Pattern 3 is NOT gated';
+	const blk = src.slice(i, i + 1800)
+		.split(String.fromCharCode(10))
+		.map(l => l.replace(/\/\/.*/, ''))
+		.join(String.fromCharCode(10));
+	return !blk.includes("mode !== 'create'") ? true : 'the P3 create-mode guard is BACK';
 });
 
 check('no token-cap comparison exists (truncation is silent)', () => {

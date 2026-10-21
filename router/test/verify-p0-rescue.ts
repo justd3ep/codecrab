@@ -215,9 +215,19 @@ check('prose is rejected by the rescue path', () =>
 		? true
 		: `prose was rescued as ${prose.map(e => e.path).join(', ')} — a false positive`);
 
-console.log('\n=== 5. the guards are actually gone from src/index.ts ===');
+console.log('\n=== 5. the guards are actually gone from the source ===');
 
-const src = fs.readFileSync(path.join(ROUTER_ROOT, 'src', 'index.ts'), 'utf8');
+// The extraction implementation moved from src/index.ts into
+// src/generation/pipelineHelpers.ts, so the Pattern 3 / Pattern 4 blocks
+// are looked up in BOTH files. The test does not care where the
+// implementation lives — only that the guards are gone.
+const SOURCE_FILES = [
+	path.join(ROUTER_ROOT, 'src', 'index.ts'),
+	path.join(ROUTER_ROOT, 'src', 'generation', 'pipelineHelpers.ts'),
+];
+const src = SOURCE_FILES
+	.map(f => fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '')
+	.join('\n');
 const p3Idx = src.indexOf('// Pattern 3: Code fenced block');
 const p4Idx = src.indexOf('// Pattern 4 (CRITICAL): Raw unfenced code detection');
 

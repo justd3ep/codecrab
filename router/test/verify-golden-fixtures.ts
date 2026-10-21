@@ -21,6 +21,7 @@
  * expectation asserts nothing, and would let a regression through.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
@@ -110,14 +111,36 @@ for (const file of fixtureFiles) {
 		// produce nothing (prose, an explanation). But it is only
 		// meaningful if the fixture SAYS so — otherwise a fixture whose
 		// extraction silently broke to zero would look fine.
-		const n = fixture.expect?.create?.length ?? 0;
-		if (n > 0) return true;
+		//
+		// Two shapes are accepted:
+		//   expect.create[]                    the workspace-independent form
+		//   expect.withWorkspace[]             the workspace-dependent form
+		const std = fixture.expect?.create?.length ?? 0;
+		const ws = fixture.expect?.withWorkspace?.length ?? 0;
+		if (std > 0 || ws > 0) return true;
 		return fixture.expectNoFiles === true
 			? true
-			: 'the create-mode expectation is empty and the fixture is not labelled `expectNoFiles`';
+			: 'the expectation is empty and the fixture is not labelled `expectNoFiles`';
 	});
 
 	// ── the actual assertions ──────────────────────────────────────────
+	//
+	// A fixture may have two shapes:
+	//
+	//   expect.create / expect.edit / expect.onlyClosed
+	//     the workspace-independent extraction
+	//
+	//   expect.withWorkspace / expect.withoutWorkspace
+	//     the workspace-DEPENDENT extraction, used by the raw-code-p4
+	//     fixture. Pattern 4 only runs when a workspace is given, so
+	//     these are the only assertions that cover it.
+	//
+	// A fixture with neither shape asserts nothing, so it is rejected
+	// above.
+	const hasStandardShape = Array.isArray(fixture.expect?.create);
+	const hasWorkspaceShape = Array.isArray(fixture.expect?.withWorkspace);
+
+	if (hasStandardShape) {
 	for (const mode of ['create', 'edit'] as const) {
 		check(`${name}: ${mode} mode extracts the same files`, () => {
 			const actual = extractFallbackEdits(
@@ -153,6 +176,40 @@ for (const file of fixtureFiles) {
 		const e = expected.map(x => x.path).join(', ');
 		return a === e ? true : `paths differ — expected [${e}], got [${a}]`;
 	});
+	} // end if (hasStandardShape)
+
+	// ── the WORKSPACE-aware fixture ───────────────────────────────────
+	//
+	// Pattern 4 (the raw-code rescue) is guarded by
+	// `edits.length === 0 && workspaceRoot`. Every other fixture calls
+	// the extractor with workspaceRoot UNDEFINED, so Pattern 4 never
+	// ran — a regression in the raw-code rescue would have passed every
+	// test. This fixture is the one that exercises it.
+	if (hasWorkspaceShape) {
+		const WS = path.join(os.tmpdir(), `hermes-golden-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		fs.mkdirSync(path.join(WS, 'src'), { recursive: true });
+		try {
+			check(`${name}: WITH a workspace, the raw-code rescue still works`, () => {
+				const actual = extractFallbackEdits(
+					fixture.response, undefined, WS, undefined, 'create', false);
+				const expected = fixture.expect.withWorkspace as Array<{ path: string; content: string }>;
+				const a = actual.map(e => e.path).join(', ');
+				const e = expected.map(x => x.path).join(', ');
+				return a === e ? true : `paths differ — expected [${e}], got [${a}]`;
+			});
+
+			check(`${name}: WITHOUT a workspace, nothing is extracted`, () => {
+				const actual = extractFallbackEdits(
+					fixture.response, undefined, undefined, undefined, 'create', false);
+				const expected = fixture.expect.withoutWorkspace as Array<{ path: string; content: string }>;
+				const a = actual.map(e => e.path).join(', ');
+				const e = expected.map(x => x.path).join(', ');
+				return a === e ? true : `paths differ — expected [${e}], got [${a}]`;
+			});
+		} finally {
+			fs.rmSync(WS, { recursive: true, force: true });
+		}
+	}
 
 	// ── the fixture must be able to fail ───────────────────────────────
 	// A fixture that asserts nothing is worse than no fixture: it looks
@@ -165,13 +222,26 @@ for (const file of fixtureFiles) {
 		// files gains another, and one that expects none gains its first.
 		const mutated = fixture.response +
 			'\n<file path="src/__mutation_probe.tsx">\nexport const probe = 1;\n</file>\n';
-		const before = extractFallbackEdits(fixture.response, undefined, undefined, undefined, 'create', false)
-			.map(e => e.path).join('|');
-		const after = extractFallbackEdits(mutated, undefined, undefined, undefined, 'create', false)
-			.map(e => e.path).join('|');
-		return before !== after
-			? true
-			: 'the extraction did not change when a file block was appended — the fixture pins nothing';
+		// The workspace shape needs a workspace, or Pattern 4 never runs
+		// and the mutation would not be observed.
+		const WS2 = path.join(os.tmpdir(), `hermes-golden-mut-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		fs.mkdirSync(path.join(WS2, 'src'), { recursive: true });
+		try {
+			const run = (text: string, ws?: string) =>
+				extractFallbackEdits(text, undefined, ws, undefined, 'create', false)
+					.map(e => e.path).join('|');
+			const before = hasWorkspaceShape
+				? run(fixture.response, WS2)
+				: run(fixture.response);
+			const after = hasWorkspaceShape
+				? run(mutated, WS2)
+				: run(mutated);
+			return before !== after
+				? true
+				: 'the extraction did not change when a file block was appended — the fixture pins nothing';
+		} finally {
+			fs.rmSync(WS2, { recursive: true, force: true });
+		}
 	});
 }
 

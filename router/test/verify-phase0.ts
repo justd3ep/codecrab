@@ -35,7 +35,16 @@ function check(name: string, fn: () => true | string): void {
 	}
 }
 
-const indexSrc = fs.readFileSync(path.join(ROUTER, 'src', 'index.ts'), 'utf8');
+// The extraction implementation moved from src/index.ts into
+// src/generation/pipelineHelpers.ts. The pattern blocks are looked up
+// in BOTH files, so the test does not care where the implementation
+// lives — only that the behaviour is right.
+const indexSrc = [
+	path.join(ROUTER, 'src', 'index.ts'),
+	path.join(ROUTER, 'src', 'generation', 'pipelineHelpers.ts'),
+]
+	.map(f => fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '')
+	.join('\n');
 const validatorSrc = fs.readFileSync(path.join(ROUTER, 'src', 'validator.ts'), 'utf8');
 const configSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'config.local.ts'), 'utf8');
 

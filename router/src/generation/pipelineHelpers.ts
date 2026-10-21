@@ -99,7 +99,11 @@ export function extractFallbackEdits(text: string, openFiles?: string[], workspa
 	const edits: FallbackEdit[] = [];
 	const seenPaths = new Set<string>();
 
+	// =====================================================================
 	// Pattern 0: <file path="relative/path.ext">content</file>
+	// This is the primary output protocol instructed in agent.md.
+	// Uses split-based parsing to handle both closed and truncated blocks.
+	// =====================================================================
 	if (/<file\s+path=["'][^"']+["']\s*>/i.test(text)) {
 		console.log(`[Router] Pattern 0: <file> tags detected, parsing...`);
 		const openTagRegex = /<file\s+path=["']([^"']+)["']\s*>/gi;
@@ -117,17 +121,24 @@ export function extractFallbackEdits(text: string, openFiles?: string[], workspa
 			const tag = openTags[i]!;
 			const afterTag = tag.tagEnd;
 
+			// Determine the end of this block's content:
+			// 1. A </file> closing tag for this block
+			// 2. The start of the next <file> opening tag
+			// 3. End of text (truncated output)
 			let endIndex = text.length;
 			const remainingText = text.substring(afterTag);
 
+			// Look for </file> before the next <file> tag
 			const closeMatch = remainingText.match(/<\/file>/i);
 			const nextOpenMatch = i + 1 < openTags.length ? openTags[i + 1]!.startIndex : text.length;
 
 			let hasClosingTag = false;
 			if (closeMatch && (afterTag + closeMatch.index!) < nextOpenMatch) {
+				// Found a </file> that belongs to this block
 				endIndex = afterTag + closeMatch.index!;
 				hasClosingTag = true;
 			} else {
+				// No </file> found before next block or end — truncated
 				endIndex = nextOpenMatch;
 			}
 
@@ -148,8 +159,12 @@ export function extractFallbackEdits(text: string, openFiles?: string[], workspa
 		}
 	}
 
+	// If Pattern 0 found any edits, return immediately — skip all other fallback patterns
 	if (edits.length > 0) {
 		console.log(`[Router] Pattern 0: ${edits.length} file block(s) extracted. Bypassing P1–P4.`);
+		return edits;
+	}
+	if (onlyClosed) {
 		return edits;
 	}
 	console.log(`[Router] Pattern 0: no <file> blocks detected. Falling through to P1–P4.`);
@@ -178,27 +193,52 @@ export function extractFallbackEdits(text: string, openFiles?: string[], workspa
 	}
 
 	// Pattern 3: Code fenced block — any ```lang ... ```
-	if (mode !== 'create') {
+	//
+	// Previously gated on `mode !== 'create'`. That gate is what caused the
+	// dashboard failure: the FE model emitted raw code with NO fences and NO
+	// <file> tags, so Pattern 0 found nothing, Pattern 3 was disabled, and
+	// Pattern 4 was also disabled — the whole response was discarded and the
+	// run was reported as success.
+	//
+	// The rescue patterns must be available in create mode too. A fenced
+	// block in a create response is still code worth keeping.
+	{
 		const p3f = /```(?:jsx|tsx|javascript|js|typescript|ts|css|html|vue|svelte|json|sh|bash)\r?\n([\s\S]+?)```/g;
 		while ((match = p3f.exec(text)) !== null) {
 			const code = match[1]!.trim();
-			if (code.length > 30 && !seenPaths.size) {
+			// > 30 chars of content, and the inferred path must not already
+			// be taken — a second React block would infer the same path and
+			// is correctly dropped rather than clobbering the first.
+			if (code.length > 30) {
 				const targetPath = inferFilePath(code, openFiles, workspaceRoot, userPrompt);
 				if (targetPath && !seenPaths.has(targetPath)) {
 					seenPaths.add(targetPath);
 					edits.push({ path: targetPath, content: code });
+					console.log(`[Router] Pattern 3: fenced block → "${targetPath}" (${code.length} chars)`);
 				}
 			}
 		}
 	}
 
-	// Pattern 4: Raw unfenced code detection
-	if (edits.length === 0 && workspaceRoot && mode !== 'create') {
+	// Pattern 4 (CRITICAL): Raw unfenced code detection
+	// The Qwen models output raw code without any code fences or tool tags.
+	// Detect if the response IS code by checking for structural markers.
+	//
+	// Previously gated on `mode !== 'create'`. Disabled here, it was the
+	// single reason a fully-written dashboard was thrown away. The gate was
+	// presumably intended for edit mode (where a fragment is not a whole
+	// file), but in create mode a code response with no wrapper is exactly
+	// the case this pattern exists to handle.
+	//
+	// extractRawCode() already rejects prose (it requires a >= 0.6 code-line
+	// ratio and a > 30 char body), so enabling it is safe: an explanation
+	// with no code in it will not match.
+	if (edits.length === 0 && workspaceRoot) {
 		const code = extractRawCode(text);
 		if (code && code.length > 30) {
 			const targetPath = inferFilePath(code, openFiles, workspaceRoot, userPrompt);
 			if (targetPath) {
-				console.log(`[Router] Fallback P4: detected raw unfenced code → ${targetPath}`);
+				console.log(`[Router] Fallback P4: detected raw unfenced code → ${targetPath} (${code.length} chars)`);
 				edits.push({ path: targetPath, content: code });
 			}
 		}

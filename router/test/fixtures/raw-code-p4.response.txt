@@ -1,0 +1,11 @@
+import React, { useState } from 'react';
+import { TaskCard } from './components/TaskCard';
+
+export default function App() {
+  const [tasks, setTasks] = useState([]);
+  return (
+    <div className="min-h-screen bg-slate-50 p-8">
+      <TaskCard tasks={tasks} onChange={setTasks} />
+    </div>
+  );
+}

@@ -146,7 +146,43 @@ function findFunctionEnd(src: string, openBraceIndex: number): number {
  * Strip the TypeScript-only syntax so the function can be evaluated as
  * plain JavaScript.
  */
+/**
+ * Remove comments from a function body, preserving the line structure.
+ *
+ * THE BUG THIS PREVENTS
+ *
+ * The type-stripper ran over COMMENTS. A comment can look like
+ * TypeScript:
+ *
+ *     // If >60% of lines look like code, treat entire text as code
+ *
+ * The `as Type` cast rule matched the words " as code" and removed
+ * them, which merged the comment with the next line and destroyed the
+ * declaration that followed:
+ *
+ *     // ...treat entire text= codeLines.length / totalNonEmpty;
+ *
+ * The function then referenced an undefined variable at runtime.
+ *
+ * A comment can never change a function's behaviour, so removing it
+ * first is safe — and it removes the whole class of "prose that looks
+ * like code" bugs.
+ *
+ * Newlines are preserved, and a block comment's content is replaced
+ * with spaces so it cannot join two tokens together.
+ */
+function stripComments(src: string): string {
+	return src
+		.replace(/\/\*[\s\S]*?\*\//g, m => m.replace(/[^\n]/g, ' '))
+		.replace(/\/\/[^\n]*/g, '');
+}
+
 function stripTypes(src: string): string {
+	// Comments go FIRST. A comment can look like TypeScript (the words
+	// " as code" in a prose comment match the cast rule), and stripping
+	// types out of a comment can destroy the declaration that follows
+	// it. See stripComments() for the full story.
+	src = stripComments(src);
 	return src
 		// An optional parameter: `openFiles?: string[]` -> `openFiles`.
 		.replace(/([A-Za-z_$][\w$]*)\?\s*:\s*[A-Za-z_$][\w$<>[\]|,\s]*?(?=\s*[,)=])/g, '$1')
@@ -160,9 +196,9 @@ function stripTypes(src: string): string {
 		// A generic type argument: `new Set<string>()`.
 		.replace(/<[A-Za-z_$][\w$<>[\]|,\s]*?>\s*\(/g, '(')
 		// A local with an OBJECT type: `const t: { path: string }[] = []`.
-		.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*\{[^{}]*\}\s*(\[\])?\s*=/g, '$1 $2 =')
+		.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*\{[^{}\r\n]*\}\s*(\[\])?\s*=/g, '$1 $2 =')
 		// A local annotation: `const s: string =` / `let n: number =`.
-		.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*[^=;]+=/g, '$1 $2 =')
+		.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*[^=;\r\n]+=/g, '$1 $2 =')
 		// A trailing return annotation: `): string {`.
 		.replace(/\)\s*:\s*[A-Za-z_$][\w$<>\[\]|,\s]*\s*\{/g, ') {');
 }

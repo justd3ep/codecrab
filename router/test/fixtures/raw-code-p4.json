@@ -1,0 +1,16 @@
+{
+  "name": "raw-code-p4",
+  "capturedAt": "2026-10-21",
+  "synthetic": false,
+  "note": "A raw-code response with no <file> tags and no fence. Pattern 4 (the raw-code rescue) must recover it WHEN A WORKSPACE IS GIVEN, and must extract NOTHING without one. This fixture exists because the earlier ones never exercised Pattern 4 \u2014 they called the extractor with workspaceRoot undefined, so a regression in the raw-code rescue would have passed every test.",
+  "response": "import React, { useState } from 'react';\nimport { TaskCard } from './components/TaskCard';\n\nexport default function App() {\n  const [tasks, setTasks] = useState([]);\n  return (\n    <div className=\"min-h-screen bg-slate-50 p-8\">\n      <TaskCard tasks={tasks} onChange={setTasks} />\n    </div>\n  );\n}\n",
+  "expect": {
+    "withWorkspace": [
+      {
+        "path": "src/App.jsx",
+        "content": "import React, { useState } from 'react';\r\nimport { TaskCard } from './components/TaskCard';\r\n\r\nexport default function App() {\r\n  const [tasks, setTasks] = useState([]);\r\n  return (\r\n    <div className=\"min-h-screen bg-slate-50 p-8\">\r\n      <TaskCard tasks={tasks} onChange={setTasks} />\r\n    </div>\r\n  );\r\n}"
+      }
+    ],
+    "withoutWorkspace": []
+  }
+}
