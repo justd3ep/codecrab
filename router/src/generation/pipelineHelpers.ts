@@ -350,6 +350,36 @@ export function validateJsxSymbols(
 	return issues;
 }
 
+export function buildNoOutputPrompt(mode: AgentMode): string {
+const contract = `You did not output any file blocks. Your previous response could not be parsed.
+
+Output EVERY file as a complete block using exactly this format:
+<file path="src/Component.tsx">
+...the complete file content...
+</file>
+
+Rules:
+  - Every file MUST be wrapped in <file path="...">...</file>.
+  - Do NOT wrap the code in markdown fences.
+  - Do NOT add explanations, commentary, or prose before or after the blocks.
+  - Emit the COMPLETE file, not a fragment.
+  - Emit ALL requested files, not just the first one.`;
+
+if (mode === 'edit') {
+return `${contract}
+
+<validation_errors>
+No file blocks were found in your previous response. Re-emit the edited file(s) using the <file path="..."> format.
+</validation_errors>`;
+}
+
+return `${contract}
+
+<validation_errors>
+No file blocks were found in your previous response. Re-emit ALL requested files using the <file path="..."> format.
+</validation_errors>`;
+}
+
 export function buildJsxRepairPrompt(issues: JsxSymbolIssue[]): string {
 	const byFile = new Map<string, JsxSymbolIssue[]>();
 	for (const iss of issues) {
