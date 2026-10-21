@@ -58,6 +58,14 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-loader.ts',
 		what: 'the loader imports the real modules',
 	},
+	{
+		file: 'verify-parity-execute-toolcall.ts',
+		what: 'the parity of the executeToolCall consolidation',
+	},
+	{
+		file: 'verify-parity-execute-toolcall-mutation.ts',
+		what: 'the executeToolCall parity test catches every mutation',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
