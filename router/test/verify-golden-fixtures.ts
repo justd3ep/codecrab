@@ -54,14 +54,14 @@ function check(name: string, fn: () => true | string): void {
  */
 const captureModule = await import(
 	pathToFileURL(path.join(HERE, 'capture-fixture.ts')).href
-) as { loadAll?: () => { extractFallbackEdits: (t: string, o?: string[], w?: string, u?: string, m?: string, oc?: boolean) => Array<{ path: string; content: string }> } };
+) as { loadAll?: () => Promise<{ extractFallbackEdits: (t: string, o?: string[], w?: string, u?: string, m?: string, oc?: boolean) => Array<{ path: string; content: string }> }> };
 
 if (typeof captureModule.loadAll !== 'function') {
 	console.error('FATAL: capture-fixture.ts does not export loadAll()');
 	process.exit(2);
 }
 
-const { extractFallbackEdits } = captureModule.loadAll();
+const { extractFallbackEdits } = await captureModule.loadAll();
 
 // ── the fixtures ────────────────────────────────────────────────────────
 const fixtureFiles = fs.existsSync(FIXTURES)

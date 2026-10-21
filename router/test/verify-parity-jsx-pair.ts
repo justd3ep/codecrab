@@ -162,46 +162,19 @@ console.log('\n=== 6. the prompt BEHAVIOUR: it handles every kind ===');
 /**
  * Load the prompt builder from the module and CALL it.
  *
- * The type-stripper is the loader's own, imported from
- * capture-fixture.ts — one stripper, not two.
+ * The module is imported DIRECTLY — the real implementation, not a
+ * copy. So the prompt this test exercises is exactly the prompt the
+ * router sends to the model.
  */
 async function loadPromptBuilder(): Promise<(issues: any[]) => string> {
 	const mod = await import(
 		pathToFileURL(path.join(ROUTER, 'test', 'capture-fixture.ts')).href
-	) as { loadFunction?: (file: string, name: string) => (...a: any[]) => any };
+	) as { loadFunction?: (file: string, name: string) => Promise<(...a: any[]) => any> };
 
-	if (typeof mod.loadFunction === 'function') {
-		return mod.loadFunction('src/generation/pipelineHelpers.ts', 'buildJsxRepairPrompt');
+	if (typeof mod.loadFunction !== 'function') {
+		throw new Error('capture-fixture.ts does not export loadFunction()');
 	}
-
-	// Fall back to a local stripper.
-	const src = helpersSrc;
-	const m = /export function buildJsxRepairPrompt\s*\(/.exec(src);
-	if (!m) throw new Error('buildJsxRepairPrompt not found in the module');
-	const paren = src.indexOf('(', m.index + m[0].length - 1);
-	let depth = 0, i = paren;
-	for (; i < src.length; i++) {
-		if (src[i] === '(') depth++;
-		else if (src[i] === ')') { depth--; if (depth === 0) break; }
-	}
-	const brace = src.indexOf('{', i);
-	depth = 0;
-	let end = -1;
-	for (let j = brace; j < src.length; j++) {
-		if (src[j] === '{') depth++;
-		else if (src[j] === '}') { depth--; if (depth === 0) { end = j + 1; break; } }
-	}
-	if (end < 0) throw new Error('could not find the end of the prompt builder');
-	let body = src.slice(m.index, end)
-		.replace(/^export\s+/m, '')
-		.replace(/\/\*[\s\S]*?\*\//g, c => c.replace(/[^\n]/g, ' '))
-		.replace(/\/\/[^\n]*/g, '')
-		.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*\{[^{}\r\n]*\}\s*(\[\])?\s*=/g, '$1 $2 =')
-		.replace(/\b(const|let|var)\s+([A-Za-z_$][\w$]*)\s*:\s*[^=;\r\n]+=/g, '$1 $2 =')
-		.replace(/\)\s*:\s*[A-Za-z_$][\w$<>[\]|,\s]*\s*\{/g, ') {')
-		.replace(/\b(issues)\s*:\s*JsxSymbolIssue\[\]/g, '$1');
-	// eslint-disable-next-line no-new-func
-	return new Function(body + '\nreturn buildJsxRepairPrompt;')();
+	return await mod.loadFunction('src/generation/pipelineHelpers.ts', 'buildJsxRepairPrompt');
 }
 
 const buildPrompt = await loadPromptBuilder();

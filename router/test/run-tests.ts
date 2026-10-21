@@ -54,6 +54,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-parity-jsx-pair-mutation.ts',
 		what: 'the JSX pair parity test catches every mutation',
 	},
+	{
+		file: 'verify-loader.ts',
+		what: 'the loader imports the real modules',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
