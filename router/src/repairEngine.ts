@@ -501,6 +501,7 @@ export function buildTargetedRepairPrompt(
 	const wsModules = workspaceRoot ? collectWorkspaceModules(workspaceRoot, generatedFiles) : new Map();
 	const existingModuleList = [...wsModules.keys()].sort().slice(0, 20);
 
+	// Group issues → RepairMode → instructions
 	type RepairGroup = { mode: RepairMode; issues: ValidationIssue[] };
 	const groups = new Map<RepairMode, ValidationIssue[]>();
 	for (const iss of errors) {
@@ -511,6 +512,7 @@ export function buildTargetedRepairPrompt(
 
 	const lines: string[] = ['<repair_instructions>'];
 
+	// ── Project State ─────────────────────────────────────────────────────────
 	lines.push('## Project State', '');
 	if (existingModuleList.length > 0) {
 		lines.push('### Existing Modules (DO NOT duplicate)');
@@ -523,6 +525,7 @@ export function buildTargetedRepairPrompt(
 		lines.push('');
 	}
 
+	// ── Expected Layer Graph ──────────────────────────────────────────────────
 	lines.push(
 		'## Expected Dependency Graph',
 		'  Routes → Controllers → Services → Repositories → Models/Database',
@@ -530,11 +533,14 @@ export function buildTargetedRepairPrompt(
 		'',
 	);
 
+	// ── Repair Instructions by Mode ───────────────────────────────────────────
 	lines.push('## Repair Instructions', '');
 
+	// MODIFY_EXISTING — rewrite specific files
 	const modifyIssues = groups.get(RepairMode.MODIFY_EXISTING) ?? [];
 	if (modifyIssues.length > 0) {
 		lines.push('### MODIFY (rewrite existing files — do NOT create new parallel implementations)');
+		// Group by file
 		const byFile = new Map<string, ValidationIssue[]>();
 		for (const iss of modifyIssues) {
 			const key = iss.file ?? 'unknown';
@@ -549,11 +555,13 @@ export function buildTargetedRepairPrompt(
 		lines.push('');
 	}
 
+	// GENERATE_MISSING — only truly missing files
 	const genIssues = groups.get(RepairMode.GENERATE_MISSING) ?? [];
 	if (genIssues.length > 0) {
 		lines.push('### GENERATE (create ONLY these missing files — no other new files)');
 		for (const iss of genIssues) {
 			lines.push(`  - ${iss.message}`);
+			// If related files need updating, list them
 			if (iss.file && fileExists(iss.file, generatedSet, workspaceRoot)) {
 				lines.push(`    → Also update imports in: ${iss.file}`);
 			}
@@ -561,6 +569,7 @@ export function buildTargetedRepairPrompt(
 		lines.push('');
 	}
 
+	// REWIRE_IMPORTS — fix imports in existing files
 	const rewireIssues = groups.get(RepairMode.REWIRE_IMPORTS) ?? [];
 	if (rewireIssues.length > 0) {
 		lines.push('### REWIRE IMPORTS (fix import paths — do not restructure logic)');
@@ -571,6 +580,7 @@ export function buildTargetedRepairPrompt(
 		lines.push('');
 	}
 
+	// DELETE_DUPLICATES — remove or consolidate
 	const deleteIssues = groups.get(RepairMode.DELETE_DUPLICATES) ?? [];
 	if (deleteIssues.length > 0) {
 		lines.push('### CONSOLIDATE (remove duplicate logic — reuse existing modules)');
@@ -581,6 +591,7 @@ export function buildTargetedRepairPrompt(
 		lines.push('');
 	}
 
+	// SECURITY_FIX
 	const secIssues = groups.get(RepairMode.SECURITY_FIX) ?? [];
 	if (secIssues.length > 0) {
 		lines.push('### SECURITY FIXES (patch existing files only)');
@@ -590,22 +601,17 @@ export function buildTargetedRepairPrompt(
 		lines.push('');
 	}
 
+	// COMPILE_FIX
 	const compileIssues = groups.get(RepairMode.COMPILE_FIX) ?? [];
 	if (compileIssues.length > 0) {
-		lines.push('### COMPILE ERRORS (fix type errors in these files)');
-		const byFile = new Map<string, ValidationIssue[]>();
+		lines.push('### COMPILE ERRORS (fix type errors — do not restructure)');
 		for (const iss of compileIssues) {
-			const key = iss.file ?? 'unknown';
-			if (!byFile.has(key)) byFile.set(key, []);
-			byFile.get(key)!.push(iss);
-		}
-		for (const [file, fileIssues] of byFile) {
-			lines.push(`  MODIFY: ${file}`);
-			fileIssues.forEach(i => lines.push(`    - ${i.message}`));
+			lines.push(`  - ${iss.file ?? ''}: ${iss.message}`);
 		}
 		lines.push('');
 	}
 
+	// ── Output Rules ─────────────────────────────────────────────────────────
 	lines.push(
 		'## Output Rules',
 		'  1. Use <file path="...">...</file> format for ALL output files.',
@@ -621,14 +627,10 @@ export function buildTargetedRepairPrompt(
 	return lines.join('\n');
 }
 
-/**
-	* buildPlainStackRepairPrompt — repair prompt for PLAIN HTML / CSS / JS work.
-	*
-	* The React repair prompt talks about src/App.tsx, React hooks and component
-	* imports. Feeding that to a model that was asked for a single vanilla HTML
-	* file pushes it back into React. This variant keeps the same error list but
-	* only talks in terms of the requested artifact.
-	*/
+
+// ---------------------------------------------------------------------------
+// Suppress known harmless llama.cpp native stderr noise
+// ---------------------------------------------------------------------------
 export function buildPlainStackRepairPrompt(
 	issues: ValidationIssue[],
 	targetFile: string = 'index.html',
