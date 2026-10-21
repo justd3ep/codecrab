@@ -43,6 +43,11 @@ const gitSrc = fs.readFileSync(path.join(ROUTER, 'src', 'gitHarness.ts'), 'utf8'
 const cfgSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'config.local.ts'), 'utf8');
 const cfgTypesSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'types.ts'), 'utf8');
 
+/** Read a source file relative to the router root. */
+function read(rel: string): string {
+	return fs.readFileSync(path.join(ROUTER, rel), 'utf8');
+}
+
 /** Strip comments so a doc string is never read as code. */
 function stripComments(src: string): string {
 	return src
@@ -202,18 +207,29 @@ check('/health reports the model resolution', () =>
 // ══════════════════════════════════════════════════════════════════════
 console.log('\n=== P1.7 — a create request cannot clobber the scaffold ===');
 
+// The guard lives in tools/scaffoldGuard.ts, and it is CALLED from the
+// live executeToolCall in tools/toolEngine.ts. The PROPERTY is what
+// matters, so the checks follow the code wherever it lives.
+const guardSrc = read('src/tools/scaffoldGuard.ts');
+const toolEngineSrc = read('src/tools/toolEngine.ts');
+
 check('SCAFFOLD_OWNED_FILES exists', () =>
-	indexLive.includes('SCAFFOLD_OWNED_FILES') ? true : 'the set is missing');
+	guardSrc.includes('SCAFFOLD_OWNED_FILES') ? true : 'the set is missing');
 
 check('the guard function exists', () =>
-	indexLive.includes('function wouldClobberScaffold') ? true : 'wouldClobberScaffold is missing');
+	guardSrc.includes('export function wouldClobberScaffold')
+		? true : 'wouldClobberScaffold is missing');
 
 check('the guard is applied before the write', () => {
-	const i = indexLive.indexOf('wouldClobberScaffold(relPath');
+	const i = toolEngineSrc.indexOf('wouldClobberScaffold(relPath');
 	if (i < 0) return 'the guard is not called';
-	const j = indexLive.indexOf('writeFileSync(resolvedPath, content', i);
+	const j = toolEngineSrc.indexOf('writeFileSync(resolvedPath, content', i);
 	return i < j ? true : 'the guard runs AFTER the write';
 });
+
+check('the live executeToolCall is the one in the module', () =>
+	!indexLive.includes('function executeToolCall(')
+		? true : 'index.ts still defines its own copy');
 
 check('the write call sites pass the create flag', () => {
 	const n = (indexLive.match(/readWriteMode,\s*rawAdvisorIntent\?\.startsWith\('create_'\)/g) ?? []).length;
@@ -221,8 +237,8 @@ check('the write call sites pass the create flag', () => {
 });
 
 check('src/App.tsx is NOT protected (the model must write it)', () => {
-	const i = indexLive.indexOf('const SCAFFOLD_OWNED_FILES');
-	const body = indexLive.slice(i, i + 1200);
+	const i = guardSrc.indexOf('const SCAFFOLD_OWNED_FILES');
+	const body = guardSrc.slice(i, i + 1200);
 	return !body.includes("'src/App.tsx'") ? true : 'App.tsx is protected — the model can never write it';
 });
 

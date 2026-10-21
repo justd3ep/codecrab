@@ -41,7 +41,9 @@ import { buildNoOutputPrompt } from './generation/pipelineHelpers.js';
 import { validateJsxSymbols, buildJsxRepairPrompt, type JsxSymbolIssue } from './generation/pipelineHelpers.js';
 import { parseAdvisorJson } from './routing/advisorJson.js';
 
-// ---------------------------------------------------------------------------
+import { wouldClobberScaffold } from './tools/scaffoldGuard.js';
+
+import { executeToolCall } from './tools/toolEngine.js';// ---------------------------------------------------------------------------
 // Constraint Parser — runs BEFORE advisor, highest priority
 // ---------------------------------------------------------------------------
 
@@ -73,48 +75,6 @@ const FRONTEND_ONLY_PATTERNS = [
 	/\bonly\s+(?:the\s+)?(?:frontend|ui)\b/i,
 	/\buse\s+mock\s+(?:data|api|functions)\b/i,
 ];
-
-/**
- * Files the SCAFFOLD owns. A model-authored version must not replace
- * them during a create request.
- *
- * The live check caught the model emitting a `<file path=".gitignore">`
- * block, which the router happily wrote over the scaffold's file. The
- * content was identical, so no harm — but a model that emitted a broken
- * `vite.config.ts` or `tsconfig.json` would break the project it had just
- * built.
- *
- * `package.json` and `init.sh` are NOT here: they go through a MERGE, not
- * a blind overwrite, which is the correct behaviour.
- *
- * `src/App.tsx` is deliberately absent: the model is supposed to write it
- * (the scaffold only creates a placeholder).
- */
-const SCAFFOLD_OWNED_FILES = new Set([
-	'.gitignore',
-	'index.html',
-	'vite.config.ts',
-	'vite.config.js',
-	'tsconfig.json',
-	'tailwind.config.js',
-	'tailwind.config.ts',
-	'postcss.config.js',
-	'src/main.tsx',
-	'src/main.jsx',
-	'src/style.css',
-]);
-
-/**
- * Should this write be blocked because it would overwrite a scaffold file?
- *
- * Only for CREATE requests. An edit request may legitimately need to
- * change vite.config.ts.
- */
-export function wouldClobberScaffold(relPath: string, isCreateRequest: boolean): boolean {
-	if (!isCreateRequest) return false;
-	const normalised = relPath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
-	return SCAFFOLD_OWNED_FILES.has(normalised);
-}
 
 function parseUserScope(msg: string): UserScope {
 	const isFullStack = /\bfull[\s-]?stack\b/i.test(msg) ||
@@ -2468,179 +2428,6 @@ function parseToolCall(text: string): { toolCall: ToolCallParsed; textBefore: st
 	return null;
 }
 
-function executeToolCall(
-	tool: ToolCallParsed,
-	workspaceRoot: string,
-	openFiles?: string[],
-	lastUserMsg?: string,
-	intent?: string,
-	readWriteMode?: 'read' | 'write',
-	/** True for a create request — the scaffold owns its config files. */
-	isCreateRequest?: boolean
-): ToolResult {
-	const resolvedPath = path.resolve(workspaceRoot, tool.arguments.path || '.');
-
-	// Security: ensure the path stays within the workspace
-	if (!resolvedPath.startsWith(path.resolve(workspaceRoot))) {
-		return { success: false, output: 'Error: path is outside the workspace boundary.' };
-	}
-
-	switch (tool.name) {
-		case 'listFiles': {
-			try {
-				const entries = fs.readdirSync(resolvedPath, { withFileTypes: true });
-				const skipDirs = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'out']);
-				const listing = entries
-					.filter(e => !skipDirs.has(e.name))
-					.sort((a, b) => {
-						if (a.isDirectory() && !b.isDirectory()) return -1;
-						if (!a.isDirectory() && b.isDirectory()) return 1;
-						return a.name.localeCompare(b.name);
-					})
-					.map(e => e.isDirectory() ? `${e.name}/` : e.name)
-					.join('\n');
-				return { success: true, output: listing || '(empty directory)' };
-			} catch (e: any) {
-				return { success: false, output: `Error listing directory: ${e.message}` };
-			}
-		}
-
-		case 'readFile': {
-			try {
-				const content = fs.readFileSync(resolvedPath, 'utf-8');
-				if (content.length > 100_000) {
-					return { success: true, output: `(file too large: ${(content.length / 1024).toFixed(0)}KB — showing first 2000 chars)\n${content.substring(0, 2000)}` };
-				}
-				return { success: true, output: content };
-			} catch (e: any) {
-				return { success: false, output: `Error reading file: ${e.message}` };
-			}
-		}
-
-		case 'writeFile': {
-			try {
-				// READ mode guard
-				if (readWriteMode === 'read') {
-					console.log(`[Router] READ mode — blocked write to: ${tool.arguments.path}`);
-					return { success: false, output: `[READ MODE] File write blocked. This is a read-only request. No files will be modified.` };
-				}
-
-				// Part A — path safety validation
-				const rawPathArg = tool.arguments.path || '';
-				const pathValidation = validateTargetPath(resolvedPath, workspaceRoot, rawPathArg);
-				if (!pathValidation.valid) {
-					console.log(`[Router] Path validation failed: ${pathValidation.error}`);
-					return { success: false, output: `Path Error: ${pathValidation.error}` };
-				}
-
-				let content = tool.arguments.content || '';
-				const validation = validateContentForExtension(resolvedPath, content, intent);
-				if (!validation.valid) {
-					return { success: false, output: `Validation Error: ${validation.error}` };
-				}
-
-				// Part B — actual disk write instead of staging
-				const oldContent = fs.existsSync(resolvedPath) ? fs.readFileSync(resolvedPath, 'utf-8') : '';
-				const relPath = path.relative(workspaceRoot, resolvedPath);
-				const dir = path.dirname(resolvedPath);
-				if (!fs.existsSync(dir)) {
-					fs.mkdirSync(dir, { recursive: true });
-				}
-
-				// Safe merging protection for package.json and init.sh
-				const baseName = path.basename(resolvedPath).toLowerCase();
-				if (baseName === 'package.json' && oldContent.trim()) {
-					try {
-						content = mergePackageJson(oldContent, content);
-						console.log(`[Writer] Merged package.json with existing dependencies`);
-					} catch (e: any) {
-						console.warn(`[Writer] Warning merging package.json: ${e?.message || e}`);
-					}
-				} else if (baseName === 'init.sh' && oldContent.trim()) {
-					try {
-						content = mergeInitSh(oldContent, content);
-						console.log(`[Writer] Merged init.sh with existing setup script`);
-					} catch (e: any) {
-						console.warn(`[Writer] Warning merging init.sh: ${e?.message || e}`);
-					}
-				}
-
-				// ─── Pipeline SHA trace (Stage 5–6) ───────────────────────────────
-				const sha = (s: string) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
-				const oldHash = sha(oldContent);
-				const newHash = sha(content);
-				const contentIdentical = oldHash === newHash;
-				console.log(`[Writer] ${relPath} | old=${oldHash} new=${newHash} same=${contentIdentical}`);
-				if (contentIdentical) {
-					console.warn(`[Writer] ⚠️ IDENTICAL CONTENT — LLM generated the same code as disk. No change will be visible.`);
-					console.log(`[Writer] Existing first 200: ${oldContent.slice(0, 200).replace(/\n/g, '␊')}`);
-					console.log(`[Writer] Generated first 200: ${content.slice(0, 200).replace(/\n/g, '␊')}`);
-				}
-
-				// ── P1.7: never let a create request clobber the scaffold ──────
-				if (wouldClobberScaffold(relPath, isCreateRequest === true)) {
-					console.warn(
-						`[Writer] ⛔ BLOCKED: "${relPath}" is scaffold-owned — the model's version was NOT written.`,
-					);
-					console.log(`[Writer] Scaffold version kept. Model's first 150: ${content.slice(0, 150).replace(/\n/g, '␊')}`);
-					// Report it, but keep going: the model's OTHER files still land.
-					return {
-						success: true,
-						output: `Skipped: ${relPath} is owned by the project scaffold and was left unchanged.`,
-					};
-				}
-
-				fs.writeFileSync(resolvedPath, content, 'utf-8');
-
-				// Stage 7: disk read-back verification
-				const diskContent = fs.readFileSync(resolvedPath, 'utf-8');
-				const diskHash = sha(diskContent);
-				if (diskHash !== newHash) {
-					console.error(`[Writer] ❌ DISK MISMATCH! written=${newHash} disk=${diskHash} — write failed silently!`);
-				} else {
-					console.log(`[Writer] ✓ Disk verified: ${diskHash}`);
-				}
-
-				// ─── Proper sequential line diff (not Set-based) ───────────────────────
-				const oldLines = oldContent ? oldContent.split('\n') : [];
-				const newLines = content.split('\n');
-				// LCS-based: count lines added/deleted vs positional old
-				let addedLines = 0;
-				let deletedLines = 0;
-				if (!contentIdentical) {
-					const maxLen = Math.max(oldLines.length, newLines.length);
-					for (let i = 0; i < maxLen; i++) {
-						const o = oldLines[i];
-						const n = newLines[i];
-						if (o === undefined) addedLines++;        // new file has more lines
-						else if (n === undefined) deletedLines++;  // old file has more lines
-						else if (o !== n) { addedLines++; deletedLines++; } // line changed
-					}
-				}
-
-				let diffMsg = '';
-				if (addedLines > 0 || deletedLines > 0) {
-					diffMsg = `\n\`\`\`diff\n`;
-					if (addedLines > 0) diffMsg += `+ ${addedLines} lines added\n`;
-					if (deletedLines > 0) diffMsg += `- ${deletedLines} lines deleted\n`;
-					diffMsg += `\`\`\`\n`;
-				} else {
-					diffMsg = `\n\`\`\`diff\n  (No changes — LLM generated identical content)\n\`\`\`\n`;
-				}
-
-				console.log(`[Router] ✏️ Written: ${relPath} (+${addedLines}/-${deletedLines} lines)`);
-				return { success: true, output: `WRITTEN:${relPath}`, diffMsg };
-			} catch (e: any) {
-				return { success: false, output: `Error staging file: ${e.message}` };
-			}
-		}
-
-		default:
-			return { success: false, output: `Unknown tool: ${tool.name}` };
-	}
-}
-
-/** Helper to send a JSON chunk to the SSE stream */
 function streamChunk(res: express.Response, content: string) {
 	res.write(JSON.stringify({ message: { content } }) + '\n');
 }

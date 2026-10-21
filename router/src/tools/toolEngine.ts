@@ -10,6 +10,7 @@ import path from 'path';
 import crypto from 'crypto';
 import { mergePackageJson, mergeInitSh } from '../frontendScaffold.js';
 
+import { wouldClobberScaffold } from './scaffoldGuard.js';
 // ---------------------------------------------------------------------------
 // Content Validation
 // ---------------------------------------------------------------------------
@@ -390,7 +391,9 @@ export function executeToolCall(
 	openFiles?: string[],
 	lastUserMsg?: string,
 	intent?: string,
-	readWriteMode?: 'read' | 'write'
+	readWriteMode?: 'read' | 'write',
+	/** True for a create request — the scaffold owns its config files. */
+	isCreateRequest?: boolean
 ): ToolResult {
 	const resolvedPath = path.resolve(workspaceRoot, tool.arguments.path || '.');
 
@@ -448,9 +451,6 @@ export function executeToolCall(
 				}
 
 				let content = tool.arguments.content || '';
-				if (/\.(tsx|jsx|ts|js)$/i.test(resolvedPath)) {
-					content = content.replace(/^(\s*['"]use client['"];?\s*\r?\n?)+/gi, '').trimStart();
-				}
 				const validation = validateContentForExtension(resolvedPath, content, intent);
 				if (!validation.valid) {
 					return { success: false, output: `Validation Error: ${validation.error}` };
@@ -494,6 +494,19 @@ export function executeToolCall(
 					console.log(`[Writer] Generated first 200: ${content.slice(0, 200).replace(/\n/g, '␊')}`);
 				}
 
+				// ── P1.7: never let a create request clobber the scaffold ──────
+				if (wouldClobberScaffold(relPath, isCreateRequest === true)) {
+					console.warn(
+						`[Writer] ⛔ BLOCKED: "${relPath}" is scaffold-owned — the model's version was NOT written.`,
+					);
+					console.log(`[Writer] Scaffold version kept. Model's first 150: ${content.slice(0, 150).replace(/\n/g, '␊')}`);
+					// Report it, but keep going: the model's OTHER files still land.
+					return {
+						success: true,
+						output: `Skipped: ${relPath} is owned by the project scaffold and was left unchanged.`,
+					};
+				}
+
 				fs.writeFileSync(resolvedPath, content, 'utf-8');
 
 				// Stage 7: disk read-back verification
@@ -508,6 +521,7 @@ export function executeToolCall(
 				// ─── Proper sequential line diff (not Set-based) ───────────────────────
 				const oldLines = oldContent ? oldContent.split('\n') : [];
 				const newLines = content.split('\n');
+				// LCS-based: count lines added/deleted vs positional old
 				let addedLines = 0;
 				let deletedLines = 0;
 				if (!contentIdentical) {
@@ -542,3 +556,5 @@ export function executeToolCall(
 			return { success: false, output: `Unknown tool: ${tool.name}` };
 	}
 }
+
+/** Helper to send a JSON chunk to the SSE stream */
