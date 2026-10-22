@@ -7,7 +7,9 @@
 
 import fs from 'fs';
 import path from 'path';
-import type { Response } from 'express';
+// The moved stream helpers use `express.Response` as a NAMESPACE,
+// so the namespace itself must be in scope.
+import type express from 'express';
 import type { AgentMode } from '../routing/agentMode.js';
 import { readFileSafe, inferFilePath } from '../tools/toolEngine.js';
 
@@ -699,7 +701,7 @@ export function extractRawCode(text: string): string | null {
 // Streaming & Pipeline Event Helpers
 // ---------------------------------------------------------------------------
 
-export function streamChunk(res: Response, content: string): void {
+export function streamChunk(res: express.Response, content: string) {
 	res.write(JSON.stringify({ message: { content } }) + '\n');
 }
 
@@ -714,7 +716,7 @@ export interface PipelineEvent {
 	model?: string;
 }
 
-export function streamEvent(res: Response, evt: PipelineEvent): void {
+export function streamEvent(res: express.Response, evt: PipelineEvent): void {
 	if (evt.type === 'context_usage') {
 		res.write(JSON.stringify({ type: 'context_usage', used: evt.used, total: evt.total, percent: evt.percent, model: evt.model }) + '\n');
 		return;

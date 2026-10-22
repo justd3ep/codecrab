@@ -37,8 +37,14 @@ export function shouldRunFrontend(opts: {
 	prompt: string;
 	beFilesWritten: string[];
 }): boolean {
-	if (promptNeedsFrontend(opts.prompt)) return true;
-	if (opts.intent === 'create_fullstack' || opts.intent === 'edit_fullstack' || opts.intent === 'general') return true;
+	// If the prompt contains any UI signals, we must run the frontend
+	if (promptNeedsFrontend(opts.prompt)) {
+		return true;
+	}
+	// Fallback for explicitly declared fullstack intents
+	if (opts.intent === 'create_fullstack' || opts.intent === 'edit_fullstack' || opts.intent === 'general') {
+		return true;
+	}
 	return false;
 }
 

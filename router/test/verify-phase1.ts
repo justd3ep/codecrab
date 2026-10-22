@@ -171,18 +171,18 @@ check('both advisor parsers use the tolerant parser', () => {
 console.log('\n=== P1.5 — the Advisor has room to finish its JSON ===');
 
 check('the advisor context is 4096', () =>
-	indexLive.includes('createContext({ contextSize: 4096 })') ? true : 'the context is still 2048');
+	intentClassifierSrc.includes('createContext({ contextSize: 4096 })') ? true : 'the context is still 2048');
 
 check('the output cap is 2000 chars, not 600', () => {
-	const m = indexLive.match(/raw\.length > (\d+)/);
+	const m = intentClassifierSrc.match(/raw\.length > (\d+)/);
 	return m && Number(m[1]) >= 2000 ? true : `the cap is ${m?.[1]}`;
 });
 
 check('the full raw output is logged, not a 150-char slice', () =>
-	!indexLive.includes("raw.trim().slice(0, 150)") ? true : 'the log still truncates to 150 chars');
+	!intentClassifierSrc.includes("raw.trim().slice(0, 150)") ? true : 'the log still truncates to 150 chars');
 
 check('hitting the cap is warned about', () =>
-	indexLive.includes('hitCap') ? true : 'a truncation is still silent');
+	intentClassifierSrc.includes('hitCap') ? true : 'a truncation is still silent');
 
 // ══════════════════════════════════════════════════════════════════════
 console.log('\n=== P1.6 — the model-path fallback is visible ===');

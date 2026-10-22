@@ -138,8 +138,9 @@ const MAX_TOTAL_CORRECTIONS = 5;
 async function runAdvisor(userRequest: string): Promise<AdvisorIntent | null>;
 async function runAdvisor(userRequest: string, v2: true): Promise<{ intent: AdvisorIntent | null; v2Result: AdvisorV2Result | null }>;
 async function runAdvisor(userRequest: string, v2 = false): Promise<any> {
-	const advisorModel = await mm.acquire('advisor');
-	return runAdvisorImpl(advisorModel, loadPrompt, userRequest, v2 as any);
+	// The current runAdvisor acquires the advisor model and loads the
+	// planner prompt itself. It used to take both as arguments.
+	return runAdvisorImpl(userRequest, v2 as any);
 }
 
 /**

@@ -461,8 +461,10 @@ export function collectWorkspaceModules(
 		result.get(mod)!.push({ layer, path: relPath });
 	}
 
+	// Generated files
 	for (const f of generatedFiles) addFile(f);
 
+	// Workspace files (shallow scan)
 	function scanDir(dir: string, depth = 0): void {
 		if (depth > 5) return;
 		try {

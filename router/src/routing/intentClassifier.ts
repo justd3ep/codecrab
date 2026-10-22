@@ -7,6 +7,8 @@
  */
 
 import path from 'path';
+import { mm } from '../models/legacyModelManager.js';
+import { loadPrompt } from '../prompts/promptBuilder.js';
 import type { LlamaModel } from 'node-llama-cpp';
 import type { AdvisorV2Result } from '../planner.js';
 import { parseAdvisorJson } from './advisorJson.js';
@@ -164,56 +166,60 @@ export function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: Adviso
 // ---------------------------------------------------------------------------
 
 /** Run the Advisor model pass (overloads). */
-export async function runAdvisor(
-	advisorModel: LlamaModel,
-	loadPrompt: (name: string) => string,
-	userRequest: string,
-): Promise<AdvisorIntent | null>;
-export async function runAdvisor(
-	advisorModel: LlamaModel,
-	loadPrompt: (name: string) => string,
-	userRequest: string,
-	v2: true,
-): Promise<{ intent: AdvisorIntent | null; v2Result: AdvisorV2Result | null }>;
-export async function runAdvisor(
-	advisorModel: LlamaModel,
-	loadPrompt: (name: string) => string,
-	userRequest: string,
-	v2 = false,
-): Promise<any> {
+export async function runAdvisor(userRequest: string): Promise<AdvisorIntent | null>;
+export async function runAdvisor(userRequest: string, v2: true): Promise<{ intent: AdvisorIntent | null; v2Result: AdvisorV2Result | null }>;
+export async function runAdvisor(userRequest: string, v2 = false): Promise<any> {
 	const systemPrompt = loadPrompt('planner');
 	if (!systemPrompt) {
 		console.warn('[Advisor] planner.md not found, skipping advisor pass.');
 		return v2 ? { intent: null, v2Result: null } : null;
 	}
 	try {
+		const advisorModel = await mm.acquire('advisor');
 		// 2048 ctx: ample room for system prompt (~400 tok), multi-paragraph user requests (~300 tok), and JSON output (~200 tok)
-		const advisorCtx = await advisorModel.createContext({ contextSize: 2048 });
+		// 4096 ctx: the planner prompt (~500 tok) + a long user request
+		// (~400 tok) + the full V2 JSON payload (~400 tok) fits comfortably.
+		// At 2048 the advisor ran out of room on detailed requests.
+		const advisorCtx = await advisorModel.createContext({ contextSize: 4096 });
 		const seq = advisorCtx.getSequence();
 
 		// Build Qwen3 chat template + /no_think to suppress chain-of-thought mode.
 		// Pre-filling <think>\n\n</think> forces the model to skip reasoning and output JSON directly.
 		const fullPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n<|im_start|>user\n${userRequest} /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n`;
 		const inputTokens = advisorModel.tokenize(fullPrompt);
-		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 2048`);
+		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 4096`);
 
+		// evaluate(inputTokens) both evals the prompt AND generates next tokens.
+		// The V2 payload is much larger than {"intent":"..."} — it carries
+		// framework, language, architecture, modules, requiredFeatures,
+		// estimatedFiles, confidence and generationStrategy.
 		let raw = '';
+		let hitCap = false;
 		const eosToken = advisorModel.tokens.eos;
 		for await (const token of seq.evaluate(inputTokens, { temperature: 0 })) {
 			const text = advisorModel.detokenize([token]);
 			raw += text;
 			if (token === eosToken) break;
+			// Stop when JSON is closed — simple heuristic
 			const depth = (raw.match(/\{/g) ?? []).length - (raw.match(/\}/g) ?? []).length;
 			if (depth <= 0 && raw.includes('{')) break;
-			if (raw.length > 600) break;
+			// Safety cap. 2000 chars fits the full V2 payload; the old 600
+			// cut it mid-array, which is what truncated the live-check run.
+			if (raw.length > 2000) { hitCap = true; break; }
 		}
 
-		console.log('[Advisor] Raw output:', raw.trim().slice(0, 150));
+		if (hitCap) {
+			console.warn(`[Advisor] Output hit the 2000-char cap — the JSON may be incomplete.`);
+		}
+		// Log the FULL output. The old 150-char slice hid the truncation.
+		console.log('[Advisor] Raw output:', raw.trim());
 		await advisorCtx.dispose();
 
 		if (v2) {
+			// Try V2 parse first (rich fields), fall back to V1 intent-only
 			const parsed = parseAdvisorV2(raw);
 			if (parsed) return { intent: parsed.intent, v2Result: parsed.v2 };
+			// V2 parse failed — try V1
 			const intentOnly = parseAdvisorIntent(raw);
 			return { intent: intentOnly, v2Result: intentOnly ? { intent: intentOnly } : null };
 		}
@@ -370,12 +376,16 @@ export async function runAdvisorLoopDecomposition(
 // ---------------------------------------------------------------------------
 
 export function inferPreviousRoute(messages: any[]): 'fe' | 'be' | null {
+	// Walk messages in reverse, find most recent assistant turn
 	for (let i = messages.length - 2; i >= 0; i--) {
 		const msg = messages[i];
 		if (msg?.role !== 'assistant') continue;
 		const content = msg?.content || '';
+		// Check for FE file patterns
 		if (/<file\s+path=["'][^"']*(\.(tsx|jsx|css|scss)|components\/|pages\/|hooks\/)[^"']*["']/i.test(content)) return 'fe';
+		// Check for BE file patterns
 		if (/<file\s+path=["'][^"']*(controller|service|middleware|repository|schema\.prisma|routes\/)[^"']*["']/i.test(content)) return 'be';
+		// Found an assistant message but no clear signal — stop
 		break;
 	}
 	return null;
@@ -423,5 +433,6 @@ export function scoreKeywords(msg: string): { feScore: number; beScore: number }
 }
 
 export function detectAppType(msg: string): boolean {
-	return /\b(app|application|platform|saas|clone|dashboard|tool|system|portal|suite|product)\b/i.test(msg);
+	const appNouns = /\b(app|application|platform|saas|clone|dashboard|tool|system|portal|suite|product)\b/i;
+	return appNouns.test(msg);
 }

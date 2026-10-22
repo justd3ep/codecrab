@@ -121,6 +121,7 @@ export interface PendingSession {
 }
 
 export function buildLCS(a: string[], b: string[]): Array<{ old: number; nw: number }> {
+	// Patience diff — find longest common subsequence via index matching
 	const bMap = new Map<string, number[]>();
 	for (let i = 0; i < b.length; i++) {
 		const key = b[i]!;
@@ -147,6 +148,7 @@ export function generateUnifiedDiff(oldContent: string | null, newContent: strin
 	const newLines = newContent.split('\n');
 	const header = `--- a/${relPath}\n+++ b/${relPath}\n`;
 
+	// Simple line-level diff (Myers-style via longest common subsequence)
 	const lcs = buildLCS(oldLines, newLines);
 	const hunks: string[] = [];
 	let ol = 0, nl = 0, lc = 0;
@@ -165,6 +167,7 @@ export function generateUnifiedDiff(oldContent: string | null, newContent: strin
 		}
 	}
 
+	// Group into hunks (context = 3 lines)
 	const CONTEXT = 3;
 	const changeIndices = changes.map((c, i) => c.type !== ' ' ? i : -1).filter(i => i >= 0);
 	if (changeIndices.length === 0) return header + '(no changes)';
@@ -244,6 +247,7 @@ export function applyPendingSession(session: PendingSession): { written: string[
  * Uses: open files, user prompt keywords, and code content analysis.
  */
 export function inferFilePath(code: string, openFiles?: string[], workspaceRoot?: string, userPrompt?: string): string {
+	// Try to determine from the code content
 	const isReact = /import\s+React|from\s+['"]react['"]|jsx|tsx|<\w+[\s/>]/.test(code);
 	const isHTML = /<!DOCTYPE|<html|<head|<body/.test(code);
 	const isCSS = /@media|@import|@keyframes|\.[\w-]+\s*\{|#[\w-]+\s*\{/.test(code) && !isReact;
@@ -266,6 +270,7 @@ export function inferFilePath(code: string, openFiles?: string[], workspaceRoot?
 
 	// 3. Determine from project structure if we have a workspace
 	if (workspaceRoot) {
+		// Check if src/ directory exists
 		const hasSrc = fs.existsSync(path.join(workspaceRoot, 'src'));
 		const prefix = hasSrc ? 'src/' : '';
 
@@ -275,7 +280,7 @@ export function inferFilePath(code: string, openFiles?: string[], workspaceRoot?
 		if (isReact) return `${prefix}App.jsx`;
 		if (isTS) return `${prefix}index.ts`;
 		if (isJS) return `${prefix}index.js`;
-		return `${prefix}App.jsx`;
+		return `${prefix}App.jsx`; // Default for code output
 	}
 
 	// 4. No workspace - best guess

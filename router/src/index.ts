@@ -1,4 +1,5 @@
 import express from 'express';
+import { mm } from './models/legacyModelManager.js';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
@@ -14,7 +15,7 @@ import { buildArtifactFromFiles, writeArtifact, deleteArtifact } from './rag/art
 import { runPostGenerationValidator } from './validator.js';
 import type { ValidationContract, ValidationIssue, GeneratedFile } from './validator.js';
 import { selectTopDependencyFiles, buildDependencyContextBlock } from './dependencySelector.js';
-import { buildFERepairPrompt, buildPlainStackRepairPrompt, buildTargetedRepairPrompt, classifyRepairMode, fileExists } from './repairEngine.js';
+import { buildFERepairPrompt, buildPlainStackRepairPrompt, buildTargetedRepairPrompt, classifyRepairMode, collectWorkspaceModules, fileExists } from './repairEngine.js';
 import { inspectWorkspace } from './workspaceInspector.js';
 import { buildExecutionGraph, nextPendingNode, isGraphComplete, graphSummary, markNodeFailed } from './planner.js';
 import type { AdvisorV2Result, ExecutionGraph } from './planner.js';
@@ -32,11 +33,11 @@ import { makeHealthRoutes } from './router/healthRoutes.js';
 import config from '@/config/index.js';
 import { activeContextUsage, updateContextUsage, setEffectiveContextSize, effectiveContextSize } from './telemetry/contextUsage.js';
 import { ensureFrontendScaffold, ensureBackendScaffold, mergePackageJson, mergeInitSh } from './frontendScaffold.js';
-import { classifyIntent, parseAdvisorIntent, parseAdvisorV2, runAdvisorLoopDecomposition, runAdvisorProjectSummary, scoreKeywords } from './routing/intentClassifier.js';
+import { classifyIntent, classifyOpenFile, detectAppType, detectBackendIntent, inferPreviousRoute, parseAdvisorIntent, parseAdvisorV2, runAdvisor, runAdvisorLoopDecomposition, runAdvisorProjectSummary, scoreKeywords } from './routing/intentClassifier.js';
 import { detectStackProfile } from './routing/stackProfile.js';
 import type { StackProfile } from './routing/stackProfile.js';
 import { diagnoseResponse, buildTruncationContinuationPrompt, buildProseOutputPrompt } from './generation/responseDiagnosis.js';
-import { cleanCodeBlock, detectRepetitionLoop, extractFallbackEdits, extractRawCode } from './generation/pipelineHelpers.js';
+import { cleanCodeBlock, detectRepetitionLoop, escapeRegExp, extractBackendSummary, extractFallbackEdits, extractRawCode, streamChunk, streamEvent } from './generation/pipelineHelpers.js';
 import { buildNoOutputPrompt } from './generation/pipelineHelpers.js';
 import { validateJsxSymbols, buildJsxRepairPrompt, type JsxSymbolIssue } from './generation/pipelineHelpers.js';
 import { parseAdvisorJson } from './routing/advisorJson.js';
@@ -46,8 +47,8 @@ import { determineMode } from './routing/agentMode.js';
 
 import { buildBESystemPrompt, buildFESystemPrompt, buildSystemPrompt, loadPrompt, workspaceHasTsx } from './prompts/promptBuilder.js';
 
-import { ensembleRoute } from './routing/ensembleRouter.js';
-import { executeToolCall } from './tools/toolEngine.js';
+import { ensembleRoute, isCreatePrompt, promptNeedsFrontend, shouldRunFrontend } from './routing/ensembleRouter.js';
+import { applyPendingSession, buildDirectoryTree, buildLCS, createPendingSession, executeToolCall, extractReferencedFiles, generateUnifiedDiff, inferFilePath, parseToolCall, readFileSafe, validateContentForExtension, validateTargetPath } from './tools/toolEngine.js';
 import { getAvailableModels, getCpuUsage } from './router/systemRoutes.js';
 import { buildPlannerContract } from './parsing/plannerContract.js';
 import { parseUserScope } from './parsing/constraintParser.js';
@@ -155,67 +156,7 @@ const enum RepairMode {
 
 
 
-/**
- * Scan workspace + generated files and return a map of:
- *   moduleName → { layer, relPath }[]
- * Used to prevent parallel implementations during repair.
- */
-function collectWorkspaceModules(
-	workspaceRoot: string,
-	generatedFiles: string[],
-): Map<string, { layer: string; path: string }[]> {
-	const result = new Map<string, { layer: string; path: string }[]>();
-	const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', 'out', '.git', '.next']);
 
-	const LAYER_SUFFIX_RE = /\.(service|controller|repository|router|routes?|middleware|guard|module|dto|entity|model|schema)\.[tj]sx?$/i;
-	const LAYER_DIR_RE = /\/(services?|controllers?|repositor|routes?|middleware|models?|dto|guards?)\//i;
-
-	function classifyFileLayer(p: string): string {
-		if (LAYER_DIR_RE.test(p)) {
-			const m = LAYER_DIR_RE.exec(p);
-			return m ? m[1]!.replace(/s$/, '').toLowerCase() : 'other';
-		}
-		if (LAYER_SUFFIX_RE.test(p)) {
-			const m = LAYER_SUFFIX_RE.exec(p);
-			return m ? m[1]!.toLowerCase() : 'other';
-		}
-		return 'other';
-	}
-
-	function extractMod(p: string): string | null {
-		const base = path.basename(p, path.extname(p))
-			.replace(/\.(service|controller|repository|router|routes?|middleware|guard|module|dto|entity|model|schema)$/i, '')
-			.toLowerCase().trim();
-		return base.length > 1 ? base : null;
-	}
-
-	function addFile(relPath: string): void {
-		const mod = extractMod(relPath);
-		const layer = classifyFileLayer(relPath);
-		if (!mod || layer === 'other') return;
-		if (!result.has(mod)) result.set(mod, []);
-		result.get(mod)!.push({ layer, path: relPath });
-	}
-
-	// Generated files
-	for (const f of generatedFiles) addFile(f);
-
-	// Workspace files (shallow scan)
-	function scanDir(dir: string, depth = 0): void {
-		if (depth > 5) return;
-		try {
-			const entries = fs.readdirSync(dir, { withFileTypes: true });
-			for (const e of entries) {
-				if (SKIP_DIRS.has(e.name)) continue;
-				if (e.isDirectory()) scanDir(path.join(dir, e.name), depth + 1);
-				else if (/\.(ts|tsx|js|jsx)$/.test(e.name)) addFile(path.relative(workspaceRoot, path.join(dir, e.name)));
-			}
-		} catch { /* ignore */ }
-	}
-	scanDir(workspaceRoot);
-
-	return result;
-}
 
 
 
@@ -257,119 +198,7 @@ const GPU_LAYERS: Record<string, number | 'auto'> = {
 // ---------------------------------------------------------------------------
 // ModelManager — exactly 0 or 1 model in VRAM at any time
 // ---------------------------------------------------------------------------
-const mm = new class ModelManager {
-	private llama: Llama | null = null;
-	private activeModel: LlamaModel | null = null;
-	private activeKey: string | null = null;
-	private loading = false;        // mutex: prevent concurrent loads
-	private idleTimer: ReturnType<typeof setTimeout> | null = null;
-
-	// fallback to auto discovery if configured path missing
-	private findModelFile(key: string): string | null {
-		// 1. Check explicit configuration
-		const cfgPath = key === 'advisor' ? config.models.advisor : (key === 'fe' ? config.models.frontend : config.models.backend);
-		if (cfgPath) {
-			if (fs.existsSync(cfgPath)) return cfgPath;
-			throw new Error(`Configuration Error: Configured model path for ${key} does not exist: ${cfgPath}`);
-		}
-
-		// 2. Fallback to auto-discovery
-		const BASE_MODELS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '../models/base');
-		if (!fs.existsSync(BASE_MODELS_DIR)) {
-			throw new Error(`Configuration Error: No configured path for ${key} and models/base directory missing.`);
-		}
-		const files = fs.readdirSync(BASE_MODELS_DIR).filter(f => f.endsWith('.gguf'));
-		if (key === 'advisor') {
-			const match = files.find(f => f.includes('advisor'));
-			return match ? path.join(BASE_MODELS_DIR, match) : null;
-		}
-		const match = files.find(f => f.includes(key) && !f.includes('advisor'));
-		return match ? path.join(BASE_MODELS_DIR, match) : null;
-	}
-
-	// Unload current model, free VRAM
-	private async unload(): Promise<void> {
-		if (!this.activeModel) return;
-		const key = this.activeKey;
-		console.log(`[ModelManager] Unloading model "${key}" — freeing VRAM...`);
-		try {
-			await this.activeModel.dispose();
-		} catch (e) {
-			console.error(`[ModelManager] Error disposing model "${key}": `, e);
-		}
-		this.activeModel = null;
-		this.activeKey = null;
-		console.log(`[ModelManager] Model "${key}" unloaded.`);
-	}
-
-	private resetIdleTimer(): void {
-		if (this.idleTimer) clearTimeout(this.idleTimer);
-		this.idleTimer = setTimeout(async () => {
-			console.log(`[ModelManager] Idle timeout. Unloading model...`);
-			await this.unload();
-		}, IDLE_UNLOAD_MS);
-	}
-
-	async init(): Promise<void> {
-		console.log(`[ModelManager] Initializing llama engine (no models pre-loaded)...`);
-		this.llama = await getLlama();
-		console.log(`[ModelManager] Engine ready. VRAM: 0 models loaded.`);
-	}
-
-	// Get model for intent — loads if needed, swaps if different model active
-	async acquire(intent: 'frontend' | 'backend' | 'general' | 'advisor'): Promise<LlamaModel> {
-		if (!this.llama) throw new Error('Engine not initialized.');
-
-		// Resolve key: advisor → 'advisor', frontend → 'fe', everything else → 'be'
-		const key = intent === 'advisor' ? 'advisor' : (intent === 'frontend' ? 'fe' : 'be');
-
-		// Already loaded — reset idle, return it
-		if (this.activeModel && this.activeKey === key) {
-			console.log(`[ModelManager] Model "${key}" already in VRAM.`);
-			this.resetIdleTimer();
-			return this.activeModel;
-		}
-
-		// Mutex: wait if another load in progress
-		if (this.loading) throw new Error('Model load already in progress. Retry.');
-		this.loading = true;
-
-		try {
-			// Unload current model first (VRAM swap)
-			if (this.activeModel) {
-				console.log(`[ModelManager] Swapping "${this.activeKey}" → "${key}"`);
-				await this.unload();
-				// Give CUDA driver ~500ms to fully reclaim pages before VRAM preflight
-				await new Promise(r => setTimeout(r, 500));
-			}
-
-			const modelPath = this.findModelFile(key);
-			if (!modelPath) throw new Error(`Model resolution failed for key "${key}"`);
-
-			const gpuLayers = GPU_LAYERS[key] ?? 'auto';
-			console.log(`[ModelManager] Loading "${key}" (gpuLayers=${gpuLayers}): ${modelPath}`);
-
-			this.activeModel = await this.llama!.loadModel({
-				modelPath,
-				gpuLayers,
-			});
-			this.activeKey = key;
-			console.log(`[ModelManager] Model "${key}" loaded. VRAM swap complete.`);
-			this.resetIdleTimer();
-			return this.activeModel;
-		} finally {
-			this.loading = false;
-		}
-	}
-
-	get status() {
-		return {
-			activeKey: this.activeKey,
-			loaded: this.activeModel !== null,
-			loading: this.loading,
-		};
-	}
-};
+;
 
 // Initialize on startup (engine only, no models loaded)
 mm.init().catch(e => console.error('[ModelManager] Init failed:', e));
@@ -410,15 +239,7 @@ function detectFrontendIntent(messages: any[]): boolean {
 	);
 }
 
-function detectBackendIntent(messages: any[]): boolean {
-	if (!messages || messages.length === 0) return false;
-	const lastMessage = messages[messages.length - 1]?.content || '';
-	return (
-		BE_DB_PATTERN.test(lastMessage) ||
-		BE_SERVER_PATTERN.test(lastMessage) ||
-		BE_AUTH_INFRA_PATTERN.test(lastMessage)
-	);
-}
+
 
 // ---------------------------------------------------------------------------
 // READ vs WRITE intent classifier
@@ -578,171 +399,30 @@ type AdvisorIntent =
 
 
 
-/**
- * Run the Advisor model pass.
- * - Acquires the 'advisor' (0.6B) model via ModelManager.
- * - Immediately disposes context after classification (no VRAM residency).
- * - Returns AdvisorIntent or null (orchestrator falls back to ensemble heuristic).
- * - Also returns AdvisorV2Result if the model output includes the rich fields.
- */
-async function runAdvisor(userRequest: string): Promise<AdvisorIntent | null>;
-async function runAdvisor(userRequest: string, v2: true): Promise<{ intent: AdvisorIntent | null; v2Result: AdvisorV2Result | null }>;
-async function runAdvisor(userRequest: string, v2 = false): Promise<any> {
-	const systemPrompt = loadPrompt('planner');
-	if (!systemPrompt) {
-		console.warn('[Advisor] planner.md not found, skipping advisor pass.');
-		return v2 ? { intent: null, v2Result: null } : null;
-	}
-	try {
-		const advisorModel = await mm.acquire('advisor');
-		// 2048 ctx: ample room for system prompt (~400 tok), multi-paragraph user requests (~300 tok), and JSON output (~200 tok)
-		// 4096 ctx: the planner prompt (~500 tok) + a long user request
-		// (~400 tok) + the full V2 JSON payload (~400 tok) fits comfortably.
-		// At 2048 the advisor ran out of room on detailed requests.
-		const advisorCtx = await advisorModel.createContext({ contextSize: 4096 });
-		const seq = advisorCtx.getSequence();
 
-		// Build Qwen3 chat template + /no_think to suppress chain-of-thought mode.
-		// Pre-filling <think>\n\n</think> forces the model to skip reasoning and output JSON directly.
-		const fullPrompt = `<|im_start|>system\n${systemPrompt}<|im_end|>\n<|im_start|>user\n${userRequest} /no_think<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n`;
-		const inputTokens = advisorModel.tokenize(fullPrompt);
-		console.log(`[Advisor] Input tokens: ${inputTokens.length} / 4096`);
-
-		// evaluate(inputTokens) both evals the prompt AND generates next tokens.
-		// The V2 payload is much larger than {"intent":"..."} — it carries
-		// framework, language, architecture, modules, requiredFeatures,
-		// estimatedFiles, confidence and generationStrategy.
-		let raw = '';
-		let hitCap = false;
-		const eosToken = advisorModel.tokens.eos;
-		for await (const token of seq.evaluate(inputTokens, { temperature: 0 })) {
-			const text = advisorModel.detokenize([token]);
-			raw += text;
-			if (token === eosToken) break;
-			// Stop when JSON is closed — simple heuristic
-			const depth = (raw.match(/\{/g) ?? []).length - (raw.match(/\}/g) ?? []).length;
-			if (depth <= 0 && raw.includes('{')) break;
-			// Safety cap. 2000 chars fits the full V2 payload; the old 600
-			// cut it mid-array, which is what truncated the live-check run.
-			if (raw.length > 2000) { hitCap = true; break; }
-		}
-
-		if (hitCap) {
-			console.warn(`[Advisor] Output hit the 2000-char cap — the JSON may be incomplete.`);
-		}
-		// Log the FULL output. The old 150-char slice hid the truncation.
-		console.log('[Advisor] Raw output:', raw.trim());
-		await advisorCtx.dispose();
-
-		if (v2) {
-			// Try V2 parse first (rich fields), fall back to V1 intent-only
-			const parsed = parseAdvisorV2(raw);
-			if (parsed) return { intent: parsed.intent, v2Result: parsed.v2 };
-			// V2 parse failed — try V1
-			const intentOnly = parseAdvisorIntent(raw);
-			return { intent: intentOnly, v2Result: intentOnly ? { intent: intentOnly } : null };
-		}
-		return parseAdvisorIntent(raw);
-	} catch (e: any) {
-		console.error('[Advisor] Failed:', e.message);
-		return v2 ? { intent: null, v2Result: null } : null;
-	}
-}
 
 
 // ---------------------------------------------------------------------------
 // Ensemble scoring — fuses all signals into a final FE/BE/FULLSTACK/GENERAL score
 // ---------------------------------------------------------------------------
 
-/**
- * Infer previous route intent from conversation history.
- * Scans past assistant messages for <file path="..."> tags.
- * Returns 'fe', 'be', or null.
- */
-function inferPreviousRoute(messages: any[]): 'fe' | 'be' | null {
-	// Walk messages in reverse, find most recent assistant turn
-	for (let i = messages.length - 2; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg?.role !== 'assistant') continue;
-		const content = msg?.content || '';
-		// Check for FE file patterns
-		if (/<file\s+path=["'][^"']*(\.(tsx|jsx|css|scss)|components\/|pages\/|hooks\/)[^"']*["']/i.test(content)) return 'fe';
-		// Check for BE file patterns
-		if (/<file\s+path=["'][^"']*(controller|service|middleware|repository|schema\.prisma|routes\/)[^"']*["']/i.test(content)) return 'be';
-		// Found an assistant message but no clear signal — stop
-		break;
-	}
-	return null;
-}
-
-/**
- * Classify open file context as 'fe', 'be', or null.
- */
-function classifyOpenFile(openFiles: string[] | undefined): 'fe' | 'be' | null {
-	if (!openFiles || openFiles.length === 0) return null;
-	const activeFile = openFiles[0]!;
-	const ext = path.extname(activeFile).toLowerCase();
-	const base = path.basename(activeFile).toLowerCase();
-	if (['.tsx', '.jsx'].includes(ext)) return 'fe';
-	if (['.css', '.scss'].includes(ext)) return 'fe';
-	if (/(?:component|page|layout|sidebar|dashboard|modal|hook|store)/i.test(base)) return 'fe';
-	if (/(?:controller|service|middleware|repository|route|schema\.prisma|guard)/i.test(base)) return 'be';
-	if (ext === '.sql') return 'be';
-	return null;
-}
 
 
 
-/**
- * Empty workspace app-type detector.
- * If workspace empty + prompt describes an app → force create_fullstack.
- * Prevents "build a Postman clone" routing to create_be.
- */
-function detectAppType(msg: string): boolean {
-	const appNouns = /\b(app|application|platform|saas|clone|dashboard|tool|system|portal|suite|product)\b/i;
-	return appNouns.test(msg);
-}
+
+
+
+
 
 // ---------------------------------------------------------------------------
 // Cross-Specialist Skip Helpers
 // ---------------------------------------------------------------------------
 
-/**
- * Returns true if the prompt contains signals that frontend work is required.
- * Used to decide whether the FE specialist should run after the BE phase.
- */
-function promptNeedsFrontend(prompt: string): boolean {
-	return (
-		UI_COMPONENT_PATTERN.test(prompt) ||
-		UI_INTERACTION_PATTERN.test(prompt) ||
-		UI_DESIGN_PATTERN.test(prompt) ||
-		UI_FRAMEWORK_PATTERN.test(prompt)
-	);
-}
 
-/**
- * Single hook for deciding whether the FE specialist should run in fullstack mode.
- * Ensures the Frontend specialist is NEVER skipped when UI work is requested.
- */
-function shouldRunFrontend(opts: {
-	intent: string;
-	prompt: string;
-	beFilesWritten: string[];
-}): boolean {
-	// If the prompt contains any UI signals, we must run the frontend
-	if (promptNeedsFrontend(opts.prompt)) {
-		return true;
-	}
-	// Fallback for explicitly declared fullstack intents
-	if (opts.intent === 'create_fullstack' || opts.intent === 'edit_fullstack' || opts.intent === 'general') {
-		return true;
-	}
-	return false;
-}
 
-function isCreatePrompt(msg: string): boolean {
-	return /\b(?:create|make|build|scaffold|generate|setup|init|new|develop|implement)\b/i.test(msg);
-}
+
+
+
 
 
 
@@ -807,55 +487,7 @@ interface BackendSummary {
 	files: string[];       // relative paths written by BE
 }
 
-function extractBackendSummary(filesModified: string[], workspaceRoot: string): string {
-	const summary: BackendSummary = {
-		routes: [],
-		entities: [],
-		auth: 'Unknown',
-		database: 'Unknown',
-		files: filesModified,
-	};
 
-	for (const f of filesModified) {
-		const absPath = path.isAbsolute(f) ? f : path.join(workspaceRoot, f);
-		const content = readFileSafe(absPath);
-		if (!content) continue;
-
-		// Extract route definitions (Express-style)
-		const routeMatches = content.matchAll(/(?:router|app)\.(get|post|put|patch|delete)\s*\(\s*['"`]([^'"`]+)['"`]/gi);
-		for (const m of routeMatches) {
-			if (m[1] && m[2]) summary.routes.push(`${m[1].toUpperCase()} ${m[2]}`);
-		}
-
-		// Extract entity/model names (TypeScript interfaces, classes, Prisma models)
-		const entityMatches = content.matchAll(/(?:interface|class|model)\s+([A-Z][a-zA-Z]+)/g);
-		for (const m of entityMatches) {
-			if (!summary.entities.includes(m[1]!)) summary.entities.push(m[1]!);
-		}
-
-		// Detect auth strategy
-		if (/jwt|jsonwebtoken/i.test(content)) summary.auth = 'JWT Bearer token';
-		else if (/session|express-session/i.test(content)) summary.auth = 'Session-based';
-		else if (/passport/i.test(content)) summary.auth = 'Passport.js';
-
-		// Detect database
-		if (/prisma/i.test(content)) summary.database = 'Prisma ORM';
-		else if (/mongoose|mongodb/i.test(content)) summary.database = 'MongoDB/Mongoose';
-		else if (/pg|postgres/i.test(content)) summary.database = 'PostgreSQL';
-		else if (/mysql2?/i.test(content)) summary.database = 'MySQL';
-		else if (/sqlite/i.test(content)) summary.database = 'SQLite';
-	}
-
-	// Deduplicate routes
-	summary.routes = [...new Set(summary.routes)].slice(0, 20);
-
-	return [
-		summary.routes.length > 0 ? `API routes:\n${summary.routes.map(r => `  ${r}`).join('\n')}` : '',
-		summary.entities.length > 0 ? `Entities: ${summary.entities.join(', ')}` : '',
-		`Auth: ${summary.auth}`,
-		`Database: ${summary.database}`,
-	].filter(Boolean).join('\n');
-}
 
 // ---------------------------------------------------------------------------
 // Fallback: extract code blocks with file paths from model output
@@ -878,99 +510,13 @@ interface FallbackEdit {
 // ---------------------------------------------------------------------------
 
 /** Build a repair prompt from JSX symbol validation issues. */
-/**
- * The model produced a response from which no file could be parsed.
- *
- * This is a DIFFERENT failure from a symbol problem: the code was never
- * emitted, so there is nothing to repair. The prompt restates the output
- * contract explicitly and asks for the files again.
- */
 
-
-function validateContentForExtension(filename: string, content: string, intent?: string): { valid: boolean; error?: string } {
-	const ext = path.extname(filename).toLowerCase();
-	const basename = path.basename(filename);
-
-	const hasReactJSX = /import\s+React|from\s+['"]react['"]|useState\s*\(|useEffect\s*\(|useRef\s*\(|useMemo\s*\(|useCallback\s*\(|className\s*=\s*|htmlFor\s*=\s*|onClick\s*=\s*\{|style\s*=\s*\{\{/.test(content);
-	const hasTS = /\b(?:interface|namespace)\s+\w+\s*\{|\btype\s+\w+\s*=\s*[^;=]+;|\bas\s+(?:string|number|boolean|any|object|unknown|never)\b|:\s*(?:string|number|boolean|any|void|unknown|never|Record<|Array<)\b/.test(content);
-	const hasHTML = /<!DOCTYPE|<html|<head|<body|<div\b|<span\b|<p\b|<a\s+href=|<\/\w+>/.test(content);
-	const hasJS = /\b(?:const|let|var)\s+\w+\s*=|^\s*import\s+[\w{}*,\s]+\s+from\s+['"]|^\s*export\s+(?:default|const|let|var|class|function)\b|\bfunction\s+\w+\s*\(|\bconsole\.log\b/m.test(content);
-
-	if (ext === '.js') {
-		if (hasReactJSX) {
-			if (intent === 'backend') {
-				return { valid: false, error: `React/JSX syntax detected in ${basename}.\n\nThis is a BACKEND Node.js project. You MUST write backend JavaScript/TypeScript.\nDo NOT generate frontend React, JSX, or TSX code.\n\nRe-emit only the corrected backend file.` };
-			} else {
-				return { valid: false, error: `React/JSX syntax detected in ${basename}.\n\nThis project is currently a vanilla HTML/CSS/JavaScript project.\n\nYou MUST rewrite the code using vanilla JavaScript.\nDo NOT create React, JSX, TSX, or framework files.\n\nRe-emit only the corrected file.` };
-			}
-		}
-		if (hasTS) {
-			return { valid: false, error: 'TypeScript syntax (type annotations, interfaces) is not allowed in plain JavaScript (.js) files.' };
-		}
-	} else if (ext === '.ts') {
-		if (hasReactJSX) {
-			return { valid: false, error: 'React/JSX syntax is not allowed in plain TypeScript (.ts) files. Use .tsx instead.' };
-		}
-	} else if (ext === '.css') {
-		if (hasHTML) {
-			return { valid: false, error: 'HTML tags are not allowed in CSS (.css) files.' };
-		}
-		if (hasJS || hasReactJSX) {
-			return { valid: false, error: 'JavaScript or React code is not allowed in CSS (.css) files.' };
-		}
-	} else if (ext === '.html' || ext === '.htm') {
-		if (hasReactJSX) {
-			return { valid: false, error: 'React/JSX code is not allowed in HTML (.html) files.' };
-		}
-		if ((content.includes('import ') || content.includes('export ')) && !content.includes('<script')) {
-			return { valid: false, error: 'JavaScript imports/exports are not allowed in HTML files outside of <script> tags.' };
-		}
-	}
-
-	return { valid: true };
-}
 
 // ---------------------------------------------------------------------------
 // Part A — Path validation (rejects directories, escapes, missing parents)
 // ---------------------------------------------------------------------------
 
-function validateTargetPath(
-	resolvedPath: string,
-	workspaceRoot: string,
-	rawPathArg: string
-): { valid: boolean; error?: string } {
-	// 1. Must stay inside workspace
-	const absRoot = path.resolve(workspaceRoot);
-	if (!resolvedPath.startsWith(absRoot + path.sep) && resolvedPath !== absRoot) {
-		return { valid: false, error: `Path "${rawPathArg}" escapes the workspace root. Write rejected.` };
-	}
 
-	// 2. Trailing slash or no extension and already exists as dir → directory target
-	if (rawPathArg.endsWith('/') || rawPathArg.endsWith('\\')) {
-		return { valid: false, error: `Path "${rawPathArg}" is a directory (trailing slash). Provide a file path with an extension, e.g. controllers/users.ts` };
-	}
-
-	// 3. Path resolves to an existing directory on disk
-	try {
-		const stat = fs.statSync(resolvedPath);
-		if (stat.isDirectory()) {
-			return { valid: false, error: `Path "${rawPathArg}" resolves to a directory on disk (EISDIR). Provide a full file path with an extension.` };
-		}
-	} catch { /* file doesn't exist yet — that's fine */ }
-
-	// 4. Must have a file extension
-	if (!path.extname(resolvedPath)) {
-		return { valid: false, error: `Path "${rawPathArg}" has no file extension. Provide a valid file path (e.g. src/utils/helpers.ts).` };
-	}
-
-	// 5. Parent directory must either exist or be creatable inside the workspace
-	const parentDir = path.dirname(resolvedPath);
-	if (!parentDir.startsWith(absRoot)) {
-		return { valid: false, error: `Parent directory of "${rawPathArg}" is outside the workspace. Write rejected.` };
-	}
-
-	return { valid: true };
-}
 
 // ---------------------------------------------------------------------------
 // Part B — Pending Edits Store (diff / approval workflow)
@@ -992,241 +538,28 @@ interface PendingSession {
 	createdAt: number;
 }
 
-function generateUnifiedDiff(oldContent: string | null, newContent: string, relPath: string): string {
-	const oldLines = (oldContent ?? '').split('\n');
-	const newLines = newContent.split('\n');
-	const header = `--- a/${relPath}\n+++ b/${relPath}\n`;
 
-	// Simple line-level diff (Myers-style via longest common subsequence)
-	const lcs = buildLCS(oldLines, newLines);
-	const hunks: string[] = [];
-	let ol = 0, nl = 0, lc = 0;
-	const changes: Array<{ type: '+' | '-' | ' '; line: string }> = [];
 
-	while (ol < oldLines.length || nl < newLines.length) {
-		if (lc < lcs.length && ol === lcs[lc]!.old && nl === lcs[lc]!.nw) {
-			changes.push({ type: ' ', line: oldLines[ol]! });
-			ol++; nl++; lc++;
-		} else if (nl < newLines.length && (lc >= lcs.length || nl < lcs[lc]!.nw)) {
-			changes.push({ type: '+', line: newLines[nl]! });
-			nl++;
-		} else {
-			changes.push({ type: '-', line: oldLines[ol]! });
-			ol++;
-		}
-	}
 
-	// Group into hunks (context = 3 lines)
-	const CONTEXT = 3;
-	const changeIndices = changes.map((c, i) => c.type !== ' ' ? i : -1).filter(i => i >= 0);
-	if (changeIndices.length === 0) return header + '(no changes)';
-
-	const ranges: Array<[number, number]> = [];
-	let start = Math.max(0, changeIndices[0]! - CONTEXT);
-	let end = Math.min(changes.length - 1, changeIndices[0]! + CONTEXT);
-	for (let i = 1; i < changeIndices.length; i++) {
-		const next = changeIndices[i]!;
-		if (next - CONTEXT <= end + CONTEXT) {
-			end = Math.min(changes.length - 1, next + CONTEXT);
-		} else {
-			ranges.push([start, end]);
-			start = Math.max(0, next - CONTEXT);
-			end = Math.min(changes.length - 1, next + CONTEXT);
-		}
-	}
-	ranges.push([start, end]);
-
-	for (const [s, e] of ranges) {
-		const slice = changes.slice(s, e + 1);
-		const oldStart = s + 1;
-		const oldCount = slice.filter(c => c.type !== '+').length;
-		const newStart = s + 1;
-		const newCount = slice.filter(c => c.type !== '-').length;
-		hunks.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
-		for (const c of slice) hunks.push(`${c.type}${c.line}`);
-	}
-
-	return header + hunks.join('\n');
-}
-
-function buildLCS(a: string[], b: string[]): Array<{ old: number; nw: number }> {
-	// Patience diff — find longest common subsequence via index matching
-	const bMap = new Map<string, number[]>();
-	for (let i = 0; i < b.length; i++) {
-		const key = b[i]!;
-		if (!bMap.has(key)) bMap.set(key, []);
-		bMap.get(key)!.push(i);
-	}
-	const pairs: Array<{ old: number; nw: number }> = [];
-	let lastNw = -1;
-	for (let oi = 0; oi < a.length; oi++) {
-		const matches = bMap.get(a[oi]!) ?? [];
-		for (const ni of matches) {
-			if (ni > lastNw) {
-				pairs.push({ old: oi, nw: ni });
-				lastNw = ni;
-				break;
-			}
-		}
-	}
-	return pairs;
-}
 
 // In-memory store: sessionId → PendingSession
 const pendingStore = new Map<string, PendingSession>();
 
-function createPendingSession(
-	workspaceRoot: string,
-	query: string,
-	rawEdits: Array<{ path: string; content: string }>
-): PendingSession {
-	const id = `ps_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-	const edits: PendingEdit[] = rawEdits.map(e => {
-		const absPath = path.resolve(workspaceRoot, e.path);
-		const relPath = path.relative(workspaceRoot, absPath);
-		let oldContent: string | null = null;
-		try { oldContent = fs.readFileSync(absPath, 'utf-8'); } catch { /* new file */ }
-		const diff = generateUnifiedDiff(oldContent, e.content, relPath);
-		return { relPath, absPath, newContent: e.content, oldContent, diff };
-	});
-	const session: PendingSession = { id, workspaceRoot, query, edits, createdAt: Date.now() };
-	pendingStore.set(id, session);
-	// Auto-expire after 10 minutes
-	setTimeout(() => pendingStore.delete(id), 10 * 60 * 1000);
-	return session;
-}
 
-function applyPendingSession(session: PendingSession): { written: string[]; errors: string[] } {
-	const written: string[] = [];
-	const errors: string[] = [];
-	for (const edit of session.edits) {
-		try {
-			const dir = path.dirname(edit.absPath);
-			if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-			fs.writeFileSync(edit.absPath, edit.newContent, 'utf-8');
-			written.push(edit.relPath);
-			console.log(`[PendingStore] ✅ Applied: ${edit.relPath}`);
-		} catch (e: any) {
-			errors.push(`${edit.relPath}: ${e.message}`);
-			console.error(`[PendingStore] ❌ Failed: ${edit.relPath} — ${e.message}`);
-		}
-	}
-	return { written, errors };
-}
 
-/**
- * Determine the most appropriate file path for a piece of code.
- * Uses: open files, user prompt keywords, and code content analysis.
- */
-function inferFilePath(code: string, openFiles?: string[], workspaceRoot?: string, userPrompt?: string): string {
-	// Try to determine from the code content
-	const isReact = /import\s+React|from\s+['"]react['"]|jsx|tsx|<\w+[\s/>]/.test(code);
-	const isHTML = /<!DOCTYPE|<html|<head|<body/.test(code);
-	const isCSS = /@media|@import|@keyframes|\.[\w-]+\s*\{|#[\w-]+\s*\{/.test(code) && !isReact;
-	const isVue = /<template>|<script setup|defineComponent/.test(code);
-	const isTS = /(?:interface|type|public|private|readonly|namespace)\s+\w+/.test(code) && !isHTML && !isCSS && !isReact;
-	const isJS = /(?:const|let|var|function|console\.log|import|export|class)\b/.test(code) && !isHTML && !isCSS && !isReact;
 
-	// 1. Check if user mentions a specific file name (highest priority)
-	if (userPrompt) {
-		const fileMatch = userPrompt.match(/(?:file|create|make|write|save|name(?:d)?)\s+(?:it\s+)?(?:as\s+|to\s+)?['"]?([\w./\\-]+\.\w+)['"]?/i);
-		if (fileMatch) {
-			return fileMatch[1]!;
-		}
-	}
 
-	// 2. If there's exactly one open file, write to it (high priority, ignores model content inference)
-	if (openFiles && openFiles.length === 1 && workspaceRoot) {
-		return path.relative(workspaceRoot, openFiles[0]!);
-	}
 
-	// 3. Determine from project structure if we have a workspace
-	if (workspaceRoot) {
-		// Check if src/ directory exists
-		const hasSrc = fs.existsSync(path.join(workspaceRoot, 'src'));
-		const prefix = hasSrc ? 'src/' : '';
-
-		if (isHTML) return `${prefix}index.html`;
-		if (isCSS) return `${prefix}styles.css`;
-		if (isVue) return `${prefix}App.vue`;
-		if (isReact) return `${prefix}App.jsx`;
-		if (isTS) return `${prefix}index.ts`;
-		if (isJS) return `${prefix}index.js`;
-		return `${prefix}App.jsx`; // Default for code output
-	}
-
-	// 4. No workspace - best guess
-	if (isHTML) return 'index.html';
-	if (isCSS) return 'styles.css';
-	if (isVue) return 'App.vue';
-	if (isReact) return 'App.jsx';
-	if (isTS) return 'index.ts';
-	if (isJS) return 'index.js';
-	return 'App.jsx';
-}
 
 // ---------------------------------------------------------------------------
 // Server-side workspace tools (Node.js fs)
 // ---------------------------------------------------------------------------
 
-function buildDirectoryTree(dirPath: string, indent: string = '', depth: number = 0, maxDepth: number = 3): string {
-	if (depth >= maxDepth) return indent + '...\n';
-	try {
-		const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-		const skipDirs = new Set(['node_modules', '.git', '.next', 'dist', 'build', 'out', '.vscode', '__pycache__', '.cache', '.svelte-kit']);
-		const lines: string[] = [];
 
-		const sorted = [...entries].sort((a, b) => {
-			if (a.isDirectory() && !b.isDirectory()) return -1;
-			if (!a.isDirectory() && b.isDirectory()) return 1;
-			return a.name.localeCompare(b.name);
-		});
 
-		for (const entry of sorted) {
-			if (entry.isDirectory()) {
-				if (skipDirs.has(entry.name)) {
-					lines.push(`${indent}${entry.name}/ (skipped)`);
-					continue;
-				}
-				lines.push(`${indent}${entry.name}/`);
-				lines.push(buildDirectoryTree(path.join(dirPath, entry.name), indent + '  ', depth + 1, maxDepth));
-			} else {
-				lines.push(`${indent}${entry.name}`);
-			}
-		}
-		return lines.join('\n');
-	} catch {
-		return '';
-	}
-}
 
-function readFileSafe(filePath: string): string | null {
-	try {
-		const stat = fs.statSync(filePath);
-		if (stat.size > 100_000) return `(file too large: ${(stat.size / 1024).toFixed(0)}KB)`;
-		return fs.readFileSync(filePath, 'utf-8');
-	} catch {
-		return null;
-	}
-}
 
-function extractReferencedFiles(message: string, workspaceRoot: string): string[] {
-	const filePatterns = message.match(/(?:^|[\s'"`(])([./]?(?:[\w.-]+\/)*[\w.-]+\.(?:json|jsx|tsx|js|ts|css|html|md|vue|svelte|py|rs|go|yaml|yml|toml|env|sh|lock|mjs|cjs))\b/gm);
-	if (!filePatterns) return [];
 
-	const files: string[] = [];
-	const seen = new Set<string>();
-
-	for (let match of filePatterns) {
-		match = match.trim().replace(/^['"`(]/, '');
-		const fullPath = path.isAbsolute(match) ? match : path.join(workspaceRoot, match);
-		if (!seen.has(fullPath) && fs.existsSync(fullPath)) {
-			seen.add(fullPath);
-			files.push(fullPath);
-		}
-	}
-	return files;
-}
 
 // ---------------------------------------------------------------------------
 // Tool Execution Engine
@@ -1243,28 +576,9 @@ interface ToolResult {
 	diffMsg?: string;
 }
 
-function parseToolCall(text: string): { toolCall: ToolCallParsed; textBefore: string; textAfter: string } | null {
-	const match = text.match(/([\s\S]*?)<tool_call>\s*([\s\S]*?)\s*<\/tool_call>([\s\S]*)/);
-	if (!match) return null;
 
-	try {
-		const parsed = JSON.parse(match[2]!.trim());
-		if (parsed.name && parsed.arguments) {
-			return {
-				toolCall: parsed as ToolCallParsed,
-				textBefore: match[1]!.trim(),
-				textAfter: match[3]!.trim(),
-			};
-		}
-	} catch (e) {
-		console.error(`[Router] Failed to parse tool call JSON:`, e);
-	}
-	return null;
-}
 
-function streamChunk(res: express.Response, content: string) {
-	res.write(JSON.stringify({ message: { content } }) + '\n');
-}
+
 
 // ---------------------------------------------------------------------------
 // Structured pipeline event system
@@ -1281,21 +595,7 @@ interface PipelineEvent {
 	model?: string;
 }
 
-/** Emit a structured progress event. Renders as markdown in existing chat UI;
- *  also carries typed `event` metadata for future frontend parsing. */
-function streamEvent(res: express.Response, evt: PipelineEvent): void {
-	if (evt.type === 'context_usage') {
-		res.write(JSON.stringify({ type: 'context_usage', used: evt.used, total: evt.total, percent: evt.percent, model: evt.model }) + '\n');
-		return;
-	}
-	const icon =
-		evt.type === 'success' ? '✓'
-			: evt.type === 'error' ? '✗'
-				: evt.type === 'warning' ? '!'
-					: '•';
-	const markdown = `${icon} ${evt.message}\n`;
-	res.write(JSON.stringify({ message: { content: markdown }, event: evt }) + '\n');
-}
+
 
 /** Detect whether the user is explicitly requesting to view generated code.
  *  When true, raw model output is shown rather than suppressed. */
@@ -1317,9 +617,7 @@ const MAX_AGENT_ITERATIONS = 6; // 3 for BE pass + 3 for FE pass in full-stack m
 const MAX_CORRECTIONS_PER_FILE = 3;
 const MAX_TOTAL_CORRECTIONS = 5;
 
-function escapeRegExp(string: string): string {
-	return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
+
 
 
 
