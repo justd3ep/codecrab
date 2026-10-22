@@ -138,6 +138,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-guarded-acquires.ts',
 		what: 'the advisor acquires are guarded',
 	},
+	{
+		file: 'verify-crash-handlers-catch.ts',
+		what: 'the crash handlers actually catch',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
