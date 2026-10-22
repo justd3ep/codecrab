@@ -7,8 +7,13 @@ npm-debug.log*
 .crabcode
 .lancedb
 .rag-cache/
-models/
-!models/placeholder.txt
+# The GGUF weights. ANCHORED to the router root: a bare 'models/'
+# also matched src/models/, which holds SOURCE FILES (the model
+# manager, the embedding manager) that the router imports. Seven
+# tracked files import from src/models/ — a fresh clone could not
+# build the router.
+/models/
+!/models/placeholder.txt
 
 # Dependency directories
 node_modules/
