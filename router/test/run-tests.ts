@@ -98,6 +98,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-parity-failure-log.ts',
 		what: 'the routing-failure logger computes its own path',
 	},
+	{
+		file: 'verify-fresh-clone.ts',
+		what: 'a fresh clone has every file the source imports',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
