@@ -73,6 +73,7 @@ import { parseUserScope } from './parsing/constraintParser.js';
 import { plannerContractToValidationContract } from './parsing/plannerContract.js';
 import { installCrashHandlers } from './server/crashHandlers.js';
 import { beginRequest } from './server/requestLifecycle.js';
+import { acquireRequestSlot, getActiveController, setActiveController, makeAbortRoutes } from './server/requestMutex.js';
 import { makeEditRoutes } from './router/editRoutes.js';
 import { makeRagRoutes } from './router/ragRoutes.js';
 
@@ -400,48 +401,16 @@ type AdvisorIntent =
 app.use('/v1', makeRagRoutes());
 
 
-// ---------------------------------------------------------------------------
-// Request serialisation mutex
-// Only one chat request runs at a time — prevents concurrent mm.acquire() calls
-// from disposing a model that another request is actively generating into.
-// ---------------------------------------------------------------------------
-
-// Global abort controller — lets /v1/chat/abort terminate active generation
-let activeController: AbortController | null = null;
-
-app.post('/v1/chat/abort', (_req, res) => {
-	if (activeController && !activeController.signal.aborted) {
-		console.log('[Router] /v1/chat/abort — aborting active generation.');
-		activeController.abort();
-		res.json({ aborted: true });
-	} else {
-		res.json({ aborted: false, reason: 'No active generation' });
-	}
-});
-let requestInFlight = false;
-const requestQueue: Array<() => void> = [];
-
-function acquireRequestSlot(): Promise<() => void> {
-	return new Promise(resolve => {
-		const release = () => {
-			if (requestQueue.length > 0) {
-				const next = requestQueue.shift()!;
-				next();
-			} else {
-				requestInFlight = false;
-			}
-		};
-		if (!requestInFlight) {
-			requestInFlight = true;
-			resolve(release);
-		} else {
-			requestQueue.push(() => {
-				requestInFlight = true;
-				resolve(release);
-			});
-		}
-	});
-}
+// The request serialisation mutex and the active-generation handle.
+//
+// Only one chat request runs at a time — a concurrent mm.acquire()
+// can dispose a model that another request is actively generating
+// into. And the abort route must reach the request that is running.
+//
+// They are a module because the route and the handler were coupled
+// through a mutable module-level `activeController`. A module that
+// owns both cannot be half-wired.
+app.use('/v1', makeAbortRoutes());
 
 // The SHADOW route — chatRoutes.ts, the newer architecture, mounted
 // BESIDE the live one so the two can be compared.
@@ -476,8 +445,8 @@ app.post('/v1/chat/completions', async (req, res) => {
 	const life = beginRequest(req, res, {
 		releaseSlot,
 		timeoutMs: REQUEST_TIMEOUT_MS,
-		registerController: (c) => { activeController = c; },
-		deregisterController: (c) => { if (activeController === c) activeController = null; },
+		registerController: (c) => { setActiveController(c); },
+		deregisterController: (c) => { if (getActiveController() === c) setActiveController(null); },
 		getContext: () => context,
 		clearContext: () => { context = null; },
 	});

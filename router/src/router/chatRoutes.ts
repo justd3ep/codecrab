@@ -119,7 +119,7 @@ import {
 	acquireRequestSlot,
 	getActiveController,
 	setActiveController,
-	abortActiveGeneration,
+	makeAbortRoutes,
 } from '../server/requestMutex.js';
 import { MAX_AGENT_ITERATIONS, MAX_CORRECTIONS_PER_FILE, MAX_TOTAL_CORRECTIONS, REPEAT_PENALTY, REPEAT_PENALTY_TOKENS, REQUEST_TIMEOUT_MS } from '../generation/limits.js';
 
@@ -182,14 +182,10 @@ async function runAdvisorProjectSummary(params: {
 export function makeChatRoutes(): Router {
 	const router = Router();
 
-	router.post('/chat/abort', (_req, res) => {
-		const aborted = abortActiveGeneration();
-		if (aborted) {
-			res.json({ aborted: true });
-		} else {
-			res.json({ aborted: false, reason: 'No active generation' });
-		}
-	});
+	// The abort route. It used to be inline here, with the same body
+	// as the live route's copy — and the two could drift apart. The
+	// module owns it now, so both routes serve the same one.
+	router.use(makeAbortRoutes());
 
 	router.post('/chat/completions', async (req, res) => {
 		if (!mm.status.loaded && mm.status.loading) {

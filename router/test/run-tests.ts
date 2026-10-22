@@ -158,6 +158,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-single-health-route.ts',
 		what: 'there is one health route, and it is complete',
 	},
+	{
+		file: 'verify-shared-abort-route.ts',
+		what: 'both chat routes share one abort route',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
