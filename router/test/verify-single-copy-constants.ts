@@ -101,11 +101,18 @@ for (const name of SHARED) {
 			declarers.push(rel);
 		}
 	}
-	check(`${name} is declared exactly once`, () =>
-		declarers.length === 1
+	// AT MOST one declaration. Zero is allowed: a constant that
+	// nothing uses should not be declared at all.
+	//
+	// MAX_TOKENS was declared in index.ts AND chatRoutes.ts and
+	// used in NEITHER. It was dead in both, and the dead-type
+	// removal deleted it. A check that demanded exactly one
+	// declaration would have kept a dead constant alive.
+	check(`${name} is declared at most once`, () =>
+		declarers.length <= 1
 			? true
 			: `declared ${declarers.length} times: ${declarers.join(', ')}`);
-}
+	}
 
 console.log('\n=== 3. every USER imports it rather than redeclaring it ===');
 

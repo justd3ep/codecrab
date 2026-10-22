@@ -66,9 +66,6 @@ export const REPEAT_PENALTY = 1.18;
 export const MAX_TOTAL_CORRECTIONS = 5;
 
 
-export const MAX_TOKENS = 4096;
-
-
 export const MAX_CORRECTIONS_PER_FILE = 3;
 
 
@@ -79,7 +76,7 @@ export const MAX_AGENT_ITERATIONS = 6;
 // Constraint Parser — runs BEFORE advisor, highest priority
 // ---------------------------------------------------------------------------
 
-type UserScope = 'BACKEND_ONLY' | 'FRONTEND_ONLY' | 'ANY';
+
 
 
 
@@ -90,15 +87,7 @@ type UserScope = 'BACKEND_ONLY' | 'FRONTEND_ONLY' | 'ANY';
 // Planner Contract — deterministic keyword extraction, no model call
 // ---------------------------------------------------------------------------
 
-interface PlannerContract {
-	scope: 'backend' | 'frontend' | 'fullstack';
-	architecture: 'repository' | 'mvc' | 'clean' | 'flat' | 'unknown';
-	framework: string;
-	language: 'typescript' | 'javascript';
-	requiredFeatures: string[];
-	requiredFolders: string[];
-	estimatedFiles: number;
-}
+
 
 
 
@@ -115,14 +104,7 @@ interface PlannerContract {
 // ---------------------------------------------------------------------------
 
 /** Repair strategy per issue type. */
-const enum RepairMode {
-	MODIFY_EXISTING = 'MODIFY_EXISTING',
-	GENERATE_MISSING = 'GENERATE_MISSING',
-	REWIRE_IMPORTS = 'REWIRE_IMPORTS',
-	DELETE_DUPLICATES = 'DELETE_DUPLICATES',
-	SECURITY_FIX = 'SECURITY_FIX',
-	COMPILE_FIX = 'COMPILE_FIX',
-}
+
 
 
 
@@ -318,7 +300,7 @@ app.get('/v1/models', (req, res) => {
 // Call whenever you detect the route was wrong (via user feedback or hard overrides).
 // Collect 500–2000 failures before finetuning the advisor.
 // ---------------------------------------------------------------------------
-const FAILURE_LOG_PATH = path.join(config.runtime.root, 'logs/routing_failures.jsonl');
+
 
 
 // ---------------------------------------------------------------------------
@@ -367,12 +349,9 @@ type AdvisorIntent =
 // AgentMode — computed once per request, sealed, passed to all specialists
 // ---------------------------------------------------------------------------
 
-type AgentMode = 'create' | 'edit' | 'needs_context';
 
-interface PhaseState {
-	specialist: 'be' | 'fe';
-	mode: AgentMode;
-}
+
+
 
 
 
@@ -386,17 +365,7 @@ interface PhaseState {
 // Priority: agent → typescript → mode → framework → feature
 // ---------------------------------------------------------------------------
 
-interface PromptRouterContext {
-	userMessage: string;
-	mode: AgentMode;
-	activeFile: string | undefined;
-	workspaceRoot: string | undefined;
-	/** Raw content of package.json, if available */
-	packageJson: string | undefined;
-	openFiles: string[] | undefined;
-	/** Stack + hard constraints derived from the user's request. */
-	profile?: StackProfile;
-}
+
 
 // ---------------------------------------------------------------------------
 // React workspace scanner — checks for .tsx files on disk (no keyword deps)
@@ -416,13 +385,7 @@ interface PromptRouterContext {
 // APIs that don't match what BE actually generated.
 // ---------------------------------------------------------------------------
 
-interface BackendSummary {
-	routes: string[];      // e.g. ["POST /api/auth/login", "GET /api/users/:id"]
-	entities: string[];    // e.g. ["User", "Session", "Post"]
-	auth: string;          // e.g. "JWT Bearer token in Authorization header"
-	database: string;      // e.g. "PostgreSQL via Prisma"
-	files: string[];       // relative paths written by BE
-}
+
 
 
 
@@ -431,10 +394,7 @@ interface BackendSummary {
 // Used when the model ignores <tool_call> and just pastes code directly
 // ---------------------------------------------------------------------------
 
-interface FallbackEdit {
-	path: string;
-	content: string;
-}
+
 
 
 
@@ -502,16 +462,9 @@ const pendingStore = new Map<string, PendingSession>();
 // Tool Execution Engine
 // ---------------------------------------------------------------------------
 
-interface ToolCallParsed {
-	name: string;
-	arguments: Record<string, any>;
-}
 
-interface ToolResult {
-	success: boolean;
-	output: string;
-	diffMsg?: string;
-}
+
+
 
 
 
@@ -521,16 +474,7 @@ interface ToolResult {
 // Structured pipeline event system
 // ---------------------------------------------------------------------------
 
-interface PipelineEvent {
-	type: 'progress' | 'success' | 'warning' | 'error' | 'info' | 'context_usage';
-	stage?: 'read' | 'plan' | 'generate' | 'write' | 'validate' | 'repair' | 'complete';
-	message?: string;
-	file?: string;
-	used?: number;
-	total?: number;
-	percent?: number;
-	model?: string;
-}
+
 
 
 

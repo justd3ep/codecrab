@@ -106,6 +106,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-single-copy-constants.ts',
 		what: 'every shared constant has exactly one declaration',
 	},
+	{
+		file: 'verify-no-dead-code.ts',
+		what: 'index.ts holds no unreferenced declaration',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook

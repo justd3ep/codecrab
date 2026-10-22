@@ -133,8 +133,31 @@ check('Pattern 4 exists and is no longer gated on create mode', () => {
 check('index.ts:4168 — responseTokenCount is computed', () =>
 	find(indexTs, 'responseTokenCount'));
 
-check('index.ts:3033 — MAX_TOKENS = 4096', () =>
-	find(indexTs, 'MAX_TOKENS'));
+// The token cap is COMPUTED, not a constant. The dead MAX_TOKENS
+// constant (4096) was declared in index.ts and chatRoutes.ts and
+// used in NEITHER. The live path is:
+//
+//     const genMaxTokens = Math.min(
+//         stackProfile.recommendedMaxTokens,
+//         Math.max(2048, requestedContextSize - 4096),
+//     );
+//
+// so the check follows the live path.
+check('the token cap is computed from the stack profile', () =>
+	find(indexTs, 'genMaxTokens = Math.min(')
+		&& find(indexTs, 'stackProfile.recommendedMaxTokens')
+		? true
+		: 'the live token cap is not computed from the stack profile');
+
+check('the per-file cap comes from the config', () => {
+	const local = fs.readFileSync(
+		path.join(ROUTER, 'src', 'config', 'config.local.ts'),
+		'utf8',
+	);
+	return /maxTokensPerFile:\s*4096/.test(local)
+		? true
+		: 'config.local.ts does not set maxTokensPerFile: 4096';
+});
 
 check('index.ts:3485 — filesModified is declared', () =>
 	find(indexTs, 'filesModified'));
