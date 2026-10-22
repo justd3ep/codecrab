@@ -118,6 +118,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-phase-parity.ts',
 		what: 'both chat routes carry the same Phase 0/1 fixes',
 	},
+	{
+		file: 'verify-requirement-probes.ts',
+		what: 'the React path gets requirement coverage too',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook

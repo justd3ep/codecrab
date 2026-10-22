@@ -39,7 +39,7 @@ import { exec } from 'child_process';
 import util from 'util';
 import { classifyDependency, DependencyStatus, isImportError } from './dependencyStatus.js';
 import type { ExecutionGraph } from './planner.js';
-import type { StackProfile } from './routing/stackProfile.js';
+import type { StackProfile, StackKind } from './routing/stackProfile.js';
 
 const execPromise = util.promisify(exec);
 
@@ -2102,8 +2102,31 @@ function pass19bRequirementProbes(
 ): void {
 	const stack = contract?.stack;
 	if (!stack) return;
-	const plain = stack.kind === 'vanilla' || stack.kind === 'single-file';
-	if (!plain) return;
+
+	// The probes used to run ONLY for vanilla and single-file
+	// deliverables. So a React request — which is what the frontend
+	// model is asked for most of the time — got NO requirement
+	// coverage at all.
+	//
+	// And the coverage SCORE was 0/0, because FEATURE_DETECTION is
+	// eighteen of eighteen BACKEND patterns (jwt, uploads, payments,
+	// rbac, ...). A frontend request matches none of them, so the
+	// contract's requiredFeatures was empty and there was nothing to
+	// measure.
+	//
+	// The result: a React generation that silently dropped the
+	// drag-and-drop the user asked for PASSED validation.
+	//
+	// The probes themselves are stack-agnostic — they match the
+	// user's request against the generated code, and the evidence
+	// patterns (keydown, tabindex, localStorage, @media) are valid
+	// JSX as well as valid vanilla JS. So the gate is now "is this
+	// a frontend deliverable?", not "is this vanilla?".
+	//
+	// The kinds are StackKind: react | vanilla | single-file |
+	// framework. A 'framework' deliverable is still a frontend one.
+	const frontendKinds: StackKind[] = ['vanilla', 'single-file', 'react', 'framework'];
+	if (!frontendKinds.includes(stack.kind)) return;
 
 	const request = stack.request || '';
 	if (!request) return;
@@ -2323,5 +2346,16 @@ export async function runLocalFileValidator(
 		);
 	}
 
+	// The coverage is NOT computed here, on purpose.
+	//
+	// runLocalFileValidator runs only the passes that are safe for
+	// per-file use during incremental generation, and pass7
+	// (requirement coverage) needs the WHOLE file set to know what
+	// is covered. The full validator — runPostGenerationValidator —
+	// does compute it, and returns the real score.
+	//
+	// So the zero here means "not measured", not "nothing covered".
+	// Reporting it as 0/0 is what made the number meaningless in the
+	// log, so the two are distinguished by the caller.
 	return { passed, files, issues, coverageScore: 0, coverageMax: 0 };
 }
