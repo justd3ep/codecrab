@@ -162,6 +162,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-shared-abort-route.ts',
 		what: 'both chat routes share one abort route',
 	},
+	{
+		file: 'verify-which-pipeline-runs.ts',
+		what: 'the monolithic loop is the live path for frontend requests',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
