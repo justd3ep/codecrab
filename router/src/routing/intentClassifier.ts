@@ -13,22 +13,59 @@ import type { LlamaModel } from 'node-llama-cpp';
 import type { AdvisorV2Result } from '../planner.js';
 import { parseAdvisorJson } from './advisorJson.js';
 
+export const WRITE_PATTERNS = [
+	/\b(?:create|make|generate|add|write|implement|build|scaffold)\b/i,
+	/\b(?:modify|edit|update|change|refactor|rename|move|delete|remove)\b/i,
+	/\b(?:fix|debug|resolve|patch|correct|repair)\b/i,
+	/\b(?:add\s+feature|new\s+file|new\s+component|new\s+route|new\s+endpoint)\b/i,
+];
+
+
+export const UI_INTERACTION_PATTERN = /\b(?:drag(?:ging)?(?:\s+and\s+drop)?|drop(?:ped)?|click(?:able)?|hover|render(?:ing)?|display(?:ing)?|style(?:d|s)?|animate(?:d|s|ion)?|preview|layout|visualize|toggle|select|filter|sort|reorder|scroll|zoom|paint|color|draw)\b/i;
+
+
+export const UI_FRAMEWORK_PATTERN = /\b(?:react|vue|svelte|angular|next\.?js|nuxt|vite|tailwind(?:css)?|framer|lucide|shadcn|radix|redux|zustand|tanstack|chakra|material-ui|mui|bootstrap)\b/i;
+
+
+export const UI_DESIGN_PATTERN = /\b(?:ui|ux|frontend|front-end|gui|theme|dark\s*mode|light\s*mode|responsive|mobile|desktop|css|scss|sass|tailwind|html|svg|icon|palette|typography|look\s+like|clone(?:\s+of)?|style|-style)\b/i;
+
+
+export const UI_COMPONENT_PATTERN = /\b(?:board|card|column|view|page|screen|modal|dialog|panel|widget|bar|tab|drawer|menu|carousel|slider|form|table|chart|grid|feed|timeline|sidebar|navbar|header|footer|button|input|dropdown|toast|accordion|avatar|badge|canvas|popup|stepper|breadcrumbs?|tooltip|trello|kanban)s?\b/i;
+
+
+export const READ_PATTERNS = [
+	/\b(?:explain|summarize|summary|describe|what\s+is|what\s+are|how\s+does|how\s+do|tell\s+me\s+about)\b/i,
+	/\b(?:list|show|find|locate|search|where\s+is|where\s+are|which\s+files?)\b/i,
+	/\b(?:review|audit|analyse|analyze|inspect|read|look\s+at|check)\b/i,
+	/\b(?:architecture|overview|structure|diagram|dependency|dependencies)\b/i,
+];
+
+
+export const BE_SERVER_PATTERN = /\b(?:backend|back-end|api|rest(?:ful)?|graphql|endpoint|route|router|controller|service|middleware|repository|server|express|nestjs|fastify|koa|django|flask|spring)\b/i;
+
+
+export const BE_DB_PATTERN = /\b(?:sql|postgres(?:ql)?|mysql|sqlite|mongodb?|mongoose|prisma|typeorm|database|db|migration|seed(?:er)?|redis|memcached)\b/i;
+
+
+export const BE_AUTH_INFRA_PATTERN = /\b(?:jwt|bearer|oauth|bcrypt|hash(?:ing)?|auth(?:entication|orization)?|session|cookie|rbac|queue|bullmq|kafka|rabbitmq|cron|worker|microservice|docker)\b/i;
+
+
 // ---------------------------------------------------------------------------
 // 1. UI Component / Interaction / Design / Framework Patterns
 // ---------------------------------------------------------------------------
 
-export const UI_COMPONENT_PATTERN = /\b(?:board|card|column|view|page|screen|modal|dialog|panel|widget|bar|tab|drawer|menu|carousel|slider|form|table|chart|grid|feed|timeline|sidebar|navbar|header|footer|button|input|dropdown|toast|accordion|avatar|badge|canvas|popup|stepper|breadcrumbs?|tooltip|trello|kanban)s?\b/i;
-export const UI_INTERACTION_PATTERN = /\b(?:drag(?:ging)?(?:\s+and\s+drop)?|drop(?:ped)?|click(?:able)?|hover|render(?:ing)?|display(?:ing)?|style(?:d|s)?|animate(?:d|s|ion)?|preview|layout|visualize|toggle|select|filter|sort|reorder|scroll|zoom|paint|color|draw)\b/i;
-export const UI_DESIGN_PATTERN = /\b(?:ui|ux|frontend|front-end|gui|theme|dark\s*mode|light\s*mode|responsive|mobile|desktop|css|scss|sass|tailwind|html|svg|icon|palette|typography|look\s+like|clone(?:\s+of)?|style|-style)\b/i;
-export const UI_FRAMEWORK_PATTERN = /\b(?:react|vue|svelte|angular|next\.?js|nuxt|vite|tailwind(?:css)?|framer|lucide|shadcn|radix|redux|zustand|tanstack|chakra|material-ui|mui|bootstrap)\b/i;
+
+
+
+
 
 // ---------------------------------------------------------------------------
 // 2. Backend Patterns
 // ---------------------------------------------------------------------------
 
-export const BE_DB_PATTERN = /\b(?:sql|postgres(?:ql)?|mysql|sqlite|mongodb?|mongoose|prisma|typeorm|database|db|migration|seed(?:er)?|redis|memcached)\b/i;
-export const BE_SERVER_PATTERN = /\b(?:backend|back-end|api|rest(?:ful)?|graphql|endpoint|route|router|controller|service|middleware|repository|server|express|nestjs|fastify|koa|django|flask|spring)\b/i;
-export const BE_AUTH_INFRA_PATTERN = /\b(?:jwt|bearer|oauth|bcrypt|hash(?:ing)?|auth(?:entication|orization)?|session|cookie|rbac|queue|bullmq|kafka|rabbitmq|cron|worker|microservice|docker)\b/i;
+
+
+
 
 // ---------------------------------------------------------------------------
 // 3. High-level intent helpers
@@ -59,19 +96,9 @@ export function detectBackendIntent(messages: any[]): boolean {
 // 4. READ vs WRITE intent classifier
 // ---------------------------------------------------------------------------
 
-const READ_PATTERNS = [
-	/\b(?:explain|summarize|summary|describe|what\s+is|what\s+are|how\s+does|how\s+do|tell\s+me\s+about)\b/i,
-	/\b(?:list|show|find|locate|search|where\s+is|where\s+are|which\s+files?)\b/i,
-	/\b(?:review|audit|analyse|analyze|inspect|read|look\s+at|check)\b/i,
-	/\b(?:architecture|overview|structure|diagram|dependency|dependencies)\b/i,
-];
 
-const WRITE_PATTERNS = [
-	/\b(?:create|make|generate|add|write|implement|build|scaffold)\b/i,
-	/\b(?:modify|edit|update|change|refactor|rename|move|delete|remove)\b/i,
-	/\b(?:fix|debug|resolve|patch|correct|repair)\b/i,
-	/\b(?:add\s+feature|new\s+file|new\s+component|new\s+route|new\s+endpoint)\b/i,
-];
+
+
 
 export function classifyIntent(userMessage: string): 'read' | 'write' {
 	const msg = userMessage.toLowerCase();

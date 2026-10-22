@@ -11,17 +11,7 @@ import type { UserScope } from './constraintParser.js';
 import { parseUserScope } from './constraintParser.js';
 import type { StackProfile } from '../routing/stackProfile.js';
 
-export interface PlannerContract {
-	scope: 'backend' | 'frontend' | 'fullstack';
-	architecture: 'repository' | 'mvc' | 'clean' | 'flat' | 'unknown';
-	framework: string;
-	language: 'typescript' | 'javascript';
-	requiredFeatures: string[];
-	requiredFolders: string[];
-	estimatedFiles: number;
-}
-
-const FEATURE_DETECTION: Array<{ key: string; re: RegExp }> = [
+export const FEATURE_DETECTION: Array<{ key: string; re: RegExp }> = [
 	{ key: 'jwt', re: /\bjwt\b|json.?web.?token|access.?token/i },
 	{ key: 'refresh_tokens', re: /refresh.?token/i },
 	{ key: 'repository', re: /repository.?pattern|repo.?pattern/i },
@@ -41,18 +31,37 @@ const FEATURE_DETECTION: Array<{ key: string; re: RegExp }> = [
 	{ key: 'middleware', re: /\bmiddleware\b/i },
 ];
 
-const ARCH_DETECTION: Array<{ arch: PlannerContract['architecture']; re: RegExp }> = [
-	{ arch: 'repository', re: /repository.?pattern|repo.?pattern/i },
-	{ arch: 'clean', re: /clean.?arch|domain.?driven|ddd|hexagonal/i },
-	{ arch: 'mvc', re: /\bmvc\b|model.?view.?controller/i },
-];
 
-const ARCH_FOLDERS_MAP: Record<string, string[]> = {
+export const ARCH_FOLDERS_MAP: Record<string, string[]> = {
 	repository: ['controllers', 'services', 'repositories'],
 	mvc: ['models', 'controllers'],
 	clean: ['domain', 'application', 'infrastructure'],
 	flat: [],
 };
+
+
+export const ARCH_DETECTION: Array<{ arch: PlannerContract['architecture']; re: RegExp }> = [
+	{ arch: 'repository', re: /repository.?pattern|repo.?pattern/i },
+	{ arch: 'clean', re: /clean.?arch|domain.?driven|ddd|hexagonal/i },
+	{ arch: 'mvc', re: /\bmvc\b|model.?view.?controller/i },
+];
+
+
+export interface PlannerContract {
+	scope: 'backend' | 'frontend' | 'fullstack';
+	architecture: 'repository' | 'mvc' | 'clean' | 'flat' | 'unknown';
+	framework: string;
+	language: 'typescript' | 'javascript';
+	requiredFeatures: string[];
+	requiredFolders: string[];
+	estimatedFiles: number;
+}
+
+
+
+
+
+
 
 
 

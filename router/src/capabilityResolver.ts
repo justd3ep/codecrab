@@ -12,6 +12,8 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { FEATURE_DETECTION } from './parsing/plannerContract.js';
+
 
 // ---------------------------------------------------------------------------
 // Public types

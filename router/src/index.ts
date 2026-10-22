@@ -54,38 +54,35 @@ import { buildPlannerContract } from './parsing/plannerContract.js';
 import { parseUserScope } from './parsing/constraintParser.js';
 import { plannerContractToValidationContract } from './parsing/plannerContract.js';
 
+export const REQUEST_TIMEOUT_MS = 3600000;
+
+
+export const REPEAT_PENALTY_TOKENS = 256;
+
+
+export const REPEAT_PENALTY = 1.18;
+
+
+export const MAX_TOTAL_CORRECTIONS = 5;
+
+
+export const MAX_TOKENS = 4096;
+
+
+export const MAX_CORRECTIONS_PER_FILE = 3;
+
+
+export const MAX_AGENT_ITERATIONS = 6;
+
+
 // ---------------------------------------------------------------------------
 // Constraint Parser — runs BEFORE advisor, highest priority
 // ---------------------------------------------------------------------------
 
 type UserScope = 'BACKEND_ONLY' | 'FRONTEND_ONLY' | 'ANY';
 
-const BACKEND_ONLY_PATTERNS = [
-	/\bbackend[\s-]?only\b/i, /\bbackend\s+files?\s+only\b/i,
-	/\bgenerate\s+(?:only\s+)?backend\b/i, /\bserver[\s-]?only\b/i,
-	/\bapi[\s-]?only\b/i, /\bno\s+frontend\b/i, /\bwithout\s+frontend\b/i,
-	/\bexpress\s+backend\b/i, /\bnestjs\s+backend\b/i,
-	/\bno\s+react\b/i, /\bno\s+ui\b/i,
-	// Natural language backend requests
-	/\b(?:build|create|implement|make)\s+(?:a\s+)?(?:[\w-]+\s+){0,3}(?:rest\s+|server\s+)?backend\b/i,
-	/\bbackend\s+for\b/i,
-	/\bbackend\s+(?:service|server|api|application)\b/i,
-	/\bonly\s+(?:the\s+)?(?:backend|server|api)\b/i,
-];
-const FRONTEND_ONLY_PATTERNS = [
-	/\bfrontend[\s-]?only\b/i, /\breact[\s-]?only\b/i,
-	/\bnext\.?js[\s-]?only\b/i, /\bui[\s-]?only\b/i,
-	/\bcomponent[\s-]?only\b/i, /\bno\s+backend\b/i,
-	/\bwithout\s+backend\b/i, /\bno\s+server\b/i, /\bno\s+api\b/i,
-	// Natural language frontend requests
-	/\b(?:build|create|implement|make|design)\s+(?:a\s+)?(?:[\w-]+\s+){0,3}(?:dashboard\s+|web\s+)?frontend\b/i,
-	/\bfrontend\s+for\b/i,
-	/\bfrontend\s+(?:dashboard|app|application|ui|interface|client)\b/i,
-	/\bclient[\s-]?side\b/i,
-	/\bfrontend\s+code\b/i,
-	/\bonly\s+(?:the\s+)?(?:frontend|ui)\b/i,
-	/\buse\s+mock\s+(?:data|api|functions)\b/i,
-];
+
+
 
 
 
@@ -103,38 +100,11 @@ interface PlannerContract {
 	estimatedFiles: number;
 }
 
-const FEATURE_DETECTION: Array<{ key: string; re: RegExp }> = [
-	{ key: 'jwt', re: /\bjwt\b|json.?web.?token|access.?token/i },
-	{ key: 'refresh_tokens', re: /refresh.?token/i },
-	{ key: 'repository', re: /repository.?pattern|repo.?pattern/i },
-	{ key: 'service_layer', re: /service.?layer|service\s+class/i },
-	{ key: 'uploads', re: /\bupload\b|file.?upload|image.?upload/i },
-	{ key: 'logging', re: /\blogg?ing\b|\blogger\b/i },
-	{ key: 'pagination', re: /\bpaginat/i },
-	{ key: 'email', re: /\bemail\b|send.?mail|nodemailer/i },
-	{ key: 'payments', re: /\bpayment\b|\bstripe\b|\bpaypal\b|\bcheckout\b/i },
-	{ key: 'rbac', re: /\brbac\b|role.?based|permission|admin.?role/i },
-	{ key: 'oauth', re: /\boauth\b|google.?auth|github.?auth|social.?login/i },
-	{ key: 'password_reset', re: /password.?reset|forgot.?password/i },
-	{ key: 'email_verification', re: /email.?verif|verify.?email/i },
-	{ key: 'transactions', re: /\btransaction\b/i },
-	{ key: 'dto', re: /\bdto\b|data.?transfer.?object|class.?validator/i },
-	{ key: 'bcrypt', re: /\bbcrypt\b|hash.?password|password.?hash/i },
-	{ key: 'middleware', re: /\bmiddleware\b/i },
-];
 
-const ARCH_DETECTION: Array<{ arch: PlannerContract['architecture']; re: RegExp }> = [
-	{ arch: 'repository', re: /repository.?pattern|repo.?pattern/i },
-	{ arch: 'clean', re: /clean.?arch|domain.?driven|ddd|hexagonal/i },
-	{ arch: 'mvc', re: /\bmvc\b|model.?view.?controller/i },
-];
 
-const ARCH_FOLDERS_MAP: Record<string, string[]> = {
-	repository: ['controllers', 'services', 'repositories'],
-	mvc: ['models', 'controllers'],
-	clean: ['domain', 'application', 'infrastructure'],
-	flat: [],
-};
+
+
+
 
 
 
@@ -184,16 +154,13 @@ app.use(express.json());
 
 const PORT = config.server.port;
 
-const IDLE_UNLOAD_MS = config.generation.requestTimeoutMs; // 5 min idle → unload model
+// 5 min idle → unload model
 
 // GPU VRAM budget per model key
 // 'auto' = node-llama-cpp binary-searches best layer count, falls back to CPU if needed (never OOMs)
 // 'max'  = ALL layers or throw — do NOT use
 // 0      = CPU only
-const GPU_LAYERS: Record<string, number | 'auto'> = {
-	fe: 'auto',
-	be: 'auto',
-};
+
 
 // ---------------------------------------------------------------------------
 // ModelManager — exactly 0 or 1 model in VRAM at any time
@@ -211,21 +178,21 @@ em.init().catch(e => console.error('[EmbeddingManager] Init failed:', e));
 // ---------------------------------------------------------------------------
 
 // 1. UI Components, Suffixes & Structure
-export const UI_COMPONENT_PATTERN = /\b(?:board|card|column|view|page|screen|modal|dialog|panel|widget|bar|tab|drawer|menu|carousel|slider|form|table|chart|grid|feed|timeline|sidebar|navbar|header|footer|button|input|dropdown|toast|accordion|avatar|badge|canvas|popup|stepper|breadcrumbs?|tooltip|trello|kanban)s?\b/i;
+
 
 // 2. Interaction, Visual & Styling Verbs
-export const UI_INTERACTION_PATTERN = /\b(?:drag(?:ging)?(?:\s+and\s+drop)?|drop(?:ped)?|click(?:able)?|hover|render(?:ing)?|display(?:ing)?|style(?:d|s)?|animate(?:d|s|ion)?|preview|layout|visualize|toggle|select|filter|sort|reorder|scroll|zoom|paint|color|draw)\b/i;
+
 
 // 3. Visual & Design Modifiers
-export const UI_DESIGN_PATTERN = /\b(?:ui|ux|frontend|front-end|gui|theme|dark\s*mode|light\s*mode|responsive|mobile|desktop|css|scss|sass|tailwind|html|svg|icon|palette|typography|look\s+like|clone(?:\s+of)?|style|-style)\b/i;
+
 
 // 4. Frontend Frameworks & Libraries
-export const UI_FRAMEWORK_PATTERN = /\b(?:react|vue|svelte|angular|next\.?js|nuxt|vite|tailwind(?:css)?|framer|lucide|shadcn|radix|redux|zustand|tanstack|chakra|material-ui|mui|bootstrap)\b/i;
+
 
 // Backend Patterns (strictly bounded)
-export const BE_DB_PATTERN = /\b(?:sql|postgres(?:ql)?|mysql|sqlite|mongodb?|mongoose|prisma|typeorm|database|db|migration|seed(?:er)?|redis|memcached)\b/i;
-export const BE_SERVER_PATTERN = /\b(?:backend|back-end|api|rest(?:ful)?|graphql|endpoint|route|router|controller|service|middleware|repository|server|express|nestjs|fastify|koa|django|flask|spring)\b/i;
-export const BE_AUTH_INFRA_PATTERN = /\b(?:jwt|bearer|oauth|bcrypt|hash(?:ing)?|auth(?:entication|orization)?|session|cookie|rbac|queue|bullmq|kafka|rabbitmq|cron|worker|microservice|docker)\b/i;
+
+
+
 
 // Helpers for Dynamic Routing
 
@@ -236,19 +203,9 @@ export const BE_AUTH_INFRA_PATTERN = /\b(?:jwt|bearer|oauth|bcrypt|hash(?:ing)?|
 // READ vs WRITE intent classifier
 // ---------------------------------------------------------------------------
 
-const READ_PATTERNS = [
-	/\b(?:explain|summarize|summary|describe|what\s+is|what\s+are|how\s+does|how\s+do|tell\s+me\s+about)\b/i,
-	/\b(?:list|show|find|locate|search|where\s+is|where\s+are|which\s+files?)\b/i,
-	/\b(?:review|audit|analyse|analyze|inspect|read|look\s+at|check)\b/i,
-	/\b(?:architecture|overview|structure|diagram|dependency|dependencies)\b/i,
-];
 
-const WRITE_PATTERNS = [
-	/\b(?:create|make|generate|add|write|implement|build|scaffold)\b/i,
-	/\b(?:modify|edit|update|change|refactor|rename|move|delete|remove)\b/i,
-	/\b(?:fix|debug|resolve|patch|correct|repair)\b/i,
-	/\b(?:add\s+feature|new\s+file|new\s+component|new\s+route|new\s+endpoint)\b/i,
-];
+
+
 
 
 
@@ -583,13 +540,13 @@ interface PipelineEvent {
 // Chat Completions — Agentic Tool-Calling Loop & Hardening Settings
 // ---------------------------------------------------------------------------
 
-const MAX_TOKENS = 4096;
-const REPEAT_PENALTY = 1.18;
-const REPEAT_PENALTY_TOKENS = 256;
-const REQUEST_TIMEOUT_MS = 3600000; // 60 minutes (3600 seconds)
-const MAX_AGENT_ITERATIONS = 6; // 3 for BE pass + 3 for FE pass in full-stack mode
-const MAX_CORRECTIONS_PER_FILE = 3;
-const MAX_TOTAL_CORRECTIONS = 5;
+
+
+
+// 60 minutes (3600 seconds)
+// 3 for BE pass + 3 for FE pass in full-stack mode
+
+
 
 
 

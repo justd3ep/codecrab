@@ -117,17 +117,19 @@ import {
 	setActiveController,
 	abortActiveGeneration,
 } from '../server/requestMutex.js';
+import { MAX_AGENT_ITERATIONS, MAX_CORRECTIONS_PER_FILE, MAX_TOTAL_CORRECTIONS, REPEAT_PENALTY, REPEAT_PENALTY_TOKENS, REQUEST_TIMEOUT_MS } from '../index.js';
+
 
 // ---------------------------------------------------------------------------
 // Constants & Settings
 // ---------------------------------------------------------------------------
-const MAX_TOKENS = 4096;
-const REPEAT_PENALTY = 1.18;
-const REPEAT_PENALTY_TOKENS = 256;
-const REQUEST_TIMEOUT_MS = 3600000; // 60 minutes (3600 seconds)
-const MAX_AGENT_ITERATIONS = 6; // 3 for BE pass + 3 for FE pass in full-stack mode
-const MAX_CORRECTIONS_PER_FILE = 3;
-const MAX_TOTAL_CORRECTIONS = 5;
+
+
+
+// 60 minutes (3600 seconds)
+// 3 for BE pass + 3 for FE pass in full-stack mode
+
+
 
 // ---------------------------------------------------------------------------
 // Advisor Helper Passes

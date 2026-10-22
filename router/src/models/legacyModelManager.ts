@@ -11,12 +11,18 @@ import { fileURLToPath } from 'url';
 import { getLlama, Llama, LlamaModel } from 'node-llama-cpp';
 import config from '../config/index.js';
 
+export const IDLE_UNLOAD_MS = config.generation.requestTimeoutMs;
+
+
 export const GPU_LAYERS: Record<string, number | 'auto'> = {
 	fe: 'auto',
 	be: 'auto',
 };
 
-export const IDLE_UNLOAD_MS = config.generation.requestTimeoutMs; // 5 min idle → unload model
+
+
+
+// 5 min idle → unload model
 
 class LegacyModelManager {
 	private llama: Llama | null = null;
