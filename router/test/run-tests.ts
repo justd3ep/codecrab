@@ -130,6 +130,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-prompts-load.ts',
 		what: 'the prompt loader loads the real prompt files',
 	},
+	{
+		file: 'verify-crash-handlers.ts',
+		what: 'the crash handlers exist and the prompt path is right',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook

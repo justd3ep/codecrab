@@ -54,6 +54,7 @@ import { getAvailableModels, getCpuUsage } from './router/systemRoutes.js';
 import { buildPlannerContract } from './parsing/plannerContract.js';
 import { parseUserScope } from './parsing/constraintParser.js';
 import { plannerContractToValidationContract } from './parsing/plannerContract.js';
+import { installCrashHandlers } from './server/crashHandlers.js';
 
 import {
 	MAX_AGENT_ITERATIONS,
@@ -2624,8 +2625,20 @@ _recovery.scan().catch(e => console.error('[RecoveryManager] Scan failed:', e));
 app.use('/v1/jobs', makeJobRoutes(_jobService, _asyncLogger.child('JobRoutes')));
 app.use('/', makeHealthRoutes(_asyncMM));
 
-app.listen(PORT, () => {
+// The server object is KEPT. app.listen(PORT, ...) does not keep it,
+// and a failed bind — EADDRINUSE, another router already on the port
+// — is an unhandled 'error' event on a server nobody holds a
+// reference to. Node throws it, and with no handler the process
+// exits 1 with no explanation.
+const server = app.listen(PORT, () => {
 	console.log(`CodeCrab Native Model Router running on http://localhost:${PORT}`);
 	console.log(`Engine: node-llama-cpp`);
 	console.log(`Runtime Directory: ${config.runtime.root}`);
 });
+
+// The crash handlers. They used to be inline here, and the refactor
+// commit 0b82970 deleted them — so the router died with exit code 1
+// and no explanation, which is the exact failure they were added to
+// prevent. They live in their own module now, so moving code around
+// index.ts cannot lose them again.
+installCrashHandlers(() => server);
