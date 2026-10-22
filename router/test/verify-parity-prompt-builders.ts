@@ -94,8 +94,35 @@ check('index.ts imports them from prompts/promptBuilder', () => {
 	const m = /import\s*\{([^}]*)\}\s*from\s*'\.\/prompts\/promptBuilder\.js'/.exec(indexSrc);
 	if (!m) return 'the import is missing';
 	const names = m[1]!.split(',').map(s => s.trim());
-	return names.includes('buildSystemPrompt') && names.includes('buildFESystemPrompt')
-		? true : `the import is missing them: ${names.join(', ')}`;
+	// buildSystemPrompt is the GENERAL prompt builder — it takes the
+	// specialist and dispatches to buildFESystemPrompt or
+	// buildBESystemPrompt internally. So index.ts imports
+	// buildSystemPrompt and buildBESystemPrompt (which it calls
+	// directly for the backend create prompt), and NOT
+	// buildFESystemPrompt.
+	//
+	// The check used to require buildFESystemPrompt in the import,
+	// which asserted a STALE FACT: the function is not called from
+	// index.ts, so the import was removed as dead — correctly.
+	const hasGeneral = names.includes('buildSystemPrompt');
+	const hasBackend = names.includes('buildBESystemPrompt');
+	if (hasGeneral && hasBackend) return true;
+	const missing = [
+		...(!hasGeneral ? ['buildSystemPrompt'] : []),
+		...(!hasBackend ? ['buildBESystemPrompt'] : []),
+	];
+	return `the import is missing them: ${missing.join(', ')}`;
+});
+
+check('index.ts does NOT import buildFESystemPrompt — it is called by buildSystemPrompt', () => {
+	// It is reached through buildSystemPrompt, so importing it here
+	// would be an unused import.
+	const m = /import\s*\{([^}]*)\}\s*from\s*'\.\/prompts\/promptBuilder\.js'/.exec(indexSrc);
+	if (!m) return 'the import is missing';
+	const names = m[1]!.split(',').map(s => s.trim());
+	return !names.includes('buildFESystemPrompt')
+		? true
+		: 'it imports it, but it is never called from index.ts';
 });
 
 check('ensembleRouter.ts exports ensembleRoute', () =>

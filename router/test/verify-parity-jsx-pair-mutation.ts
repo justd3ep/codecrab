@@ -147,9 +147,21 @@ if (m4 === helpersOriginal) {
 
 console.log('\n=== 5. re-introducing a local copy in index.ts must FAIL the test ===');
 
+// The import may be on its own line or merged into a multi-name
+// import, so the anchor is the NAMES, not the whole line.
+//
+// The replace must be GLOBAL: there are three pipelineHelpers
+// imports, and only the third carries validateJsxSymbols. A
+// non-global replace stops at the first one and never reaches it.
 const m5 = indexOriginal.replace(
-	"import { validateJsxSymbols, buildJsxRepairPrompt, ",
-	"function validateJsxSymbols(a: any, b: any): any { return []; }\nimport { validateJsxSymbols, buildJsxRepairPrompt, ",
+	/import \{([^}]*)\} from '\.\/generation\/pipelineHelpers\.js';/g,
+	(full: string, names: string) => {
+		if (!names.includes('validateJsxSymbols')) return full;
+		return full.replace(
+			'import {',
+			'function validateJsxSymbols(a: any, b: any): any { return []; }\nimport {',
+		);
+	},
 );
 if (m5 === indexOriginal) {
 	check('the mutation applies', () => 'the import line was not found');

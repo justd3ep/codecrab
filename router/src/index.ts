@@ -8,19 +8,22 @@ import os from 'os';
 import crypto from 'crypto';
 import { exec } from 'child_process';
 import util from 'util';
-import { fileURLToPath } from 'url';
-import { getLlama, Llama, LlamaModel, LlamaContext, LlamaChatSession } from 'node-llama-cpp';
-import { em, indexWorkspace, updateFile, deleteFiles, syncWorkspace, retrieveContext, tableNameFor } from './rag.js';
-import { tier2Retrieve, patchTier2Caches, shouldSkipFEPhase, cleanupArtifacts, patchCachesFromArtifact } from './rag/index.js';
+import { LlamaContext, LlamaChatSession } from 'node-llama-cpp';
+import { em } from './rag.js';
+import { tier2Retrieve, cleanupArtifacts, patchCachesFromArtifact } from './rag/index.js';
 import { buildArtifactFromFiles, writeArtifact, deleteArtifact } from './rag/artifact.js';
 import { runPostGenerationValidator } from './validator.js';
-import type { ValidationContract, ValidationIssue, GeneratedFile } from './validator.js';
+import type { GeneratedFile } from './validator.js';
 import { selectTopDependencyFiles, buildDependencyContextBlock } from './dependencySelector.js';
-import { buildFERepairPrompt, buildPlainStackRepairPrompt, buildTargetedRepairPrompt, classifyRepairMode, collectWorkspaceModules, fileExists } from './repairEngine.js';
+import {
+	buildFERepairPrompt,
+	buildPlainStackRepairPrompt,
+	buildTargetedRepairPrompt,
+} from './repairEngine.js';
 import { inspectWorkspace } from './workspaceInspector.js';
-import { buildExecutionGraph, nextPendingNode, isGraphComplete, graphSummary, markNodeFailed } from './planner.js';
-import type { AdvisorV2Result, ExecutionGraph } from './planner.js';
-import { resolveCapabilities, loadCapabilityPrompts, buildCapabilitySystemPrompt } from './capabilityResolver.js';
+import { buildExecutionGraph } from './planner.js';
+import type { AdvisorV2Result } from './planner.js';
+import { buildCapabilitySystemPrompt } from './capabilityResolver.js';
 import { runIncrementalEngine, shouldUseIncrementalEngine } from './incrementalEngine.js';
 
 // ── Async Job System (Phase 4) ─────────────────────────────────────────────
@@ -32,24 +35,44 @@ import { RecoveryManager } from './jobs/recoveryManager.js';
 import { makeJobRoutes } from './router/jobRoutes.js';
 import { makeHealthRoutes } from './router/healthRoutes.js';
 import config from '@/config/index.js';
-import { activeContextUsage, updateContextUsage, setEffectiveContextSize, effectiveContextSize } from './telemetry/contextUsage.js';
-import { ensureFrontendScaffold, ensureBackendScaffold, mergePackageJson, mergeInitSh } from './frontendScaffold.js';
-import { classifyIntent, classifyOpenFile, detectAppType, detectBackendIntent, detectFrontendIntent, inferPreviousRoute, parseAdvisorIntent, parseAdvisorV2, runAdvisor, runAdvisorLoopDecomposition, runAdvisorProjectSummary, scoreKeywords } from './routing/intentClassifier.js';
+import {
+	activeContextUsage,
+	updateContextUsage,
+	setEffectiveContextSize,
+} from './telemetry/contextUsage.js';
+import { ensureFrontendScaffold, ensureBackendScaffold } from './frontendScaffold.js';
+import {
+	classifyIntent,
+	detectBackendIntent,
+	detectFrontendIntent,
+	runAdvisor,
+	runAdvisorLoopDecomposition,
+	runAdvisorProjectSummary,
+} from './routing/intentClassifier.js';
 import { detectStackProfile } from './routing/stackProfile.js';
-import type { StackProfile } from './routing/stackProfile.js';
 import { diagnoseResponse, buildTruncationContinuationPrompt, buildProseOutputPrompt } from './generation/responseDiagnosis.js';
-import { cleanCodeBlock, detectRepetitionLoop, escapeRegExp, extractBackendSummary, extractFallbackEdits, extractRawCode, isExplicitCodeRequest, streamChunk, streamEvent } from './generation/pipelineHelpers.js';
+import {
+	detectRepetitionLoop,
+	extractBackendSummary,
+	extractFallbackEdits,
+	isExplicitCodeRequest,
+	streamChunk,
+	streamEvent,
+} from './generation/pipelineHelpers.js';
 import { buildNoOutputPrompt } from './generation/pipelineHelpers.js';
-import { validateJsxSymbols, buildJsxRepairPrompt, type JsxSymbolIssue } from './generation/pipelineHelpers.js';
-import { parseAdvisorJson } from './routing/advisorJson.js';
-
-import { wouldClobberScaffold } from './tools/scaffoldGuard.js';
+import { validateJsxSymbols, buildJsxRepairPrompt } from './generation/pipelineHelpers.js';
 import { determineMode } from './routing/agentMode.js';
 
-import { buildBESystemPrompt, buildFESystemPrompt, buildSystemPrompt, loadPrompt, logRoutingFailure, workspaceHasTsx } from './prompts/promptBuilder.js';
+import { buildBESystemPrompt, buildSystemPrompt, workspaceHasTsx } from './prompts/promptBuilder.js';
 
-import { ensembleRoute, isCreatePrompt, promptNeedsFrontend, shouldRunFrontend } from './routing/ensembleRouter.js';
-import { applyPendingSession, buildDirectoryTree, buildLCS, createPendingSession, executeToolCall, extractReferencedFiles, generateUnifiedDiff, inferFilePath, parseToolCall, readFileSafe, validateContentForExtension, validateTargetPath } from './tools/toolEngine.js';
+import { ensembleRoute, promptNeedsFrontend, shouldRunFrontend } from './routing/ensembleRouter.js';
+import {
+	buildDirectoryTree,
+	executeToolCall,
+	extractReferencedFiles,
+	parseToolCall,
+	readFileSafe,
+} from './tools/toolEngine.js';
 import { getAvailableModels, getCpuUsage } from './router/systemRoutes.js';
 import { buildPlannerContract } from './parsing/plannerContract.js';
 import { parseUserScope } from './parsing/constraintParser.js';

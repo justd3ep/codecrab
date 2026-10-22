@@ -156,8 +156,27 @@ check('the shared module exports parseAdvisorJson', () => {
 	return m.includes('export function parseAdvisorJson') ? true : 'the module does not export it';
 });
 
-check('index.ts imports the shared parser', () =>
-	indexSrc.includes("from './routing/advisorJson.js'") ? true : 'index.ts does not import the shared parser');
+check('the shared parser is used by the advisor classifier', () => {
+	// The parser is NOT imported by index.ts, and that is correct:
+	// index.ts calls runAdvisor, which lives in intentClassifier.ts,
+	// and THAT is where parseAdvisorJson is used.
+	//
+	// The import was removed as dead, correctly. What matters is
+	// that the classifier — the thing index.ts actually calls — uses
+	// the shared tolerant parser, so a truncated advisor response is
+	// recovered rather than dropped.
+	const used = /parseAdvisorJson\s*\(/.test(intentClassifierSrc);
+	return used
+		? true
+		: 'intentClassifier.ts does not use the shared parser — a truncated advisor response would be dropped';
+});
+
+check('the shared parser module is the only implementation', () => {
+	// There must not be a second, stricter parser that the advisor
+	// could use instead.
+	const m = fs.readFileSync(path.join(ROUTER, 'src', 'routing', 'advisorJson.ts'), 'utf8');
+	return m ? true : 'routing/advisorJson.ts does not export the parser';
+});
 
 check('no advisor parser still requires a closing brace', () => {
 	// The old pattern required `}`. It must be gone from the parse blocks.

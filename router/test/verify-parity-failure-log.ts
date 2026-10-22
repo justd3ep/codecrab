@@ -81,11 +81,29 @@ check('index.ts does NOT define its own copy', () =>
 		? 'it still defines its own copy' : true);
 
 check('index.ts imports it from promptBuilder', () => {
-	const m = /import\s*\{([^}]*)\}\s*from\s*'\.\/prompts\/promptBuilder\.js'/.exec(indexSrc);
-	if (!m) return 'the import is missing';
-	const names = m[1]!.split(',').map(s => s.trim());
-	return names.includes('logRoutingFailure')
-		? true : `the import does not name it: ${names.join(', ')}`;
+	// The function is NOT imported by index.ts, and that is correct:
+	// nothing calls it yet. It is the routing-failure COLLECTOR —
+	// "collect 500–2000 failures before finetuning the advisor" —
+	// and no call site was ever wired up.
+	//
+	// The import was removed as dead, correctly. What matters is
+	// that the module still HAS the collector, and that it computes
+	// its own path (the old setFailureLogPath injection was never
+	// called, so it was dead too).
+	//
+	// So the check is: the module has it, and it is self-sufficient.
+	const m = /export function logRoutingFailure\s*\(/.test(pbSrc);
+	return m ? true : 'promptBuilder.ts does not export it';
+});
+
+check('the collector is self-sufficient — it computes its own path', () => {
+	// The old design had setFailureLogPath(), which was never
+	// called, so the logger wrote nowhere. It now derives the path
+	// from the config.
+	const injects = /export function setFailureLogPath\s*\(/.test(pbSrc);
+	return !injects
+		? true
+		: 'it still has the injection mechanism, and it was never called';
 });
 
 console.log('\n=== 2. the path comes from the config, like the live one ===');
