@@ -54,22 +54,14 @@ import { buildPlannerContract } from './parsing/plannerContract.js';
 import { parseUserScope } from './parsing/constraintParser.js';
 import { plannerContractToValidationContract } from './parsing/plannerContract.js';
 
-export const REQUEST_TIMEOUT_MS = 3600000;
-
-
-export const REPEAT_PENALTY_TOKENS = 256;
-
-
-export const REPEAT_PENALTY = 1.18;
-
-
-export const MAX_TOTAL_CORRECTIONS = 5;
-
-
-export const MAX_CORRECTIONS_PER_FILE = 3;
-
-
-export const MAX_AGENT_ITERATIONS = 6;
+import {
+	MAX_AGENT_ITERATIONS,
+	MAX_CORRECTIONS_PER_FILE,
+	MAX_TOTAL_CORRECTIONS,
+	REPEAT_PENALTY,
+	REPEAT_PENALTY_TOKENS,
+	REQUEST_TIMEOUT_MS,
+} from './generation/limits.js';
 
 
 // ---------------------------------------------------------------------------

@@ -134,13 +134,13 @@ const HOME: Record<string, string> = {
 	WRITE_PATTERNS: 'routing/intentClassifier.ts',
 	GPU_LAYERS: 'models/legacyModelManager.ts',
 	IDLE_UNLOAD_MS: 'models/legacyModelManager.ts',
-	MAX_AGENT_ITERATIONS: 'index.ts',
-	MAX_CORRECTIONS_PER_FILE: 'index.ts',
+	MAX_AGENT_ITERATIONS: 'generation/limits.ts',
+	MAX_CORRECTIONS_PER_FILE: 'generation/limits.ts',
 	MAX_TOKENS: 'index.ts',
-	MAX_TOTAL_CORRECTIONS: 'index.ts',
-	REPEAT_PENALTY: 'index.ts',
-	REPEAT_PENALTY_TOKENS: 'index.ts',
-	REQUEST_TIMEOUT_MS: 'index.ts',
+	MAX_TOTAL_CORRECTIONS: 'generation/limits.ts',
+	REPEAT_PENALTY: 'generation/limits.ts',
+	REPEAT_PENALTY_TOKENS: 'generation/limits.ts',
+	REQUEST_TIMEOUT_MS: 'generation/limits.ts',
 };
 
 for (const name of SHARED) {
