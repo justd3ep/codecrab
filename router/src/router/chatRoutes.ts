@@ -27,6 +27,10 @@ import { resolveCapabilities, loadCapabilityPrompts, buildCapabilitySystemPrompt
 import { runIncrementalEngine, shouldUseIncrementalEngine } from '../incrementalEngine.js';
 import { ensureGitRepo, commitHarnessTurn, getGitLogSummarySync } from '../gitHarness.js';
 import { ensureFrontendScaffold, ensureBackendScaffold } from '../frontendScaffold.js';
+import { diagnoseResponse, buildTruncationContinuationPrompt, buildProseOutputPrompt } from '../generation/responseDiagnosis.js';
+import { wouldClobberScaffold } from '../tools/scaffoldGuard.js';
+import { parseAdvisorJson } from '../routing/advisorJson.js';
+import { buildNoOutputPrompt } from '../generation/pipelineHelpers.js';
 import config from '@/config/index.js';
 
 import { type UserScope, parseUserScope } from '../parsing/constraintParser.js';
@@ -117,7 +121,7 @@ import {
 	setActiveController,
 	abortActiveGeneration,
 } from '../server/requestMutex.js';
-import { MAX_AGENT_ITERATIONS, MAX_CORRECTIONS_PER_FILE, MAX_TOTAL_CORRECTIONS, REPEAT_PENALTY, REPEAT_PENALTY_TOKENS, REQUEST_TIMEOUT_MS } from '../index.js';
+import { MAX_AGENT_ITERATIONS, MAX_CORRECTIONS_PER_FILE, MAX_TOTAL_CORRECTIONS, REPEAT_PENALTY, REPEAT_PENALTY_TOKENS, REQUEST_TIMEOUT_MS } from '../generation/limits.js';
 
 
 // ---------------------------------------------------------------------------
@@ -202,6 +206,11 @@ export function makeChatRoutes(): Router {
 		const fileWriteAttempts = new Map<string, number>();
 		let totalCorrections = 0;
 		const responseHistory: string[] = [];
+		// P1.8 — per-file content hashes, so a file the model cannot fix
+		// is not re-prompted forever.
+		const fileHashHistory = new Map<string, string>();
+		const fileHashRepeat = new Map<string, number>();
+		const stuckFiles = new Set<string>();
 
 		try {
 			const workspaceRoot = req.body.workspaceRoot || config.workspace.defaultRoot;
@@ -409,6 +418,11 @@ export function makeChatRoutes(): Router {
 
 			// filesModified is shared between incremental engine and the monolithic fallback loop
 			const filesModified: string[] = [];
+			// These are NOT the deliverable — they are the project skeleton.
+			// Keeping them separate is what lets the summary say
+			// "12 files on disk, 0 of them generated" instead of the flat,
+			// misleading "12 files written".
+			const scaffoldedFiles = new Set<string>();
 			let bootstrappedCount = 0;
 
 			// Derive currentSpecialist from intent.
@@ -424,12 +438,14 @@ export function makeChatRoutes(): Router {
 					const beBootstrapped = ensureBackendScaffold(workspaceRoot, lastUserMsg);
 					bootstrappedCount += beBootstrapped.length;
 					for (const f of beBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+					for (const f of beBootstrapped) scaffoldedFiles.add(f);
 				}
 				// Frontend scaffolding when FE is active or prompt has frontend signals
 				if (currentSpecialist === 'fe' || intent === 'frontend' || (intent === 'general' && promptNeedsFrontend(lastUserMsg))) {
 					const feBootstrapped = ensureFrontendScaffold(workspaceRoot, lastUserMsg, stackProfile);
 					bootstrappedCount += feBootstrapped.length;
 					for (const f of feBootstrapped) if (!filesModified.includes(f)) filesModified.push(f);
+					for (const f of feBootstrapped) scaffoldedFiles.add(f);
 				}
 				if (bootstrappedCount > 0) {
 					try {
@@ -975,6 +991,27 @@ export function makeChatRoutes(): Router {
 				const responseTokenCount = activeModel ? activeModel.tokenize(fullResponse).length : 0;
 				console.log(`[Router] Iteration ${iteration + 1} complete. Tokens generated: ${responseTokenCount}`);
 
+				// ── Response diagnosis: truncated or prose? ─────────────────────
+				// A severed or non-code response must never be written to disk.
+				// Both cases are recoverable by re-prompting, and re-prompting is
+				// strictly better than writing a broken file and reporting success.
+				const diagnosis = diagnoseResponse(fullResponse, responseTokenCount, genMaxTokens);
+				if (diagnosis.truncated || diagnosis.prose) {
+					const canRetry = iteration < MAX_AGENT_ITERATIONS - 1 && !controller.signal.aborted;
+					if (canRetry) {
+						console.log(`[Router] Rejected response: ${diagnosis.reason}. Re-prompting.`);
+						streamEvent(res, { type: 'warning', stage: 'generate', message: diagnosis.truncated ? 'Response was cut off at the generation limit — regenerating the remaining files.' : 'The model replied with prose instead of code — asking for the files.' });
+						if (diagnosis.truncated) {
+							const emitted = fullResponse.match(/<file\s+path=["']([^"']+)["']/gi)?.map(m => m.replace(/<file\s+path=["']|["']/gi, '')) ?? [];
+							currentPrompt = buildTruncationContinuationPrompt(mode, lastUserMsg, emitted);
+						} else {
+							currentPrompt = buildProseOutputPrompt(mode, lastUserMsg);
+						}
+						continue;
+					}
+					throw new Error(`The model ${diagnosis.reason}. It could not be recovered within the iteration limit.`);
+				}
+
 				try {
 					const currentTokens = session.sequence.nextTokenIndex;
 					const modelLabel = currentSpecialist === 'be' ? 'backend' : 'frontend';
@@ -1098,6 +1135,44 @@ export function makeChatRoutes(): Router {
 								// Recompute passed after filtering (validator computed it before our scope filter)
 								validationResult.passed = !validationResult.issues.some(i => i.severity === 'error');
 								const validatedEdits = validationResult.files;
+								// P1.8 — a file the model cannot fix is excluded from the
+								// next repair prompt. If EVERY failing file is stuck, there
+								// is nothing left to ask for — stop instead of looping to
+								// the response-level guard.
+								const stuckNow = [...stuckFiles];
+								const repairableIssues = stuckNow.length > 0
+									? validationResult.issues.filter(i => !i.file || !stuckFiles.has(i.file))
+									: validationResult.issues;
+								if (repairableIssues.length === 0 && stuckNow.length > 0) {
+									throw new Error(
+										`Repair stalled: the model could not fix ${stuckNow.join(', ')} ` +
+										`after multiple attempts, and the content never changed.`,
+									);
+								}
+
+								// P1.8 — if a file's hash is the same as last iteration, the
+								// model is not making progress on it. Stop asking.
+								if (validationResult) {
+									const sha12p1 = (s: string) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 12);
+									for (const f of (validationResult.files ?? [])) {
+										const h = sha12p1(f.content);
+										const prev = fileHashHistory.get(f.path);
+										if (prev === h) {
+											const repeats = (fileHashRepeat.get(f.path) ?? 0) + 1;
+											fileHashRepeat.set(f.path, repeats);
+											if (repeats >= 2) {
+												stuckFiles.add(f.path);
+												console.warn(
+													`[Router] ⚠️ ${f.path} has not changed for ${repeats} iterations — ` +
+													`the model cannot fix it. Excluding it from the next repair prompt.`,
+												);
+											}
+										} else {
+											fileHashRepeat.set(f.path, 0);
+										}
+										fileHashHistory.set(f.path, h);
+									}
+									}
 								console.log(`[Router] Fallback: ${fallbackEdits.length} → ${validatedEdits.length} file(s) | passed=${validationResult.passed} | coverage=${validationResult.coverageScore}/${validationResult.coverageMax}`);
 								let hasErrors = false;
 								const errorOutputs: string[] = [];
@@ -1190,6 +1265,17 @@ export function makeChatRoutes(): Router {
 					if (currentSpecialist === 'fe' && workspaceRoot && !jsxRepairDoneMain && readWriteMode !== 'read') {
 						const extractedForValidation = extractFallbackEdits(fullResponse, openFiles, workspaceRoot, lastUserMsg, mode);
 						const jsxIssues = validateJsxSymbols(extractedForValidation, workspaceRoot);
+						// P0.4 — an empty generated set is not success. The remedy
+						// is to make the model emit code, not to repair symbols.
+						const noOutput = jsxIssues.find(i => i.kind === 'no_output');
+						if (noOutput) {
+							if (iteration < MAX_AGENT_ITERATIONS - 1 && !controller.signal.aborted) {
+								console.log('[Validator] no file blocks parsed from the response — re-prompting for code output.');
+								currentPrompt = buildNoOutputPrompt(mode);
+								continue;
+							}
+							throw new Error('The model produced no file blocks at all, and could not be recovered within the iteration limit.');
+						}
 						if (jsxIssues.length > 0 && iteration < MAX_AGENT_ITERATIONS - 1 && !controller.signal.aborted) {
 							jsxRepairDoneMain = true;
 							console.log(`[Validator] repairing ${jsxIssues.length} JSX issue(s) in main loop`);
@@ -1197,7 +1283,6 @@ export function makeChatRoutes(): Router {
 							continue;
 						}
 					}
-
 					// Part B — files written summary & application guard
 					const newFilesWrittenCount = filesModified.length - bootstrappedCount;
 					const isFrontendCreate = (mode === 'create' || advisorSaysCreate) && (currentSpecialist === 'fe' || intent === 'frontend');
