@@ -55,6 +55,7 @@ import { buildPlannerContract } from './parsing/plannerContract.js';
 import { parseUserScope } from './parsing/constraintParser.js';
 import { plannerContractToValidationContract } from './parsing/plannerContract.js';
 import { installCrashHandlers } from './server/crashHandlers.js';
+import { beginRequest } from './server/requestLifecycle.js';
 
 import {
 	MAX_AGENT_ITERATIONS,
@@ -615,29 +616,24 @@ app.post('/v1/chat/completions', async (req, res) => {
 	const releaseSlot = await acquireRequestSlot();
 
 	let context: LlamaContext | null = null;
-	const controller = new AbortController();
-	activeController = controller; // register globally so /v1/chat/abort can reach it
 
-	const abortGeneration = () => {
-		if (!controller.signal.aborted) {
-			console.log('[Router] Client disconnected or request aborted, aborting generation.');
-			controller.abort();
-		}
-	};
-	req.on('close', abortGeneration);
-	req.on('aborted', abortGeneration);
-	res.on('close', abortGeneration);
-
-	const timeoutId = setTimeout(() => {
-		console.error(`[Router] Request timeout of ${REQUEST_TIMEOUT_MS}ms exceeded. Aborting.`);
-		controller.abort();
-	}, REQUEST_TIMEOUT_MS);
-
-	// Part B — tracking written files for current request
-	// filesModified tracks actual disk writes during this session
-	const fileWriteAttempts = new Map<string, number>();
-	let totalCorrections = 0;
-	const responseHistory: string[] = [];
+	// The request lifecycle: the abort controller, the abort
+	// listeners, the timeout, and the per-request tracking state.
+	//
+	// It is a module because the CLEANUP is the valuable part — the
+	// slot must be released, the timer cleared, the context disposed
+	// and the controller deregistered on EVERY exit path, including
+	// the ones that throw. One owner for all four cannot get it
+	// wrong, and cannot leak a slot when a new exit path is added.
+	const life = beginRequest(req, res, {
+		releaseSlot,
+		timeoutMs: REQUEST_TIMEOUT_MS,
+		registerController: (c) => { activeController = c; },
+		deregisterController: (c) => { if (activeController === c) activeController = null; },
+		getContext: () => context,
+		clearContext: () => { context = null; },
+	});
+	const { controller, fileWriteAttempts, responseHistory, timeoutId, totalCorrections } = life;
 
 	try {
 		const workspaceRoot = req.body.workspaceRoot || config.workspace.defaultRoot;
@@ -1734,11 +1730,11 @@ app.post('/v1/chat/completions', async (req, res) => {
 									if (result.diffMsg) streamChunk(res, result.diffMsg);
 									console.log(`[Router] Fallback written: ${edit.path}`);
 								} else if (!result.success) {
-									totalCorrections++;
+									totalCorrections.value++;
 									console.log(`[Router] Fallback write rejected: ${result.output}`);
 									streamEvent(res, { type: 'error', stage: 'write', message: `Write rejected for \`${edit.path}\`: ${result.output}`, file: edit.path });
 
-									if (totalCorrections > MAX_TOTAL_CORRECTIONS) {
+									if (totalCorrections.value > MAX_TOTAL_CORRECTIONS) {
 										throw new Error(`Fallback Protection: Exceeded maximum validation correction limit (${MAX_TOTAL_CORRECTIONS} total corrections).`);
 									}
 
@@ -1912,10 +1908,10 @@ Continue with your task using plain text only. Do not emit any file blocks or wr
 					streamEvent(res, { type: 'success', stage: 'write', message: `Written \`${writtenPath}\``, file: writtenPath });
 					if (result.diffMsg) streamChunk(res, result.diffMsg);
 				} else if (!result.success) {
-					totalCorrections++;
+					totalCorrections.value++;
 					streamEvent(res, { type: 'error', stage: 'write', message: `Write rejected for \`${toolCall.arguments.path}\`: ${result.output}`, file: toolCall.arguments.path });
-					if (totalCorrections > MAX_TOTAL_CORRECTIONS) {
-						throw new Error(`Fallback Protection: Exceeded maximum validation correction limit (${totalCorrections} total corrections).`);
+					if (totalCorrections.value > MAX_TOTAL_CORRECTIONS) {
+						throw new Error(`Fallback Protection: Exceeded maximum validation correction limit (${totalCorrections.value} total corrections).`);
 					}
 				}
 			}
@@ -2520,13 +2516,10 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 			}
 		}
 	} finally {
-		clearTimeout(timeoutId);
-		if (context) {
-			await context.dispose();
-			console.log(`[Router] Context disposed successfully.`);
-		}
-		if (activeController === controller) activeController = null; // deregister
-		releaseSlot();
+		// The lifecycle owns the cleanup: the timer, the context
+		// disposal, the controller deregistration and the slot
+		// release. It is idempotent, so a second call is harmless.
+		await life.cleanup();
 	}
 });
 
