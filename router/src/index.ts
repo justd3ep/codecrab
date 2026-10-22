@@ -6,7 +6,6 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import crypto from 'crypto';
-import { exec } from 'child_process';
 import util from 'util';
 import { LlamaContext, LlamaChatSession } from 'node-llama-cpp';
 import { em } from './rag.js';
@@ -33,13 +32,8 @@ import { ModelManager } from './models/modelManager.js';
 import { JobService } from './jobs/jobService.js';
 import { RecoveryManager } from './jobs/recoveryManager.js';
 import { makeJobRoutes } from './router/jobRoutes.js';
-import { makeHealthRoutes } from './router/healthRoutes.js';
 import config from '@/config/index.js';
-import {
-	activeContextUsage,
-	updateContextUsage,
-	setEffectiveContextSize,
-} from './telemetry/contextUsage.js';
+import { updateContextUsage, setEffectiveContextSize } from './telemetry/contextUsage.js';
 import { ensureFrontendScaffold, ensureBackendScaffold } from './frontendScaffold.js';
 import {
 	classifyIntent,
@@ -73,7 +67,7 @@ import {
 	parseToolCall,
 	readFileSafe,
 } from './tools/toolEngine.js';
-import { getAvailableModels, getCpuUsage } from './router/systemRoutes.js';
+import { makeSystemRoutes } from './router/systemRoutes.js';
 import { buildPlannerContract } from './parsing/plannerContract.js';
 import { parseUserScope } from './parsing/constraintParser.js';
 import { plannerContractToValidationContract } from './parsing/plannerContract.js';
@@ -148,7 +142,6 @@ const _origStderrWrite = process.stderr.write.bind(process.stderr);
 	return (_origStderrWrite as any)(chunk, ...args);
 };
 
-const execPromise = util.promisify(exec);
 
 const app = express();
 app.use(cors());
@@ -215,98 +208,11 @@ em.init().catch(e => console.error('[EmbeddingManager] Init failed:', e));
 
 
 // Health Check
-app.get('/health', (req, res) => {
-	res.json({
-		router: 'ok',
-		engine: 'node-llama-cpp',
-		// The editor's ISpecialistModel expects a narrow domain/status union.
-		// The router used to report 'ready' / 'Frontend UI/UX', which matched
-		// neither, so the model picker silently showed garbage.
-		ollama: 'connected',
-		...mm.status,
-		context: activeContextUsage,
-		models: getAvailableModels(),
-		// Which model file was really loaded, and whether the preferred one
-		// was missing. A silent fallback hid a 3x-slower model.
-		modelResolution: config.modelResolution ?? null
-	});
-});
+// The system routes — /health, /stats, /context-usage, /v1/models.
+// They were inline here AND in router/src/router/systemRoutes.ts,
+// and the module was never mounted. The module is mounted now.
+app.use('/', makeSystemRoutes());
 
-
-
-// Stats Telemetry Endpoint
-app.get('/stats', async (req, res) => {
-	try {
-		const totalMemBytes = os.totalmem();
-		const freeMemBytes = os.freemem();
-		const usedMemBytes = totalMemBytes - freeMemBytes;
-		const ramUsagePercent = (usedMemBytes / totalMemBytes) * 100;
-		const ramUsedGb = usedMemBytes / 1024 / 1024 / 1024;
-		const ramTotalGb = totalMemBytes / 1024 / 1024 / 1024;
-
-		const cpuUsagePercent = getCpuUsage();
-
-		let storageUsagePercent = 0;
-		let storageUsedGb = 0;
-		let storageTotalGb = 0;
-		try {
-			const { stdout } = await execPromise('df -k / | tail -1');
-			const parts = stdout.trim().split(/\\s+/);
-			const totalKb = parseInt(parts[1] ?? '0', 10);
-			const usedKb = parseInt(parts[2] ?? '0', 10);
-			storageTotalGb = totalKb / 1024 / 1024;
-			storageUsedGb = usedKb / 1024 / 1024;
-			storageUsagePercent = (storageUsedGb / storageTotalGb) * 100;
-		} catch (e) { }
-
-		let hasGpu = false;
-		let vramUsagePercent = 0;
-		let vramUsedGb = 0;
-		let vramTotalGb = 0;
-
-		try {
-			const { stdout } = await execPromise('nvidia-smi --query-gpu=memory.used,memory.total --format=csv,nounits,noheader');
-			const [used, total] = stdout.trim().split(',').map(Number);
-			hasGpu = true;
-			vramUsedGb = (used ?? 0) / 1024;
-			vramTotalGb = (total ?? 0) / 1024;
-			vramUsagePercent = ((used ?? 0) / (total ?? 1)) * 100;
-		} catch (e) {
-			try {
-				const { stdout } = await execPromise('rocm-smi --showmeminfo vram --csv');
-				if (stdout.includes('vram')) {
-					hasGpu = true;
-					// Dummy AMD values if parsing is complex, just to show it detected AMD
-					vramUsagePercent = 40;
-					vramUsedGb = 6;
-					vramTotalGb = 16;
-				}
-			} catch (e2) {
-				hasGpu = false;
-			}
-		}
-
-		res.json({
-			cpu: { percent: cpuUsagePercent.toFixed(1) },
-			ram: { percent: ramUsagePercent.toFixed(1), usedGb: ramUsedGb.toFixed(1), totalGb: ramTotalGb.toFixed(1) },
-			storage: { percent: storageUsagePercent.toFixed(1), usedGb: storageUsedGb.toFixed(1), totalGb: storageTotalGb.toFixed(1) },
-			gpu: { hasGpu, percent: vramUsagePercent.toFixed(1), usedGb: vramUsedGb.toFixed(1), totalGb: vramTotalGb.toFixed(1) },
-			context: activeContextUsage
-		});
-	} catch (error) {
-		res.status(500).json({ error: 'Failed to fetch stats' });
-	}
-});
-
-// Live Context Usage Endpoint
-app.get('/context-usage', (_req, res) => {
-	res.json(activeContextUsage);
-});
-
-// List Models
-app.get('/v1/models', (req, res) => {
-	res.json(getAvailableModels());
-});
 
 // ---------------------------------------------------------------------------
 // Dynamic System Prompt Builder
@@ -2505,7 +2411,6 @@ _recovery.scan().catch(e => console.error('[RecoveryManager] Scan failed:', e));
 
 // Mount job routes
 app.use('/v1/jobs', makeJobRoutes(_jobService, _asyncLogger.child('JobRoutes')));
-app.use('/', makeHealthRoutes(_asyncMM));
 
 // The server object is KEPT. app.listen(PORT, ...) does not keep it,
 // and a failed bind — EADDRINUSE, another router already on the port

@@ -199,8 +199,19 @@ check('the config exposes modelResolution', () =>
 check('the config type declares modelResolution', () =>
 	cfgTypesSrc.includes('modelResolution') ? true : 'the AppConfig type is missing modelResolution');
 
-check('/health reports the model resolution', () =>
-	indexLive.includes('modelResolution: config.modelResolution') ? true : '/health does not report it');
+check('/health reports the model resolution', () => {
+	// The /health route lives in router/src/router/systemRoutes.ts
+	// now. It was inline in index.ts, and the inline copy was the
+	// newer one — the module was brought up to date before it was
+	// mounted.
+	const systemSrc = fs.readFileSync(
+		path.join(ROUTER, 'src', 'router', 'systemRoutes.ts'),
+		'utf-8',
+	);
+	return systemSrc.includes('modelResolution: config.modelResolution')
+		? true
+		: '/health does not report it';
+});
 
 // ══════════════════════════════════════════════════════════════════════
 console.log('\n=== P1.7 — a create request cannot clobber the scaffold ===');

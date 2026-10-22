@@ -79,9 +79,16 @@ export function makeSystemRoutes(): Router {
 		res.json({
 			router: 'ok',
 			engine: 'node-llama-cpp',
+			// The editor's ISpecialistModel expects a narrow domain/status union.
+			// The router used to report 'ready' / 'Frontend UI/UX', which matched
+			// neither, so the model picker silently showed garbage.
+			ollama: 'connected',
 			...mm.status,
 			context: activeContextUsage,
-			models: getAvailableModels()
+			models: getAvailableModels(),
+			// Which model file was really loaded, and whether the preferred one
+			// was missing. A silent fallback hid a 3x-slower model.
+			modelResolution: config.modelResolution ?? null,
 		});
 	});
 
