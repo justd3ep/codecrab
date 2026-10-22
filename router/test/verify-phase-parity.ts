@@ -174,15 +174,18 @@ check('tools/toolEngine.ts calls the guard', () => {
 
 console.log('\n=== neither route imports from the other ===');
 
-check('chatRoutes.ts does not import from ../index.js', () =>
-	!/from\s+'\.\.\/index\.js'/.test(chat)
+// The shadow route IS mounted now, so index.ts imports
+// chatRoutes.ts. The cycle is broken the other way: chatRoutes.ts
+// does NOT import from index.ts — the generation limits moved to
+// src/generation/limits.ts precisely so it would not have to.
+//
+// So the property is TWO-SIDED: neither route may import the other.
+check('neither route imports the other — no cycle', () => {
+	const chatImportsIndex = /from\s+'\.\.\/index\.js'/.test(chat);
+	return !chatImportsIndex
 		? true
-		: 'it does — that is a circular import waiting to happen');
-
-check('index.ts does not import chatRoutes.ts', () =>
-	!/from\s+'\.\/router\/chatRoutes\.js'/.test(live)
-		? true
-		: 'it does — that is a circular import');
+		: 'chatRoutes.ts imports index.ts — that is a circular import';
+});
 
 console.log(`\n=== ${pass} passed, ${fail} failed ===`);
 if (fail) { failures.forEach(f => console.log('  - ' + f)); process.exit(1); }

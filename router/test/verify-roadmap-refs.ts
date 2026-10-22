@@ -236,20 +236,18 @@ check('no token-cap comparison exists (truncation is silent)', () => {
 	return true;
 });
 
-check('makeChatRoutes is NOT imported anywhere (dead code confirmed)', () => {
-	const hits: string[] = [];
-	const walk = (dir: string) => {
-		for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
-			if (e.name === 'node_modules' || e.name === 'out' || e.name.startsWith('.')) continue;
-			const p = path.join(dir, e.name);
-			if (e.isDirectory()) walk(p);
-			else if (e.name.endsWith('.ts') && e.name !== 'chatRoutes.ts') {
-				if (read(p).includes('makeChatRoutes')) hits.push(p);
-			}
-		}
-	};
-	walk(path.join(ROUTER, 'src'));
-	return hits.length === 0 ? true : `imported by: ${hits.join(', ')}`;
+// The shadow route is now MOUNTED, at /shadow. It runs BESIDE the
+// live route so the two can be compared — the newer architecture
+// has never run, and 1,794 lines of untested code cannot replace
+// the live route on faith.
+check('makeChatRoutes is mounted as the shadow route', () => {
+	// `indexTs` is a PATH, so the content must be read.
+	const src = fs.readFileSync(indexTs, 'utf-8');
+	const mounted = src.includes("app.use('/shadow', makeChatRoutes())");
+	const notLive = !src.includes("app.use('/v1', makeChatRoutes())");
+	return mounted && notLive
+		? true
+		: 'the shadow route is not mounted at /shadow (or it replaced the live route)';
 });
 
 check('the f16 FE model is on disk and the config prefers it (P0.7 applied)', () => {

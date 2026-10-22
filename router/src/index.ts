@@ -1,4 +1,5 @@
 import express from 'express';
+import { makeChatRoutes } from './router/chatRoutes.js';
 import { mm } from './models/legacyModelManager.js';
 import cors from 'cors';
 import path from 'path';
@@ -591,6 +592,18 @@ function acquireRequestSlot(): Promise<() => void> {
 		}
 	});
 }
+
+// The SHADOW route — chatRoutes.ts, the newer architecture, mounted
+// BESIDE the live one so the two can be compared.
+//
+// It runs at a different path, so it cannot be reached by accident.
+// The editor talks to /v1/chat/completions; the shadow answers at
+// /shadow/chat/completions.
+//
+// The shadow is a MEASUREMENT, not a replacement. Nothing in the
+// editor uses it yet — it exists so that a request can be sent to
+// both routes and the results compared.
+app.use('/shadow', makeChatRoutes());
 
 app.post('/v1/chat/completions', async (req, res) => {
 	if (!mm.status.loaded && mm.status.loading) {
