@@ -146,6 +146,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-request-lifecycle.ts',
 		what: 'the request lifecycle cleans up on every path',
 	},
+	{
+		file: 'verify-single-pending-store.ts',
+		what: 'there is one pending store, and it is the live one',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook

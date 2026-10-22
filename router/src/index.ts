@@ -56,6 +56,7 @@ import { parseUserScope } from './parsing/constraintParser.js';
 import { plannerContractToValidationContract } from './parsing/plannerContract.js';
 import { installCrashHandlers } from './server/crashHandlers.js';
 import { beginRequest } from './server/requestLifecycle.js';
+import { makeEditRoutes } from './router/editRoutes.js';
 
 import {
 	MAX_AGENT_ITERATIONS,
@@ -413,35 +414,6 @@ type AdvisorIntent =
 // ---------------------------------------------------------------------------
 // Part B — Pending Edits Store (diff / approval workflow)
 // ---------------------------------------------------------------------------
-
-interface PendingEdit {
-	relPath: string;           // relative to workspaceRoot
-	absPath: string;
-	newContent: string;
-	oldContent: string | null; // null = new file
-	diff: string;              // unified diff
-}
-
-interface PendingSession {
-	id: string;
-	workspaceRoot: string;
-	query: string;
-	edits: PendingEdit[];
-	createdAt: number;
-}
-
-
-
-
-
-// In-memory store: sessionId → PendingSession
-const pendingStore = new Map<string, PendingSession>();
-
-
-
-
-
-
 
 // ---------------------------------------------------------------------------
 // Server-side workspace tools (Node.js fs)
@@ -2533,64 +2505,11 @@ app.post('/v1/completions', async (req, res) => {
 // ---------------------------------------------------------------------------
 
 /** GET /v1/edits/:id  — view pending session and unified diffs */
-app.get('/v1/edits/:id', (req, res) => {
-	const session = pendingStore.get(req.params.id);
-	if (!session) return res.status(404).json({ error: 'Session not found or expired.' });
-	res.json({
-		id: session.id,
-		workspaceRoot: session.workspaceRoot,
-		query: session.query,
-		createdAt: session.createdAt,
-		fileCount: session.edits.length,
-		files: session.edits.map(e => ({
-			relPath: e.relPath,
-			isNewFile: e.oldContent === null,
-			oldChars: e.oldContent?.length ?? 0,
-			newChars: e.newContent.length,
-			diff: e.diff,
-		})),
-	});
-});
+// The diff and approval routes. They were inline here AND in
+// router/src/router/editRoutes.ts, with byte-identical bodies — the
+// module was written but never mounted. The module is mounted now.
+app.use('/v1', makeEditRoutes());
 
-/** POST /v1/edits/approve  — apply all edits in a pending session */
-app.post('/v1/edits/approve', (req, res) => {
-	const { sessionId } = req.body;
-	if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
-	const session = pendingStore.get(sessionId);
-	if (!session) return res.status(404).json({ error: 'Session not found or expired.' });
-
-	const { written, errors } = applyPendingSession(session);
-	pendingStore.delete(sessionId);
-
-	console.log(`[PendingStore] Session ${sessionId} approved. Written: ${written.length}, Errors: ${errors.length}`);
-	res.json({
-		status: errors.length === 0 ? 'applied' : 'partial',
-		written,
-		errors,
-	});
-});
-
-/** POST /v1/edits/reject  — discard all edits in a pending session */
-app.post('/v1/edits/reject', (req, res) => {
-	const { sessionId } = req.body;
-	if (!sessionId) return res.status(400).json({ error: 'sessionId is required.' });
-	const existed = pendingStore.has(sessionId);
-	pendingStore.delete(sessionId);
-	console.log(`[PendingStore] Session ${sessionId} rejected.`);
-	res.json({ status: 'rejected', existed });
-});
-
-/** GET /v1/edits  — list all active pending sessions */
-app.get('/v1/edits', (_req, res) => {
-	const sessions = Array.from(pendingStore.values()).map(s => ({
-		id: s.id,
-		workspaceRoot: s.workspaceRoot,
-		fileCount: s.edits.length,
-		files: s.edits.map(e => e.relPath),
-		createdAt: s.createdAt,
-	}));
-	res.json({ pending: sessions });
-});
 
 // ---------------------------------------------------------------------------
 // Async Job System — mounted AFTER all legacy routes.
