@@ -651,7 +651,7 @@ export function makeChatRoutes(): Router {
 						}
 
 						if (filesModified.length > 0) {
-							streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.length} file(s) updated` });
+							streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.filter(f => !scaffoldedFiles.has(f)).length} file(s) generated` });
 							streamChunk(res, `\n**Files updated:**\n${filesModified.map(f => `- \`${f}\``).join('\n')}\n`);
 						}
 
@@ -1315,7 +1315,7 @@ export function makeChatRoutes(): Router {
 								throw new Error(`Agent Iteration Protection: Exceeded maximum iteration limit of ${MAX_AGENT_ITERATIONS} steps without generating the requested files.`);
 							}
 						}
-						streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.length} file(s) updated` });
+						streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.filter(f => !scaffoldedFiles.has(f)).length} file(s) generated` });
 						streamChunk(res, `\n**Files updated:**\n${filesModified.map(f => `- \`${f}\``).join('\n')}\n`);
 					} else if (/(?:make|create|new|edit|update|change|add to) /i.test(lastUserMsg || '')) {
 						// Fallback Protection: no file blocks generated for an explicit write request
@@ -1843,7 +1843,7 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 						}
 					} catch { /* non-fatal */ }
 				}
-				streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.length} file(s) updated` });
+				streamEvent(res, { type: 'success', stage: 'complete', message: `Complete · ${filesModified.filter(f => !scaffoldedFiles.has(f)).length} file(s) generated` });
 				streamChunk(res, `\n**Files updated:**\n${filesModified.map(f => `- \`${f}\``).join('\n')}\n`);
 			}
 

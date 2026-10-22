@@ -172,6 +172,22 @@ check('tools/toolEngine.ts calls the guard', () => {
 		: 'executeToolCall does not call the guard';
 });
 
+console.log('\n=== the scaffold split is used in BOTH summaries ===');
+
+// The live route counts the GENERATED files; the scaffold is not the
+// deliverable. "13 files written" when 9 of them are the scaffold the
+// router created itself is misleading.
+for (const [name, src] of [['the live route', liveCode], ['chatRoutes.ts', chatCode]] as const) {
+	check(`${name} counts the generated files, not the scaffold`, () => {
+		const flat = src.includes('${filesModified.length} file(s) updated');
+		const split = src.includes('${filesModified.filter(f => !scaffoldedFiles.has(f)).length} file(s) generated');
+		if (split) return true;
+		return flat
+			? 'it counts every file, including the scaffold'
+			: 'the completion summary does not use the scaffold split';
+	});
+}
+
 console.log('\n=== neither route imports from the other ===');
 
 // The shadow route IS mounted now, so index.ts imports

@@ -143,6 +143,7 @@ const EXCLUDED: Array<{ file: string; why: string }> = [
 	{ file: 'test-supervisor.ts',      why: 'spawns the editor build' },
 	{ file: 'stackcontract.check.ts',  why: 'one-off analysis, superseded by verify-phase1' },
 	{ file: 'stackprofile.check.ts',   why: 'one-off analysis, superseded by verify-phase1' },
+	{ file: 'compare-shadow.ts',       why: 'needs a running router AND performs LLM inference' },
 ];
 
 interface Result {
