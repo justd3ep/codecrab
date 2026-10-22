@@ -114,6 +114,7 @@ export function ensembleRoute(
 	if (prevRoute === 'fe') feScore += 1;
 	if (prevRoute === 'be') beScore += 1;
 
+	// Only apply workspace bias if there's no strong prompt signal
 	if (fkw === 0 && bkw === 0) {
 		if (frontendFileCount > 0 && backendFileCount === 0) feScore += 2;
 		if (backendFileCount > 0 && frontendFileCount === 0) beScore += 2;
@@ -121,7 +122,7 @@ export function ensembleRoute(
 
 	console.log(`[Ensemble] Final fused scores: FE=${feScore}, BE=${beScore}`);
 
-	// Clear gap winner from fused scoring
+	// Clear gap winner
 	if (feScore >= beScore + 2) return { intent: 'frontend', isCreate };
 	if (beScore >= feScore + 2) return { intent: 'backend', isCreate };
 

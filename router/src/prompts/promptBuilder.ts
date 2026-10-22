@@ -226,14 +226,16 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 	const skipped: string[] = [];
 
 	// ── Stack profile ────────────────────────────────────────────────────────
-	// "single file", "vanilla", "no libraries", "native ... only" must win over
-	// the legacy "every frontend request is a React app" default.
+	// Derived from the request (single file / vanilla / no libraries / native
+	// APIs only). It decides the prompt set, the scaffold, and the validation
+	// contract. Without it every request was treated as a React app.
 	const profile = ctx.profile ?? detectStackProfile(userMessage, {
 		workspaceHasReact: workspaceHasTsx(workspaceRoot),
 		packageJson,
 	});
 	const plainStack = profile.kind === 'vanilla' || profile.kind === 'single-file';
 
+	// ── Empty workspace guard ────────────────────────────────────────────────
 	if (workspaceRoot) {
 		const tree = buildDirectoryTree(workspaceRoot);
 		const fileCount = tree.split('\n').filter(l => l.trim() && !l.includes('/')).length;
@@ -256,6 +258,7 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		if (reason) console.log(`[PromptRouter] SKIP fe/${name}: ${reason}`);
 	};
 
+	// ── 1. Base prompts (stack-aware) ───────────────────────────────────────
 	if (plainStack) {
 		load('agent-plain', `stack=${profile.kind} — plain HTML/CSS/JS, no framework`);
 	} else {
@@ -263,25 +266,29 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		load('typescript', 'always loaded');
 	}
 
+	// ── 2. Mode (exactly one) ───────────────────────────────────────────────
 	if (mode === 'create') {
 		if (plainStack) load('create-mode-plain', 'mode=create (plain stack)');
 		else load('create-mode', 'mode=create');
 	} else if (mode === 'edit') load('edit-mode', 'mode=edit');
 	else load('needs-context-mode', 'mode=needs_context');
 
+	// ── 3. React detection — filesystem-first, keyword-confirmed ────────────
+	// Primary: package.json dependency OR .tsx/.jsx files on disk
+	// Secondary: keywords (supplement only when no workspace signal)
 	const pkgHasReact = pkg.includes('"react"') || pkg.includes('"react-dom"');
 	const fsHasTsx = workspaceHasTsx(workspaceRoot);
 	const activeIsTsx = activeFile ? ['.tsx', '.jsx'].includes(path.extname(activeFile).toLowerCase()) : false;
 	const openFilesTsx = openFiles.some(f => ['.tsx', '.jsx'].includes(path.extname(f).toLowerCase()));
-	// NOTE: domain words (kanban/dashboard/frontend) are NOT stack signals.
-	const hasReactKeywords = /react|tsx|jsx/.test(msg);
 	const isReact = !plainStack && (pkgHasReact || fsHasTsx || activeIsTsx || openFilesTsx
-		|| (!workspaceRoot && hasReactKeywords)
-		|| (hasReactKeywords && mode === 'create'));
+		// keyword fallback only when no workspace present
+		|| (!workspaceRoot && (msg.includes('react') || msg.includes('tsx') || msg.includes('jsx'))));
 
+	// ── 4. HTML-only — ONLY when activeFile is .html AND project is NOT React
 	const activeExt = activeFile ? path.extname(activeFile).toLowerCase() : '';
 	const isHtmlOnly = !isReact && activeExt === '.html';
 
+	// ── 5. Tailwind detection ────────────────────────────────────────────────
 	const isTailwind = !plainStack && [
 		pkg.includes('tailwindcss'),
 		msg.includes('tailwind'),
@@ -289,6 +296,7 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			fs.existsSync(path.join(workspaceRoot, 'tailwind.config.ts')) : false,
 	].some(Boolean);
 
+	// ── 6. Refine detection ──────────────────────────────────────────────────
 	const isRefine = [
 		pkg.includes('@refinedev/'),
 		pkg.includes('@pankod/'),
@@ -298,13 +306,18 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		msg.includes('resource'),
 	].some(Boolean);
 
+	// Deterministic load order: react → tailwind → refine → html
 	if (plainStack) {
+		// Plain stack: never load React/Tailwind/Refine guidance — those prompts
+		// push the model into className/JSX/useState and contradict the request.
 		skip('react', `stack=${profile.kind} — plain HTML/CSS/JS, no framework requested`);
 		skip('tailwind', 'plain stack — no CSS framework');
 		skip('refine', 'plain stack — no data framework');
 		// html.md / css.md / javascript.md are mutually exclusive ("output only
 		// HTML" / "output CSS only" / "return JavaScript only") and a single-file
-		// deliverable contains all three at once.
+		// deliverable contains all three at once. Loading them together produces
+		// contradictory instructions AND burns ~1.5k tokens of the window.
+		// Only the HTML guide is safe, and only when editing an existing .html.
 		const editingHtml = mode === 'edit' && activeFile
 			&& path.extname(activeFile).toLowerCase() === '.html';
 		if (editingHtml) load('html', 'editing an existing .html file');
@@ -317,8 +330,7 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 				: fsHasTsx ? 'workspace contains .tsx/.jsx files'
 					: activeIsTsx ? 'active file is .tsx/.jsx'
 						: openFilesTsx ? 'open file is .tsx/.jsx'
-							: hasReactKeywords ? 'frontend keyword match'
-								: 'default create mode stack';
+							: 'keyword (no workspace)';
 			load('react', reactReason);
 		} else {
 			skip('react', 'no react/react-dom in package.json, no .tsx files in workspace');
@@ -330,23 +342,25 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		if (isRefine) load('refine', '@refinedev/* dependency or keyword "refine"');
 		else skip('refine');
 
+		// html MUST NOT load for React projects
 		if (isHtmlOnly) load('html', 'activeFile is .html and project is NOT React');
 		else if (!isReact) skip('html', 'not an HTML-only project');
 		else skip('html', 'BLOCKED — React project detected');
 	}
 
+	// ── 7. Feature prompts — deterministic keyword maps ──────────────────────
 	const FEATURE_KEYWORDS: Record<string, string[]> = {
 		forms: ['login', 'register', 'signup', 'form', 'submit', 'validation', 'email', 'password', 'otp', 'zod', 'react-hook-form'],
 		api: ['axios', 'fetch', 'api', 'endpoint', 'request', 'mutation', 'query', 'backend', 'auth', 'jwt'],
 		routing: ['page', 'dashboard', 'login page', 'navigate', 'route', 'layout', 'protected route'],
 		state: ['zustand', 'redux', 'store', 'context', 'provider', 'global state'],
 		kanban: ['kanban', 'trello', 'drag and drop', 'dnd'],
-		table: ['table', 'datatable', 'spreadsheet', 'data table'],
+		table: ['table', 'grid', 'column', 'pagination', 'datatable'],
 		chart: ['chart', 'graph', 'analytics', 'dashboard metrics', 'pie', 'bar', 'line'],
 	};
 
-	// Feature guides are React-flavoured; for a plain stack only the
-	// framework-free variants are loaded.
+	// Feature prompts are React-flavoured (className, useState, zustand, TanStack
+	// Table). For a plain stack only the framework-free variants are loaded.
 	const PLAIN_FEATURE_PROMPTS: Record<string, string> = { kanban: 'kanban-plain' };
 
 	for (const [feature, keywords] of Object.entries(FEATURE_KEYWORDS)) {
@@ -369,6 +383,9 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		console.log(`[PromptRouter] ${feature} -> keyword ${triggerKw}`);
 	}
 
+	// ── 8. Response validator ────────────────────────────────────────────────
+	// Inject a lightweight validator instruction when React project detected.
+	// Model must verify all imports/refs resolve before final output.
 	if (isReact && workspaceRoot) {
 		const validatorNote = [
 			'',
@@ -382,9 +399,7 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		console.log('[PromptRouter] Validator instruction injected (React project)');
 	}
 
-	const phase2Notes = injectPhase2Harness(workspaceRoot);
-	if (phase2Notes.length > 0) parts.push(...phase2Notes);
-
+	// ── 9. Workspace Dependency Constraints ──────────────────────────────────
 	let installedPkgs: string[] = [];
 	let rawPkg = packageJson;
 	if (!rawPkg && workspaceRoot) {
@@ -436,7 +451,6 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'8. NO FAKE UTILITIES: NEVER import from "@/utils/..." or "@/lib/..." (e.g. "@/utils/currency"). If you need helper functions like formatCurrency, formatPrice, or formatDate, write them directly inside the component file or output the utility file.',
 			'9. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
 		].join('\n'));
-		console.log(`[PromptRouter] Injected ${installedPkgs.length} installed package constraints into FE system prompt.`);
 	} else {
 		parts.push([
 			'',
@@ -448,15 +462,60 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 			'1. ONLY import standard React ("react") or local relative files ("./...").',
 			'2. NEVER import third-party packages (e.g. recharts, react-hook-form, zod, axios, framer-motion).',
 			'3. Implement all UI, forms, and charts using standard React useState and Tailwind CSS.',
-			'4. Every component rendered in src/App.tsx MUST have an explicit import statement at the top.',
-			'5. ALWAYS import React hooks at the top: import React, { useState, useEffect } from "react";.',
-			'6. NO PHANTOM WRAPPERS: src/App.tsx must directly assemble the generated components, not delegate to an ungenerated MainView.',
-			'7. NO FAKE UTILITIES: Never import from "@/utils/..." unless you generate that file in this response. Inline helpers locally.',
-			'8. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
+			'4. NEVER output "use client"; (this is a Vite React SPA, not Next.js).',
 		].join('\n'));
 	}
 
-	// ── HARD CONSTRAINTS (injected last — strongest signal for the model) ───
+	// ── 10. Scope-Adaptive Architecture Rules ────────────────────────────────
+	const asksForSingleFile = !plainStack
+		&& /keep all state in src\/app\.tsx|single page|single file|simple|widget/i.test(userMessage);
+	if (plainStack) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'PLAIN STACK ARCHITECTURE RULES',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'1. ONE ARTIFACT: the deliverable is a single HTML document with inline <style> and inline <script>.',
+			'2. NO FRAMEWORK: no React, no JSX, no TypeScript, no className, no useState, no import/export.',
+			'3. NO BUILD: the file must work when opened directly (file://) — no bundler, no dev server.',
+			'4. SEMANTIC MARKUP: real elements (section, ul/li, button, form), not a div soup.',
+			'5. EVERY ID YOU QUERY MUST EXIST in your own markup — no dead getElementById targets.',
+			'6. EVERY HANDLER MUST BE WIRED — a button without a listener is a defect.',
+			'7. DEFINE BEFORE USE: every function and const must be declared before it is used at runtime.',
+			'8. NO PLACEHOLDERS: no TODO, no "implementation goes here", no empty handlers.',
+		].join('\n'));
+	} else if (asksForSingleFile) {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'COMPONENT ARCHITECTURE (SINGLE-FILE HUB RULE)',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'For this application, implement the entire solution self-contained inside `src/App.tsx`.',
+			'1. Declare all TypeScript interfaces directly inside `src/App.tsx`.',
+			'2. Declare all state variables and action handlers (add, delete, toggle, filter) using native React useState.',
+			'3. Helper subcomponents may be defined in the same file `src/App.tsx`.',
+			'4. Do NOT generate separate files in `src/components/` unless modular separation is explicitly demanded.',
+			'5. Every button MUST have an active onClick handler; every form MUST have an active onSubmit handler.',
+			'6. Ensure 100% of the user requirements are fully implemented with real state logic.',
+		].join('\n'));
+	} else {
+		parts.push([
+			'',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'MODULAR ARCHITECTURE & STRICT CLOSURE RULES',
+			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+			'1. 100% IMPORT CLOSURE: If you write `import Foo from "./components/Foo"`, you MUST generate `<file path="src/components/Foo.tsx">` in this exact same response.',
+			'2. PROP ALIGNMENT: Child components must accept typed props matching what the parent passes. Container components (lists, grids) MUST map over array props (`items.map(...)`).',
+			'3. ZERO ORPHANS: Every file emitted in `src/components/` MUST be imported and rendered in the component tree.',
+			'4. FILENAME PARITY: The exported component name MUST match the filename (e.g. `src/components/HabitCard.tsx` exports `export function HabitCard`).',
+			'5. FULL REQUIREMENT COVERAGE: Every requirement requested by the user must be implemented with real interactive state and handlers.',
+			'6. NO PHANTOM WRAPPERS: src/App.tsx MUST be the real main view holding application state (useState), layouts, navigation/sidebar, and child views. NEVER output a tiny 5-10 line wrapper that delegates to an ungenerated <MainView /> or <DashboardView />. Either compose the modular components inside src/App.tsx, or if you extract a container component, you MUST emit that component in <file path="...">.',
+		].join('\n'));
+	}
+
+	// ── 11. HARD CONSTRAINTS (from the detected stack) ───────────────────────
+	// Injected LAST on purpose: it is the most recent instruction the model
+	// sees, so it wins over any generic guidance loaded above.
 	if (profile.constraints.length > 0) {
 		parts.push([
 			'',
@@ -469,6 +528,7 @@ export function buildFESystemPrompt(ctx: PromptRouterContext): string {
 		console.log(`[PromptRouter] Hard constraints injected (${profile.constraints.length})`);
 	}
 
+	// ── Debug log ────────────────────────────────────────────────────────────
 	console.log('\nPROMPTS LOADED:');
 	console.log(JSON.stringify(loaded.map(l => l.name), null, 2));
 	console.log('\nPROMPTS SKIPPED:');
