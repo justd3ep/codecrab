@@ -20,7 +20,19 @@ import type { StackProfile } from '../routing/stackProfile.js';
 
 export function loadPrompt(name: string): string {
 	try {
-		const promptPath = path.join(import.meta.dirname, '../prompts', `${name}.md`);
+		// The prompt files live at router/prompts/, and this file is
+		// at router/src/prompts/. So the path is UP TWO levels and
+		// then into prompts/.
+		//
+		// It used to be '../prompts', which was right when this
+		// function lived at router/src/promptBuilder.ts. Moving the
+		// module into router/src/prompts/ changed the depth by one,
+		// and the path was not updated — so EVERY prompt load failed
+		// and the model was prompted with the bare user request:
+		//
+		//     PROMPTS LOADED:
+		//     []
+		const promptPath = path.join(import.meta.dirname, '../../prompts', `${name}.md`);
 		return fs.readFileSync(promptPath, 'utf-8').trim();
 	} catch (e) {
 		console.warn(`[Router] Warning: Could not load prompt ${name}.md`);

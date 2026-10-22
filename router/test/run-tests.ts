@@ -126,6 +126,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-compile-check-runs.ts',
 		what: 'the compile check runs in a fresh project',
 	},
+	{
+		file: 'verify-prompts-load.ts',
+		what: 'the prompt loader loads the real prompt files',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
