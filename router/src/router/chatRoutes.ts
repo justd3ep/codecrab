@@ -158,8 +158,25 @@ async function runAdvisorProjectSummary(params: {
 	partialSnippet: string;
 	specialist?: 'fe' | 'be';
 }): Promise<string> {
-	const advisorModel = await mm.acquire('advisor');
-	return runAdvisorProjectSummaryImpl(advisorModel, params);
+	// The acquire is GUARDED, like every advisor acquire in the live
+	// route. The model manager throws:
+	//
+	//     if (this.loading) throw new Error('Model load already in progress. Retry.');
+	//
+	// and the auto-compaction path swaps models on every 75% cutoff —
+	// so two acquires CAN overlap. Unguarded, the throw becomes an
+	// unhandled rejection, and that takes the whole router down with
+	// exit code 1 and no explanation.
+	//
+	// The summary is an OPTIMISATION — the compaction can proceed
+	// without it, so a failure here is not fatal.
+	try {
+		const advisorModel = await mm.acquire('advisor');
+		return await runAdvisorProjectSummaryImpl(advisorModel, params);
+	} catch (e: any) {
+		console.warn(`[Router] Advisor summary unavailable: ${e?.message ?? String(e)}`);
+		return '';
+	}
 }
 
 export function makeChatRoutes(): Router {
