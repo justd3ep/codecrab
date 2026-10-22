@@ -150,6 +150,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		file: 'verify-single-pending-store.ts',
 		what: 'there is one pending store, and it is the live one',
 	},
+	{
+		file: 'verify-no-dead-imports.ts',
+		what: 'index.ts has no dead imports',
+	},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook
