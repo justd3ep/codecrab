@@ -57,6 +57,7 @@ import { plannerContractToValidationContract } from './parsing/plannerContract.j
 import { installCrashHandlers } from './server/crashHandlers.js';
 import { beginRequest } from './server/requestLifecycle.js';
 import { makeEditRoutes } from './router/editRoutes.js';
+import { makeRagRoutes } from './router/ragRoutes.js';
 
 import {
 	MAX_AGENT_ITERATIONS,
@@ -464,65 +465,11 @@ type AdvisorIntent =
 
 
 // ---------------------------------------------------------------------------
-// RAG — Index workspace (POST /v1/index)
-// ---------------------------------------------------------------------------
+// The RAG routes. They were inline here AND in
+// router/src/router/ragRoutes.ts — the module was written but never
+// mounted. The module is mounted now.
+app.use('/v1', makeRagRoutes());
 
-app.post('/v1/index', async (req, res) => {
-	const { workspaceRoot } = req.body;
-	if (!workspaceRoot || !fs.existsSync(workspaceRoot)) {
-		return res.status(400).json({ error: 'Invalid or missing workspaceRoot.' });
-	}
-	if (!em.isReady) {
-		return res.status(503).json({ error: 'Embedding model not ready yet. Retry in a moment.' });
-	}
-	// Respond immediately — indexing runs in background
-	res.json({ status: 'indexing_started', workspaceRoot });
-	indexWorkspace(workspaceRoot)
-		.then(r => console.log(`[RAG] Index complete: ${r.chunks} chunks from ${r.files} files.`))
-		.catch(e => console.error('[RAG] Index failed:', e));
-});
-
-// RAG — Incremental file update (POST /v1/index/file)
-app.post('/v1/index/file', async (req, res) => {
-	const workspaceRoot = req.body.workspaceRoot || config.workspace.defaultRoot;
-	const { filePath, content } = req.body;
-	if (!workspaceRoot || !filePath || content === undefined) {
-		return res.status(400).json({ error: 'workspaceRoot, filePath, and content are required.' });
-	}
-	if (!em.isReady) return res.json({ status: 'skipped', reason: 'embedding model not ready' });
-	res.json({ status: 'updating' });
-	updateFile(workspaceRoot, filePath, content)
-		.catch(e => console.error('[RAG] updateFile error:', e));
-	// Tier-2: patch symbol/import/AST/ownership caches incrementally
-	patchTier2Caches(workspaceRoot, filePath);
-});
-
-// RAG — Batch file deletion (POST /v1/index/delete)
-app.post('/v1/index/delete', async (req, res) => {
-	const workspaceRoot = req.body.workspaceRoot || config.workspace.defaultRoot;
-	const { filePaths } = req.body;
-	if (!workspaceRoot || !Array.isArray(filePaths) || filePaths.length === 0) {
-		return res.status(400).json({ error: 'workspaceRoot and filePaths[] are required.' });
-	}
-	res.json({ status: 'deleting', count: filePaths.length });
-	deleteFiles(workspaceRoot, filePaths)
-		.catch(e => console.error('[RAG] deleteFiles error:', e));
-});
-
-// RAG — Startup sync (POST /v1/index/sync)
-app.post('/v1/index/sync', async (req, res) => {
-	const workspaceRoot = req.body.workspaceRoot || config.workspace.defaultRoot;
-	if (!workspaceRoot || !fs.existsSync(workspaceRoot)) {
-		return res.status(400).json({ error: 'Invalid or missing workspaceRoot.' });
-	}
-	const result = await syncWorkspace(workspaceRoot);
-	res.json({ status: 'synced', purged: result.purged });
-});
-
-// RAG — Status check (GET /v1/index/status)
-app.get('/v1/index/status', async (req, res) => {
-	res.json({ ragReady: em.isReady });
-});
 
 // ---------------------------------------------------------------------------
 // Request serialisation mutex
