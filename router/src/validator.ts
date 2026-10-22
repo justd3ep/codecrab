@@ -37,6 +37,7 @@ import os from 'os';
 import path from 'path';
 import { exec } from 'child_process';
 import util from 'util';
+import { fileURLToPath } from 'url';
 import { classifyDependency, DependencyStatus, isImportError } from './dependencyStatus.js';
 import type { ExecutionGraph } from './planner.js';
 import type { StackProfile, StackKind } from './routing/stackProfile.js';
@@ -1751,9 +1752,27 @@ async function pass17CompileValidation(files: GeneratedFile[], workspaceRoot: st
 			log(`pass17: using router fallback tsc binary: ${routerTsc}`);
 		}
 	}
-	const nmSrc = path.join(workspaceRoot, 'node_modules');
-	if (!fs.existsSync(tscBin) || !fs.existsSync(path.join(workspaceRoot, 'tsconfig.json')) || !fs.existsSync(nmSrc)) {
-		log('pass17: tsc/tsconfig or node_modules not found — skipped (run npm install first)'); return;
+	// The gate needs a tsc binary and a tsconfig.json.
+	//
+	// It used to ALSO require the workspace's node_modules — but the
+	// only `npm install` in a new project is inside the generated
+	// init.sh, a script the USER runs later. So in a fresh project
+	// there is no node_modules, and this check was ALWAYS skipped:
+	//
+	//     pass17: tsc/tsconfig or node_modules not found — skipped
+	//
+	// That is the strongest validation signal — it actually compiles
+	// the generated TypeScript — and it was off in every fresh
+	// project. A generation with a type error could pass validation.
+	//
+	// The requirement was REDUNDANT: the code below symlinks the
+	// ROUTER's node_modules into the temp dir when the workspace has
+	// none. The gate returned before reaching that.
+	const hasTsc = fs.existsSync(tscBin);
+	const hasTsconfig = fs.existsSync(path.join(workspaceRoot, 'tsconfig.json'));
+	if (!hasTsc || !hasTsconfig) {
+		log('pass17: tsc or tsconfig.json not found — skipped');
+		return;
 	}
 	const tsFiles = files.filter(f => ['.ts', '.tsx'].includes(path.extname(f.path).toLowerCase()));
 	if (tsFiles.length === 0) return;
@@ -1810,7 +1829,39 @@ async function pass17CompileValidation(files: GeneratedFile[], workspaceRoot: st
 
 		let baseOpts: any = {};
 		try { baseOpts = JSON.parse(fs.readFileSync(path.join(workspaceRoot, 'tsconfig.json'), 'utf-8')).compilerOptions ?? {}; } catch { /* ignore */ }
-		const tmpCfg: any = { compilerOptions: { ...baseOpts, noEmit: true, skipLibCheck: true, ignoreDeprecations: '5.0' }, include: ['./**/*.ts', './**/*.tsx'], exclude: ['node_modules'] };
+		// The deprecation opt-in has to match the TypeScript version
+		// that is actually installed. It was hardcoded to '5.0', but
+		// the router runs TypeScript 6 — and TS 6 REJECTS '5.0' with
+		//
+		//     TS5101: Option 'baseUrl' is deprecated ... Specify
+		//     compilerOption '"ignoreDeprecations": "6.0"'
+		//
+		// So the compile check reported a CONFIG error instead of the
+		// code's own errors, and the "clean code" case looked broken.
+		//
+		// The version is read from the installed compiler's
+		// package.json — `require` and `import.meta.resolve` are not
+		// both available in this ESM module, so the file is located
+		// by walking up from the router's own node_modules.
+		const tsMajorMinor = ((): string => {
+			try {
+				let dir = path.dirname(new URL(import.meta.url).pathname.replace(/^\//, ''));
+				for (let i = 0; i < 6; i++) {
+					const pkgPath = path.join(dir, 'node_modules', 'typescript', 'package.json');
+					if (fs.existsSync(pkgPath)) {
+						const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+						const v = String(pkg.version ?? '');
+						const m = /^(\d+\.\d+)/.exec(v);
+						if (m?.[1]) return m[1];
+					}
+					const parent = path.dirname(dir);
+					if (parent === dir) break;
+					dir = parent;
+				}
+				return '6.0';
+			} catch { return '6.0'; }
+		})();
+		const tmpCfg: any = { compilerOptions: { ...baseOpts, noEmit: true, skipLibCheck: true, ignoreDeprecations: tsMajorMinor }, include: ['./**/*.ts', './**/*.tsx'], exclude: ['node_modules'] };
 		delete tmpCfg.compilerOptions.rootDir;
 		delete tmpCfg.compilerOptions.outDir;
 		tmpCfg.compilerOptions.baseUrl = '.';
