@@ -8,6 +8,7 @@
 
 import type { ValidationContract } from '../validator.js';
 import type { UserScope } from './constraintParser.js';
+import { parseUserScope } from './constraintParser.js';
 import type { StackProfile } from '../routing/stackProfile.js';
 
 export interface PlannerContract {
@@ -53,11 +54,41 @@ const ARCH_FOLDERS_MAP: Record<string, string[]> = {
 	flat: [],
 };
 
+
+
+export function plannerContractToValidationContract(
+	pc: PlannerContract,
+	userScope: UserScope,
+	stack?: StackProfile,
+): ValidationContract {
+	const scope: ValidationContract['scope'] =
+		userScope === 'BACKEND_ONLY' ? 'backend'
+			: userScope === 'FRONTEND_ONLY' ? 'frontend'
+				: pc.scope === 'backend' ? 'backend'
+					: pc.scope === 'frontend' ? 'frontend'
+						: pc.scope === 'fullstack' ? 'fullstack'
+							: 'unknown';
+	return {
+		scope,
+		architecture: pc.architecture,
+		framework: pc.framework,
+		language: pc.language,
+		requiredFeatures: pc.requiredFeatures,
+		requiredFolders: pc.requiredFolders,
+		expectedFiles: [],
+		estimatedFiles: pc.estimatedFiles,
+		// The requested stack becomes a binding contract: the validator enforces
+		// single-file / no-libraries / plain-HTML requirements after generation.
+		...(stack ? { stack } : {}),
+	};
+}
+
 export function buildPlannerContract(msg: string, advisorIntent: string, userScope?: UserScope): PlannerContract {
 	// Scope
+	const resolvedScope = userScope || parseUserScope(msg);
 	const scope: PlannerContract['scope'] =
-		userScope === 'FRONTEND_ONLY' || advisorIntent.includes('fe') ? 'frontend'
-			: userScope === 'BACKEND_ONLY' || advisorIntent.includes('be') ? 'backend'
+		resolvedScope === 'FRONTEND_ONLY' || advisorIntent.includes('fe') ? 'frontend'
+			: resolvedScope === 'BACKEND_ONLY' || advisorIntent.includes('be') ? 'backend'
 				: advisorIntent.includes('fullstack') ? 'fullstack'
 					: 'fullstack';
 
@@ -97,31 +128,4 @@ export function buildPlannerContract(msg: string, advisorIntent: string, userSco
 
 	console.log(`[PlannerContract] scope=${scope} arch=${architecture} fw=${framework} features=[${requiredFeatures.join(',')}] est=${estimatedFiles}`);
 	return { scope, architecture, framework, language, requiredFeatures, requiredFolders, estimatedFiles };
-}
-
-export function plannerContractToValidationContract(
-	pc: PlannerContract,
-	userScope: UserScope,
-	stack?: StackProfile,
-): ValidationContract {
-	const scope: ValidationContract['scope'] =
-		userScope === 'BACKEND_ONLY' ? 'backend'
-			: userScope === 'FRONTEND_ONLY' ? 'frontend'
-				: pc.scope === 'backend' ? 'backend'
-					: pc.scope === 'frontend' ? 'frontend'
-						: pc.scope === 'fullstack' ? 'fullstack'
-							: 'unknown';
-	return {
-		scope,
-		architecture: pc.architecture,
-		framework: pc.framework,
-		language: pc.language,
-		requiredFeatures: pc.requiredFeatures,
-		requiredFolders: pc.requiredFolders,
-		expectedFiles: [],
-		estimatedFiles: pc.estimatedFiles,
-		// The requested stack becomes a binding contract: the validator enforces
-		// single-file / no-libraries / plain-HTML requirements after generation.
-		...(stack ? { stack } : {}),
-	};
 }

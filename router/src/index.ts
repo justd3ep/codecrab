@@ -14,7 +14,7 @@ import { buildArtifactFromFiles, writeArtifact, deleteArtifact } from './rag/art
 import { runPostGenerationValidator } from './validator.js';
 import type { ValidationContract, ValidationIssue, GeneratedFile } from './validator.js';
 import { selectTopDependencyFiles, buildDependencyContextBlock } from './dependencySelector.js';
-import { buildFERepairPrompt, buildPlainStackRepairPrompt, buildTargetedRepairPrompt } from './repairEngine.js';
+import { buildFERepairPrompt, buildPlainStackRepairPrompt, buildTargetedRepairPrompt, classifyRepairMode, fileExists } from './repairEngine.js';
 import { inspectWorkspace } from './workspaceInspector.js';
 import { buildExecutionGraph, nextPendingNode, isGraphComplete, graphSummary, markNodeFailed } from './planner.js';
 import type { AdvisorV2Result, ExecutionGraph } from './planner.js';
@@ -32,11 +32,11 @@ import { makeHealthRoutes } from './router/healthRoutes.js';
 import config from '@/config/index.js';
 import { activeContextUsage, updateContextUsage, setEffectiveContextSize, effectiveContextSize } from './telemetry/contextUsage.js';
 import { ensureFrontendScaffold, ensureBackendScaffold, mergePackageJson, mergeInitSh } from './frontendScaffold.js';
-import { runAdvisorProjectSummary, runAdvisorLoopDecomposition } from './routing/intentClassifier.js';
+import { classifyIntent, parseAdvisorIntent, parseAdvisorV2, runAdvisorLoopDecomposition, runAdvisorProjectSummary, scoreKeywords } from './routing/intentClassifier.js';
 import { detectStackProfile } from './routing/stackProfile.js';
 import type { StackProfile } from './routing/stackProfile.js';
 import { diagnoseResponse, buildTruncationContinuationPrompt, buildProseOutputPrompt } from './generation/responseDiagnosis.js';
-import { extractFallbackEdits } from './generation/pipelineHelpers.js';
+import { cleanCodeBlock, detectRepetitionLoop, extractFallbackEdits, extractRawCode } from './generation/pipelineHelpers.js';
 import { buildNoOutputPrompt } from './generation/pipelineHelpers.js';
 import { validateJsxSymbols, buildJsxRepairPrompt, type JsxSymbolIssue } from './generation/pipelineHelpers.js';
 import { parseAdvisorJson } from './routing/advisorJson.js';
@@ -44,10 +44,14 @@ import { parseAdvisorJson } from './routing/advisorJson.js';
 import { wouldClobberScaffold } from './tools/scaffoldGuard.js';
 import { determineMode } from './routing/agentMode.js';
 
-import { buildFESystemPrompt, buildSystemPrompt } from './prompts/promptBuilder.js';
+import { buildBESystemPrompt, buildFESystemPrompt, buildSystemPrompt, loadPrompt, workspaceHasTsx } from './prompts/promptBuilder.js';
 
 import { ensembleRoute } from './routing/ensembleRouter.js';
 import { executeToolCall } from './tools/toolEngine.js';
+import { getAvailableModels, getCpuUsage } from './router/systemRoutes.js';
+import { buildPlannerContract } from './parsing/plannerContract.js';
+import { parseUserScope } from './parsing/constraintParser.js';
+import { plannerContractToValidationContract } from './parsing/plannerContract.js';
 
 // ---------------------------------------------------------------------------
 // Constraint Parser — runs BEFORE advisor, highest priority
@@ -82,24 +86,7 @@ const FRONTEND_ONLY_PATTERNS = [
 	/\buse\s+mock\s+(?:data|api|functions)\b/i,
 ];
 
-function parseUserScope(msg: string): UserScope {
-	const isFullStack = /\bfull[\s-]?stack\b/i.test(msg) ||
-		(/\b(?:frontend|react|ui|client)\b/i.test(msg) && /\b(?:backend|server|express|nestjs|database)\b/i.test(msg));
 
-	if (isFullStack) {
-		return 'ANY';
-	}
-
-	if (FRONTEND_ONLY_PATTERNS.some(p => p.test(msg))) {
-		console.log('[ConstraintParser] Scope: FRONTEND_ONLY');
-		return 'FRONTEND_ONLY';
-	}
-	if (BACKEND_ONLY_PATTERNS.some(p => p.test(msg))) {
-		console.log('[ConstraintParser] Scope: BACKEND_ONLY');
-		return 'BACKEND_ONLY';
-	}
-	return 'ANY';
-}
 
 // ---------------------------------------------------------------------------
 // Planner Contract — deterministic keyword extraction, no model call
@@ -148,79 +135,9 @@ const ARCH_FOLDERS_MAP: Record<string, string[]> = {
 	flat: [],
 };
 
-function buildPlannerContract(msg: string, advisorIntent: string, userScope?: UserScope): PlannerContract {
-	// Scope
-	const resolvedScope = userScope || parseUserScope(msg);
-	const scope: PlannerContract['scope'] =
-		resolvedScope === 'FRONTEND_ONLY' || advisorIntent.includes('fe') ? 'frontend'
-			: resolvedScope === 'BACKEND_ONLY' || advisorIntent.includes('be') ? 'backend'
-				: advisorIntent.includes('fullstack') ? 'fullstack'
-					: 'fullstack';
 
-	// Architecture
-	let architecture: PlannerContract['architecture'] = 'unknown';
-	for (const a of ARCH_DETECTION) {
-		if (a.re.test(msg)) { architecture = a.arch; break; }
-	}
-	// repository pattern is implied when service + controller keywords present
-	if (architecture === 'unknown' && scope !== 'frontend') {
-		if (/\bservice\b/i.test(msg) && /\bcontroller\b/i.test(msg)) architecture = 'repository';
-	}
 
-	// Framework
-	const framework =
-		/\bnestjs\b/i.test(msg) ? 'nestjs'
-			: /\bexpress\b/i.test(msg) ? 'express'
-				: /\bnext\.?js\b/i.test(msg) ? 'nextjs'
-					: /\bvite\b/i.test(msg) ? 'vite'
-						: /\bfastify\b/i.test(msg) ? 'fastify'
-							: 'unknown';
 
-	// Language
-	const language: 'typescript' | 'javascript' =
-		/\bjavascript\b|\.js\b/i.test(msg) && !/\btypescript\b|\.ts\b/i.test(msg) ? 'javascript' : 'typescript';
-
-	// Required features
-	const requiredFeatures = FEATURE_DETECTION.filter(f => f.re.test(msg)).map(f => f.key);
-
-	// Required folders from architecture
-	const requiredFolders = ARCH_FOLDERS_MAP[architecture] ?? [];
-
-	// Rough file estimate: (features * 2) + (folders * 2) + 3 base files
-	const estimatedFiles = scope === 'fullstack'
-		? Math.max(10, requiredFeatures.length * 2 + requiredFolders.length * 2 + 5)
-		: Math.max(5, requiredFeatures.length * 2 + requiredFolders.length * 2 + 3);
-
-	console.log(`[PlannerContract] scope=${scope} arch=${architecture} fw=${framework} features=[${requiredFeatures.join(',')}] est=${estimatedFiles}`);
-	return { scope, architecture, framework, language, requiredFeatures, requiredFolders, estimatedFiles };
-}
-
-function plannerContractToValidationContract(
-	pc: PlannerContract,
-	userScope: UserScope,
-	stack?: StackProfile,
-): ValidationContract {
-	const scope: ValidationContract['scope'] =
-		userScope === 'BACKEND_ONLY' ? 'backend'
-			: userScope === 'FRONTEND_ONLY' ? 'frontend'
-				: pc.scope === 'backend' ? 'backend'
-					: pc.scope === 'frontend' ? 'frontend'
-						: pc.scope === 'fullstack' ? 'fullstack'
-							: 'unknown';
-	return {
-		scope,
-		architecture: pc.architecture,
-		framework: pc.framework,
-		language: pc.language,
-		requiredFeatures: pc.requiredFeatures,
-		requiredFolders: pc.requiredFolders,
-		expectedFiles: [],
-		estimatedFiles: pc.estimatedFiles,
-		// The requested stack becomes a binding contract: the validator enforces
-		// single-file / no-libraries / plain-HTML requirements after generation.
-		...(stack ? { stack } : {}),
-	};
-}
 
 // ---------------------------------------------------------------------------
 // Repair Loop V2.6 — Modification-Oriented Architecture
@@ -236,35 +153,7 @@ const enum RepairMode {
 	COMPILE_FIX = 'COMPILE_FIX',
 }
 
-/** Map ValidationIssue.kind → RepairMode */
-function classifyRepairMode(kind: string, message: string): RepairMode {
-	switch (kind) {
-		case 'missing_architecture':
-			// "already exists" → MODIFY, otherwise GENERATE
-			return /already exists|duplicate/i.test(message) ? RepairMode.DELETE_DUPLICATES : RepairMode.GENERATE_MISSING;
-		case 'missing_coverage':
-			return RepairMode.GENERATE_MISSING;
-		case 'business_logic_leak':
-			// Layer violation = rewrite existing file, not add new one
-			return /layer violation|imports.*directly|belongs in/i.test(message) ? RepairMode.MODIFY_EXISTING : RepairMode.GENERATE_MISSING;
-		case 'missing_import':
-			return /missing from (?:generated output|workspace)|cannot resolve local import/i.test(message)
-				? RepairMode.GENERATE_MISSING
-				: RepairMode.REWIRE_IMPORTS;
-		case 'undefined_symbol':
-			return RepairMode.MODIFY_EXISTING;
-		case 'dead_code':
-			return /already exists|workspace/i.test(message) ? RepairMode.DELETE_DUPLICATES : RepairMode.MODIFY_EXISTING;
-		case 'security':
-			return RepairMode.SECURITY_FIX;
-		case 'compile_error':
-			return RepairMode.COMPILE_FIX;
-		case 'scope_violation':
-			return RepairMode.DELETE_DUPLICATES;
-		default:
-			return RepairMode.MODIFY_EXISTING;
-	}
-}
+
 
 /**
  * Scan workspace + generated files and return a map of:
@@ -328,14 +217,7 @@ function collectWorkspaceModules(
 	return result;
 }
 
-/**
- * Determine if a file path exists among generated files OR on disk.
- */
-function fileExists(filePath: string, generatedPaths: Set<string>, workspaceRoot: string): boolean {
-	if (generatedPaths.has(filePath)) return true;
-	const exts = ['', '.ts', '.tsx', '.js', '.jsx', '/index.ts', '/index.tsx'];
-	return exts.some(e => { try { return fs.existsSync(path.join(workspaceRoot, filePath + e)); } catch { return false; } });
-}
+
 
 /**
  * V2.6 Modification-Oriented Repair Prompt Builder.
@@ -556,61 +438,10 @@ const WRITE_PATTERNS = [
 	/\b(?:add\s+feature|new\s+file|new\s+component|new\s+route|new\s+endpoint)\b/i,
 ];
 
-function classifyIntent(userMessage: string): 'read' | 'write' {
-	const msg = userMessage.toLowerCase();
-
-	// WRITE wins if any write pattern matches — explicit mutation intent
-	if (WRITE_PATTERNS.some(p => p.test(msg))) return 'write';
-	// READ wins if any read pattern matches
-	if (READ_PATTERNS.some(p => p.test(msg))) return 'read';
-	// Default to write so existing behavior is preserved for ambiguous prompts
-	return 'write';
-}
 
 
-function getAvailableModels() {
-	const models = [];
 
-	if (config.models.frontend) {
-		models.push({
-			ollamaTag: 'codecrab/qwen-fe',
-			id: 'codecrab/qwen-fe',
-			displayName: 'Qwen 2.5 (Frontend Specialist)',
-			// `domain` and `status` are narrow unions in the editor's
-			// ISpecialistModel type. Keep these values in sync with it.
-			domain: 'frontend',
-			status: 'idle',
-			maturity: 'alpha',
-			ramRequiredGb: 6
-		});
-	}
 
-	if (config.models.backend) {
-		models.push({
-			ollamaTag: 'codecrab/qwen-be',
-			id: 'codecrab/qwen-be',
-			displayName: 'Qwen 2.5 (Backend Specialist)',
-			domain: 'backend',
-			status: 'idle',
-			maturity: 'alpha',
-			ramRequiredGb: 6
-		});
-	}
-
-	if (models.length === 0) {
-		models.push({
-			ollamaTag: 'codecrab/base',
-			id: 'codecrab/base',
-			displayName: 'Native CodeCrab Base Model',
-			domain: 'general',
-			status: 'idle',
-			maturity: 'stable',
-			ramRequiredGb: 4
-		});
-	}
-
-	return models;
-}
 
 // Health Check
 app.get('/health', (req, res) => {
@@ -631,23 +462,7 @@ app.get('/health', (req, res) => {
 });
 
 let lastCpuInfo = os.cpus();
-function getCpuUsage(): number {
-	const currentCpuInfo = os.cpus();
-	let idleDiff = 0;
-	let totalDiff = 0;
-	for (let i = 0; i < currentCpuInfo.length; i++) {
-		const oldTimes = lastCpuInfo[i]!.times;
-		const newTimes = currentCpuInfo[i]!.times;
-		const oldTotal = Object.values(oldTimes).reduce((a, b) => a + b, 0);
-		const newTotal = Object.values(newTimes).reduce((a, b) => a + b, 0);
-		idleDiff += newTimes.idle - oldTimes.idle;
-		totalDiff += newTotal - oldTotal;
-	}
-	lastCpuInfo = currentCpuInfo;
-	if (totalDiff === 0) return 0;
-	const usage = 100 - (100 * idleDiff / totalDiff);
-	return Math.max(0, Math.min(100, usage));
-}
+
 
 // Stats Telemetry Endpoint
 app.get('/stats', async (req, res) => {
@@ -727,15 +542,7 @@ app.get('/v1/models', (req, res) => {
 // Dynamic System Prompt Builder
 // ---------------------------------------------------------------------------
 
-function loadPrompt(name: string): string {
-	try {
-		const promptPath = path.join(import.meta.dirname, '../prompts', `${name}.md`);
-		return fs.readFileSync(promptPath, 'utf-8').trim();
-	} catch (e) {
-		console.warn(`[Router] Warning: Could not load prompt ${name}.md`);
-		return '';
-	}
-}
+
 
 // ---------------------------------------------------------------------------
 // Routing failure logger — Stage 7 dataset collection
@@ -767,75 +574,9 @@ type AdvisorIntent =
 	| 'create_fullstack' | 'edit_fullstack'
 	| 'general' | 'unknown';
 
-/** Parse {"intent":"..."} from raw advisor output. Returns null on any failure. */
-function parseAdvisorIntent(raw: string): AdvisorIntent | null {
-	const stripped = raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, '').trim();
-	const obj = parseAdvisorJson(stripped);
-	if (!obj) { console.warn('[Advisor] No JSON found.'); return null; }
-	try {
-		const intent = obj.intent as string;
-		const valid: AdvisorIntent[] = ['create_fe', 'edit_fe', 'create_be', 'edit_be', 'create_fullstack', 'edit_fullstack', 'general', 'unknown'];
-		if (!valid.includes(intent as AdvisorIntent)) {
-			console.warn(`[Advisor] Unknown intent value: "${intent}"`);
-			return null;
-		}
-		console.log(`[Advisor] Intent: ${intent}`);
-		return intent as AdvisorIntent;
-	} catch (e: any) {
-		console.error('[Advisor] JSON parse failed:', e.message);
-		return null;
-	}
-}
-
-/**
- * AdvisorV2: attempt to extract rich planning fields from advisor JSON.
- * Falls back gracefully — intent field is the only required field.
- * Never throws. Returns null if intent is invalid.
- */
 
 
-function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: AdvisorV2Result } | null {
-	const stripped = raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, '').trim();
-	// Tolerant parse: a truncated Advisor response still yields its fields.
-	const obj = parseAdvisorJson(stripped);
-	if (!obj) { console.warn('[AdvisorV2] No JSON found.'); return null; }
-	try {
-		const intentRaw = obj.intent as string;
-		const valid: AdvisorIntent[] = ['create_fe', 'edit_fe', 'create_be', 'edit_be', 'create_fullstack', 'edit_fullstack', 'general', 'unknown'];
-		if (!valid.includes(intentRaw as AdvisorIntent)) {
-			console.warn(`[AdvisorV2] Unknown intent: "${intentRaw}"`);
-			return null;
-		}
-		const v2: AdvisorV2Result = {
-			intent: intentRaw,
-			projectType: obj.projectType,
-			architecture: obj.architecture,
-			framework: obj.framework,
-			language: obj.language,
-			database: obj.database,
-			orm: obj.orm,
-			authentication: obj.authentication,
-			...(Array.isArray(obj.requiredFeatures)
-				? { requiredFeatures: obj.requiredFeatures as string[] }
-				: {}),
-			...(Array.isArray(obj.modules)
-				? { modules: obj.modules as string[] }
-				: {}),
-			...(typeof obj.estimatedFiles === 'number'
-				? { estimatedFiles: obj.estimatedFiles }
-				: {}),
-			generationStrategy: obj.generationStrategy,
-			...(typeof obj.confidence === 'number'
-				? { confidence: obj.confidence }
-				: {}),
-		};
-		console.log(`[AdvisorV2] intent=${intentRaw} arch=${v2.architecture ?? '?'} modules=[${(v2.modules ?? []).join(',')}] features=[${(v2.requiredFeatures ?? []).join(',')}]`);
-		return { intent: intentRaw as AdvisorIntent, v2 };
-	} catch (e: any) {
-		console.error('[AdvisorV2] JSON parse failed:', e.message);
-		return null;
-	}
-}
+
 
 /**
  * Run the Advisor model pass.
@@ -950,37 +691,7 @@ function classifyOpenFile(openFiles: string[] | undefined): 'fe' | 'be' | null {
 	return null;
 }
 
-/**
- * Score keywords and patterns in the user message.
- * Returns { feScore, beScore }.
- */
-function scoreKeywords(msg: string): { feScore: number; beScore: number } {
-	let feScore = 0;
-	let beScore = 0;
 
-	// Sanitize mock/client API mentions so they do not falsely trigger BE_SERVER_PATTERN
-	const beMsg = msg
-		.replace(/\b(?:mock|dummy|fake|stub|client-side|call|fetch)\s+(?:data[\s/]+)?api(?:s|\b)/gi, '')
-		.replace(/\bapi\s+(?:client|mock|functions?|endpoints?\s+mock)\b/gi, '');
-
-	if (/\b(?:mock\s+(?:data[\s/]+)?api|dummy\s+api|fake\s+api|mock\s+data|mock\s+functions?)\b/i.test(msg)) {
-		feScore += 2;
-	}
-
-	if (UI_COMPONENT_PATTERN.test(msg)) feScore += 2;
-	if (UI_INTERACTION_PATTERN.test(msg)) feScore += 1;
-	if (UI_DESIGN_PATTERN.test(msg)) feScore += 2;
-	if (UI_FRAMEWORK_PATTERN.test(msg)) feScore += 2;
-
-	// High-signal UI keywords / phrases
-	if (/\b(?:kanban|trello|drag\s+and\s+drop|dark\s+mode|dashboard|responsive)\b/i.test(msg)) feScore += 2;
-
-	if (BE_DB_PATTERN.test(beMsg)) beScore += 2;
-	if (BE_SERVER_PATTERN.test(beMsg)) beScore += 2;
-	if (BE_AUTH_INFRA_PATTERN.test(beMsg)) beScore += 2;
-
-	return { feScore, beScore };
-}
 
 /**
  * Empty workspace app-type detector.
@@ -1073,135 +784,11 @@ interface PromptRouterContext {
 // ---------------------------------------------------------------------------
 // React workspace scanner — checks for .tsx files on disk (no keyword deps)
 // ---------------------------------------------------------------------------
-function workspaceHasTsx(workspaceRoot: string | undefined): boolean {
-	if (!workspaceRoot) return false;
-	const srcDir = path.join(workspaceRoot, 'src');
-	const dirsToScan = [workspaceRoot, ...(fs.existsSync(srcDir) ? [srcDir] : [])];
-	for (const dir of dirsToScan) {
-		try {
-			const entries = fs.readdirSync(dir);
-			if (entries.some(f => f.endsWith('.tsx') || f.endsWith('.jsx'))) return true;
-		} catch { /* ignore unreadable dirs */ }
-	}
-	return false;
-}
 
 
 
-function buildBESystemPrompt(
-	userMessage: string,
-	mode: AgentMode,
-	activeFile?: string,
-	workspaceRoot?: string,
-): string {
-	const parts: string[] = [];
-	const activePrompts: string[] = [];
-	const msg = userMessage.toLowerCase();
 
-	const addBE = (name: string) => {
-		const content = loadPrompt(`be/${name}`);
-		if (content) { parts.push(content); activePrompts.push(`be/${name}`); }
-		else console.warn(`[Router] Warning: Could not load prompt be/${name}.md`);
-	};
 
-	addBE('agent');
-
-	let installedPkgs: string[] = [];
-	if (workspaceRoot) {
-		const pkgPath = path.join(workspaceRoot, 'package.json');
-		try {
-			if (fs.existsSync(pkgPath)) {
-				const raw = fs.readFileSync(pkgPath, 'utf-8');
-				const parsed = JSON.parse(raw);
-				const deps = Object.keys(parsed.dependencies || {});
-				const devDeps = Object.keys(parsed.devDependencies || {});
-				installedPkgs = Array.from(new Set([...deps, ...devDeps]));
-			}
-		} catch { /* ignore */ }
-	}
-
-	const hasPkg = (name: string) => installedPkgs.includes(name);
-
-	const ext = activeFile ? path.extname(activeFile).toLowerCase() : '';
-	if (ext === '.ts' || ext === '.js' || msg.includes('typescript') || msg.includes('express') || msg.includes('node') || mode === 'create') {
-		if (ext === '.js' || msg.includes('javascript')) addBE('javascript');
-		else addBE('typescript');
-		addBE('node');
-	}
-
-	// Express & REST are standard for backend APIs
-	const isExpress = hasPkg('express') || msg.includes('express') || mode === 'create';
-	if (isExpress) addBE('express');
-	addBE('rest');
-
-	// Database vs In-Memory DB
-	const hasSqlOrOrm = [
-		hasPkg('pg'), hasPkg('mysql'), hasPkg('mysql2'), hasPkg('sqlite3'),
-		hasPkg('prisma'), hasPkg('@prisma/client'), hasPkg('typeorm'), hasPkg('mongoose')
-	].some(Boolean);
-
-	if (hasSqlOrOrm || msg.includes('sql') || msg.includes('database') || msg.includes('postgres') || msg.includes('mysql')) {
-		addBE('sql');
-	} else {
-		addBE('in-memory-db');
-	}
-
-	// Domain skills & capabilities
-	const DOMAIN_SKILLS: Record<string, string[]> = {
-		'ecommerce': ['product', 'shop', 'store', 'cart', 'checkout', 'catalog', 'clothing', 'fashion', 'price', 'order', 'e-commerce', 'ecommerce'],
-		'saas-dashboard': ['dashboard', 'metrics', 'billing', 'analytics', 'invoice', 'subscription', 'saas', 'revenue', 'transaction'],
-		'capabilities/validation': ['validate', 'validation', 'schema', 'input', 'form'],
-		'capabilities/error-handling': ['error', 'exception', 'handler'],
-		'capabilities/controller-pattern': ['controller', 'mvc', 'repository', 'clean', 'backend', 'api'],
-		'capabilities/service-pattern': ['service', 'repository', 'clean', 'backend', 'api'],
-		'capabilities/jwt': ['jwt', 'token', 'auth', 'login', 'bearer'],
-		'capabilities/pagination': ['paginate', 'pagination', 'page', 'limit', 'offset'],
-	};
-
-	for (const [skill, keywords] of Object.entries(DOMAIN_SKILLS)) {
-		const matched = keywords.some(kw => msg.includes(kw));
-		if (matched || (mode === 'create' && (skill.includes('error-handling') || skill.includes('controller-pattern') || skill.includes('service-pattern')))) {
-			addBE(skill);
-		}
-	}
-
-	if (mode === 'create') addBE('create-mode');
-	else if (mode === 'edit') addBE('edit-mode');
-	else addBE('needs-context-mode');
-
-	// Inject workspace dependency constraints
-	if (installedPkgs.length > 0) {
-		parts.push([
-			'',
-			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-			'WORKSPACE DEPENDENCY CONSTRAINTS (package.json)',
-			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-			`Installed packages: ${installedPkgs.join(', ')}`,
-			'CRITICAL BOUNDARIES:',
-			'1. ONLY import third-party packages from the installed list above, or standard Node.js built-ins ("http", "path", "fs", "crypto").',
-			'2. NEVER import uninstalled packages (such as mongoose, prisma, typeorm, bcrypt, jsonwebtoken, zod, axios, express-validator) unless explicitly listed above.',
-			'3. NO PHANTOM UTILITIES: NEVER import from non-existent files like "../utils/logger", "../utils/validators", "../utils/errors", or "../models/database". If helper functions are needed, declare them locally in the file or in shared models/types.',
-			'4. SERVER ARCHITECTURE: "src/app.ts" configures middleware and mounts routes, exporting app (export default app;). "src/server.ts" imports app and calls app.listen(PORT). NEVER call app.listen() inside "src/app.ts".',
-			'5. IN-MEMORY STORAGE: If no database package (mongoose/prisma/pg) is installed, store data using an in-memory Map or Array in the service with initial mock data.',
-		].join('\n'));
-	} else {
-		parts.push([
-			'',
-			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-			'WORKSPACE DEPENDENCY CONSTRAINTS',
-			'━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
-			'CRITICAL BOUNDARIES:',
-			'1. ONLY import standard Express and Node.js built-ins ("http", "path", "fs", "crypto").',
-			'2. NEVER import uninstalled packages (such as mongoose, prisma, bcrypt, jsonwebtoken, zod).',
-			'3. NO PHANTOM UTILITIES: Never import from "../utils/..." unless that file already exists on disk. Declare helper functions locally.',
-			'4. SERVER ARCHITECTURE: "src/app.ts" exports app; "src/server.ts" calls app.listen(PORT). Never call app.listen() in both.',
-			'5. IN-MEMORY STORAGE: Use an in-memory Map or Array with sample seed data for data persistence.',
-		].join('\n'));
-	}
-
-	console.log('PROMPTS LOADED (BE):', JSON.stringify(activePrompts, null, 2));
-	return parts.join('\n\n');
-}
 
 
 
@@ -1280,36 +867,7 @@ interface FallbackEdit {
 	content: string;
 }
 
-function cleanCodeBlock(content: string, filePath?: string): string {
-	content = content.trim();
-	const match = content.match(/^```\w*\r?\n([\s\S]*?)\r?\n```$/);
-	if (match) {
-		content = match[1]!.trim();
-	}
 
-	// Deterministic Next.js directive cleaner
-	content = content.replace(/["']use client["'];?\r?\n?/g, '');
-
-	// Harmonize exported component name with filename if in components directory
-	if (filePath && (filePath.includes('components/') || filePath.includes('components\\'))) {
-		const baseName = path.basename(filePath, path.extname(filePath));
-		if (/^[A-Z][A-Za-z0-9]+$/.test(baseName)) {
-			// If file is HabitCard.tsx and exports 'export default function Habit(' or 'export function Habit('
-			content = content.replace(
-				new RegExp(`(export\\s+(?:default\\s+)?function\\s+)([A-Z][A-Za-z0-9]*)(\\s*\\()`, 'g'),
-				(full, prefix, currName, suffix) => {
-					if (currName !== baseName && (currName.length < baseName.length || baseName.includes(currName))) {
-						console.log(`[Harmonizer] Harmonized export function "${currName}" → "${baseName}" in ${filePath}`);
-						return `${prefix}${baseName}${suffix}`;
-					}
-					return full;
-				}
-			);
-		}
-	}
-
-	return content;
-}
 
 
 
@@ -1327,82 +885,7 @@ function cleanCodeBlock(content: string, filePath?: string): string {
  * emitted, so there is nothing to repair. The prompt restates the output
  * contract explicitly and asks for the files again.
  */
-/**
- * Detect raw unfenced code in model output.
- * Returns the code portion if the text looks like source code, null otherwise.
- */
-function extractRawCode(text: string): string | null {
-	const lines = text.split('\n');
-	let codeLines: string[] = [];
-	let nonCodeLines: string[] = [];
 
-	for (const line of lines) {
-		const trimmed = line.trim();
-		if (!trimmed) continue;
-
-		const isCode =
-			// Import/require statements
-			/^import\s+/.test(trimmed) ||
-			/^from\s+['"]/.test(trimmed) ||
-			/^const\s+\w+\s*=\s*require/.test(trimmed) ||
-			// Export statements
-			/^export\s+(default\s+)?/.test(trimmed) ||
-			// Function/class/variable declarations
-			/^(const|let|var|function|class|interface|type|enum)\s+/.test(trimmed) ||
-			// JSX/HTML tags
-			/^\s*<\/?[\w]+/.test(trimmed) ||
-			/^\s*\/>/.test(trimmed) ||
-			// CSS rules
-			/^\s*[\w.-]+\s*\{/.test(trimmed) ||
-			/^\s*[\w-]+\s*:.*[;{]/.test(trimmed) ||
-			// Closing braces, parens
-			/^[}\]);,]+$/.test(trimmed) ||
-			// Return statements
-			/^\s*return\s*[\s(]/.test(trimmed) ||
-			// JSX attributes / className etc
-			/^\s*(className|onClick|onChange|style|href|src|alt|type)=/.test(trimmed) ||
-			// Arrow functions
-			/=>\s*[{(]/.test(trimmed);
-
-		if (isCode) {
-			codeLines.push(line);
-		} else {
-			nonCodeLines.push(line);
-		}
-	}
-
-	const totalNonEmpty = codeLines.length + nonCodeLines.length;
-	if (totalNonEmpty < 3) return null;
-
-	// If >60% of lines look like code, treat entire text as code
-	const codeRatio = codeLines.length / totalNonEmpty;
-	if (codeRatio >= 0.6) {
-		// Strip any leading/trailing prose (e.g. "Here's the code:" or "I've created...")
-		const allLines = text.split('\n');
-		let startIdx = 0;
-		let endIdx = allLines.length - 1;
-
-		// Trim leading prose lines
-		while (startIdx < allLines.length) {
-			const l = allLines[startIdx]!.trim();
-			if (!l || /^(import |export |const |let |var |function |class |<|\/\/|\/\*|\*|@|#|\{|\(|return )/.test(l)) break;
-			startIdx++;
-		}
-		// Trim trailing prose lines
-		while (endIdx > startIdx) {
-			const l = allLines[endIdx]!.trim();
-			if (!l || /^[}\]);]|^<\/|^\*\/|^export |^module\.exports/.test(l)) break;
-			endIdx--;
-		}
-
-		const codeBlock = allLines.slice(startIdx, endIdx + 1).join('\n').trim();
-		if (codeBlock.length > 30) {
-			return codeBlock;
-		}
-	}
-
-	return null;
-}
 
 function validateContentForExtension(filename: string, content: string, intent?: string): { valid: boolean; error?: string } {
 	const ext = path.extname(filename).toLowerCase();
@@ -1838,99 +1321,7 @@ function escapeRegExp(string: string): string {
 	return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * Monitors generated output stream to detect repetition patterns and stagnant growth.
- */
-function detectRepetitionLoop(text: string): { detected: boolean; reason?: string } {
-	if (text.length < 200) return { detected: false };
 
-	// 1. Suffix loop check — true loop means the TAIL of output is stuck repeating.
-	// Use larger window (400 chars) and require matches to cluster at the end,
-	// not simply appear anywhere in the window (catches import blocks with same identifier).
-	const windowSizes = [30, 50]; // 20 removed — too short, matches identifiers like ", controller"
-	for (const size of windowSizes) {
-		const suffix = text.substring(text.length - size).trim();
-		if (!suffix || suffix.length < size * 0.6) continue; // skip if suffix is mostly whitespace
-
-		const recentText = text.substring(Math.max(0, text.length - 400));
-		const allMatches: number[] = [];
-		const escaped = escapeRegExp(suffix);
-		const re = new RegExp(escaped, 'g');
-		let m: RegExpExecArray | null;
-		while ((m = re.exec(recentText)) !== null) {
-			allMatches.push(m.index);
-		}
-
-		if (allMatches.length < 6) continue; // threshold raised: <6 matches is not a loop
-
-		// Clustering check: a real loop has matches bunched at the end of the window.
-		// If the last 3 matches are all in the final 60% of the window → loop confirmed.
-		const windowLen = recentText.length;
-		const tail3 = allMatches.slice(-3);
-		const allInTail = tail3.every(idx => idx >= windowLen * 0.4);
-		if (!allInTail) continue;
-
-		// Distinctness check: In a genuine loop, the text between consecutive matches is identical
-		// (e.g. repeating the exact same block). In legitimate repetitive code (like <Select.Item value="a">,
-		// <Select.Item value="b">, <td className="...">, etc.), the segments between matches contain
-		// different attributes and text. Require at least 3 consecutive identical inter-match segments.
-		let consecutiveIdentical = 0;
-		for (let i = 1; i < allMatches.length - 1; i++) {
-			const segPrev = recentText.substring(allMatches[i - 1]!, allMatches[i]!);
-			const segCurrent = recentText.substring(allMatches[i]!, allMatches[i + 1]!);
-			if (segPrev === segCurrent && segCurrent.length >= suffix.length) {
-				consecutiveIdentical++;
-			}
-		}
-		if (consecutiveIdentical >= 3) {
-			return { detected: true, reason: `Suffix loop: "${suffix}" repeated ${allMatches.length} times in recent output` };
-		}
-	}
-
-	// 2. Line repetition check — same line must appear 4+ times in last 8 lines (was 3 in 6)
-	const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-	if (lines.length >= 8) {
-		const lastLine = lines[lines.length - 1]!;
-		if (lastLine.length > 15) { // must be a non-trivial line (raised from 10)
-			let repeatCount = 0;
-			for (let i = lines.length - 2; i >= Math.max(0, lines.length - 8); i--) {
-				if (lines[i] === lastLine) repeatCount++;
-			}
-			if (repeatCount >= 4) {
-				return { detected: true, reason: `Line repetition loop: "${lastLine}" repeated ${repeatCount + 1} times` };
-			}
-		}
-	}
-
-	// 3. Stagnation check — extremely limited character set
-	if (text.length >= 200) {
-		const recent = text.substring(text.length - 150);
-		const uniqueChars = new Set(recent).size;
-		if (uniqueChars < 5) {
-			return { detected: true, reason: `Stagnation: only ${uniqueChars} unique characters in the last 150 characters` };
-		}
-	}
-
-	// 4. File-block repetition check — same <file path="..."> tag 3+ times
-	const fileTagMatches = text.match(/<file\s+path="([^"]+)"/gi) || [];
-	if (fileTagMatches.length >= 3) {
-		const tagCounts = new Map<string, number>();
-		for (const tag of fileTagMatches) {
-			const pathMatch = tag.match(/path="([^"]+)"/i);
-			if (pathMatch?.[1]) {
-				const p = pathMatch[1];
-				tagCounts.set(p, (tagCounts.get(p) || 0) + 1);
-			}
-		}
-		for (const [filePath, count] of tagCounts) {
-			if (count >= 3) {
-				return { detected: true, reason: `File-block loop: <file path="${filePath}"> repeated ${count} times` };
-			}
-		}
-	}
-
-	return { detected: false };
-}
 
 // ---------------------------------------------------------------------------
 // RAG — Index workspace (POST /v1/index)

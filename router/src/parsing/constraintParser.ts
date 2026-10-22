@@ -35,8 +35,6 @@ const FRONTEND_ONLY_PATTERNS = [
 ];
 
 export function parseUserScope(msg: string): UserScope {
-	// If the user explicitly asks for fullstack, or explicitly mentions both frontend and backend work,
-	// do NOT lock into a single-domain constraint.
 	const isFullStack = /\bfull[\s-]?stack\b/i.test(msg) ||
 		(/\b(?:frontend|react|ui|client)\b/i.test(msg) && /\b(?:backend|server|express|nestjs|database)\b/i.test(msg));
 

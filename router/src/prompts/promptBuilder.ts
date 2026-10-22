@@ -19,7 +19,7 @@ import type { StackProfile } from '../routing/stackProfile.js';
 
 export function loadPrompt(name: string): string {
 	try {
-		const promptPath = path.join(import.meta.dirname, '../../prompts', `${name}.md`);
+		const promptPath = path.join(import.meta.dirname, '../prompts', `${name}.md`);
 		return fs.readFileSync(promptPath, 'utf-8').trim();
 	} catch (e) {
 		console.warn(`[Router] Warning: Could not load prompt ${name}.md`);
@@ -624,9 +624,6 @@ export function buildBESystemPrompt(
 	if (mode === 'create') addBE('create-mode');
 	else if (mode === 'edit') addBE('edit-mode');
 	else addBE('needs-context-mode');
-
-	const phase2Notes = injectPhase2Harness(workspaceRoot);
-	if (phase2Notes.length > 0) parts.push(...phase2Notes);
 
 	// Inject workspace dependency constraints
 	if (installedPkgs.length > 0) {

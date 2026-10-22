@@ -69,15 +69,13 @@ export type RepairDecision =
 export function classifyRepairMode(kind: string, message: string): RepairMode {
 	switch (kind) {
 		case 'missing_architecture':
-			return /already exists|duplicate/i.test(message)
-				? RepairMode.DELETE_DUPLICATES
-				: RepairMode.GENERATE_MISSING;
+			// "already exists" → MODIFY, otherwise GENERATE
+			return /already exists|duplicate/i.test(message) ? RepairMode.DELETE_DUPLICATES : RepairMode.GENERATE_MISSING;
 		case 'missing_coverage':
 			return RepairMode.GENERATE_MISSING;
 		case 'business_logic_leak':
-			return /layer violation|imports.*directly|belongs in/i.test(message)
-				? RepairMode.MODIFY_EXISTING
-				: RepairMode.GENERATE_MISSING;
+			// Layer violation = rewrite existing file, not add new one
+			return /layer violation|imports.*directly|belongs in/i.test(message) ? RepairMode.MODIFY_EXISTING : RepairMode.GENERATE_MISSING;
 		case 'missing_import':
 			return /missing from (?:generated output|workspace)|cannot resolve local import/i.test(message)
 				? RepairMode.GENERATE_MISSING
@@ -85,9 +83,7 @@ export function classifyRepairMode(kind: string, message: string): RepairMode {
 		case 'undefined_symbol':
 			return RepairMode.MODIFY_EXISTING;
 		case 'dead_code':
-			return /already exists|workspace/i.test(message)
-				? RepairMode.DELETE_DUPLICATES
-				: RepairMode.MODIFY_EXISTING;
+			return /already exists|workspace/i.test(message) ? RepairMode.DELETE_DUPLICATES : RepairMode.MODIFY_EXISTING;
 		case 'security':
 			return RepairMode.SECURITY_FIX;
 		case 'compile_error':

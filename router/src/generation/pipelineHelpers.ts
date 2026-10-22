@@ -88,10 +88,28 @@ export function cleanCodeBlock(content: string, filePath?: string): string {
 	if (match) {
 		content = match[1]!.trim();
 	}
-	// Deterministically strip Next.js "use client" directive from frontend React/TSX files
-	if (!filePath || /\.(tsx|jsx|ts|js)$/i.test(filePath)) {
-		content = content.replace(/^(\s*['"]use client['"];?\s*\r?\n?)+/gi, '').trimStart();
+
+	// Deterministic Next.js directive cleaner
+	content = content.replace(/["']use client["'];?\r?\n?/g, '');
+
+	// Harmonize exported component name with filename if in components directory
+	if (filePath && (filePath.includes('components/') || filePath.includes('components\\'))) {
+		const baseName = path.basename(filePath, path.extname(filePath));
+		if (/^[A-Z][A-Za-z0-9]+$/.test(baseName)) {
+			// If file is HabitCard.tsx and exports 'export default function Habit(' or 'export function Habit('
+			content = content.replace(
+				new RegExp(`(export\\s+(?:default\\s+)?function\\s+)([A-Z][A-Za-z0-9]*)(\\s*\\()`, 'g'),
+				(full, prefix, currName, suffix) => {
+					if (currName !== baseName && (currName.length < baseName.length || baseName.includes(currName))) {
+						console.log(`[Harmonizer] Harmonized export function "${currName}" → "${baseName}" in ${filePath}`);
+						return `${prefix}${baseName}${suffix}`;
+					}
+					return full;
+				}
+			);
+		}
 	}
+
 	return content;
 }
 
@@ -614,18 +632,27 @@ export function extractRawCode(text: string): string | null {
 		if (!trimmed) continue;
 
 		const isCode =
+			// Import/require statements
 			/^import\s+/.test(trimmed) ||
 			/^from\s+['"]/.test(trimmed) ||
 			/^const\s+\w+\s*=\s*require/.test(trimmed) ||
+			// Export statements
 			/^export\s+(default\s+)?/.test(trimmed) ||
+			// Function/class/variable declarations
 			/^(const|let|var|function|class|interface|type|enum)\s+/.test(trimmed) ||
+			// JSX/HTML tags
 			/^\s*<\/?[\w]+/.test(trimmed) ||
 			/^\s*\/>/.test(trimmed) ||
+			// CSS rules
 			/^\s*[\w.-]+\s*\{/.test(trimmed) ||
 			/^\s*[\w-]+\s*:.*[;{]/.test(trimmed) ||
+			// Closing braces, parens
 			/^[}\]);,]+$/.test(trimmed) ||
+			// Return statements
 			/^\s*return\s*[\s(]/.test(trimmed) ||
+			// JSX attributes / className etc
 			/^\s*(className|onClick|onChange|style|href|src|alt|type)=/.test(trimmed) ||
+			// Arrow functions
 			/=>\s*[{(]/.test(trimmed);
 
 		if (isCode) {
@@ -638,17 +665,21 @@ export function extractRawCode(text: string): string | null {
 	const totalNonEmpty = codeLines.length + nonCodeLines.length;
 	if (totalNonEmpty < 3) return null;
 
+	// If >60% of lines look like code, treat entire text as code
 	const codeRatio = codeLines.length / totalNonEmpty;
 	if (codeRatio >= 0.6) {
+		// Strip any leading/trailing prose (e.g. "Here's the code:" or "I've created...")
 		const allLines = text.split('\n');
 		let startIdx = 0;
 		let endIdx = allLines.length - 1;
 
+		// Trim leading prose lines
 		while (startIdx < allLines.length) {
 			const l = allLines[startIdx]!.trim();
 			if (!l || /^(import |export |const |let |var |function |class |<|\/\/|\/\*|\*|@|#|\{|\(|return )/.test(l)) break;
 			startIdx++;
 		}
+		// Trim trailing prose lines
 		while (endIdx > startIdx) {
 			const l = allLines[endIdx]!.trim();
 			if (!l || /^[}\]);]|^<\/|^\*\/|^export |^module\.exports/.test(l)) break;
@@ -710,10 +741,13 @@ export function escapeRegExp(string: string): string {
 export function detectRepetitionLoop(text: string): { detected: boolean; reason?: string } {
 	if (text.length < 200) return { detected: false };
 
-	const windowSizes = [30, 50];
+	// 1. Suffix loop check — true loop means the TAIL of output is stuck repeating.
+	// Use larger window (400 chars) and require matches to cluster at the end,
+	// not simply appear anywhere in the window (catches import blocks with same identifier).
+	const windowSizes = [30, 50]; // 20 removed — too short, matches identifiers like ", controller"
 	for (const size of windowSizes) {
 		const suffix = text.substring(text.length - size).trim();
-		if (!suffix || suffix.length < size * 0.6) continue;
+		if (!suffix || suffix.length < size * 0.6) continue; // skip if suffix is mostly whitespace
 
 		const recentText = text.substring(Math.max(0, text.length - 400));
 		const allMatches: number[] = [];
@@ -724,8 +758,10 @@ export function detectRepetitionLoop(text: string): { detected: boolean; reason?
 			allMatches.push(m.index);
 		}
 
-		if (allMatches.length < 6) continue;
+		if (allMatches.length < 6) continue; // threshold raised: <6 matches is not a loop
 
+		// Clustering check: a real loop has matches bunched at the end of the window.
+		// If the last 3 matches are all in the final 60% of the window → loop confirmed.
 		const windowLen = recentText.length;
 		const tail3 = allMatches.slice(-3);
 		const allInTail = tail3.every(idx => idx >= windowLen * 0.4);
@@ -748,10 +784,11 @@ export function detectRepetitionLoop(text: string): { detected: boolean; reason?
 		}
 	}
 
+	// 2. Line repetition check — same line must appear 4+ times in last 8 lines (was 3 in 6)
 	const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 	if (lines.length >= 8) {
 		const lastLine = lines[lines.length - 1]!;
-		if (lastLine.length > 15) {
+		if (lastLine.length > 15) { // must be a non-trivial line (raised from 10)
 			let repeatCount = 0;
 			for (let i = lines.length - 2; i >= Math.max(0, lines.length - 8); i--) {
 				if (lines[i] === lastLine) repeatCount++;
@@ -762,6 +799,7 @@ export function detectRepetitionLoop(text: string): { detected: boolean; reason?
 		}
 	}
 
+	// 3. Stagnation check — extremely limited character set
 	if (text.length >= 200) {
 		const recent = text.substring(text.length - 150);
 		const uniqueChars = new Set(recent).size;
@@ -770,6 +808,7 @@ export function detectRepetitionLoop(text: string): { detected: boolean; reason?
 		}
 	}
 
+	// 4. File-block repetition check — same <file path="..."> tag 3+ times
 	const fileTagMatches = text.match(/<file\s+path="([^"]+)"/gi) || [];
 	if (fileTagMatches.length >= 3) {
 		const tagCounts = new Map<string, number>();

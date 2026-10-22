@@ -16,8 +16,10 @@ export function getAvailableModels() {
 			ollamaTag: 'codecrab/qwen-fe',
 			id: 'codecrab/qwen-fe',
 			displayName: 'Qwen 2.5 (Frontend Specialist)',
-			domain: 'Frontend UI/UX',
-			status: 'ready',
+			// `domain` and `status` are narrow unions in the editor's
+			// ISpecialistModel type. Keep these values in sync with it.
+			domain: 'frontend',
+			status: 'idle',
 			maturity: 'alpha',
 			ramRequiredGb: 6
 		});
@@ -28,8 +30,8 @@ export function getAvailableModels() {
 			ollamaTag: 'codecrab/qwen-be',
 			id: 'codecrab/qwen-be',
 			displayName: 'Qwen 2.5 (Backend Specialist)',
-			domain: 'Backend Engineering',
-			status: 'ready',
+			domain: 'backend',
+			status: 'idle',
 			maturity: 'alpha',
 			ramRequiredGb: 6
 		});
@@ -40,8 +42,8 @@ export function getAvailableModels() {
 			ollamaTag: 'codecrab/base',
 			id: 'codecrab/base',
 			displayName: 'Native CodeCrab Base Model',
-			domain: 'General',
-			status: 'ready',
+			domain: 'general',
+			status: 'idle',
 			maturity: 'stable',
 			ramRequiredGb: 4
 		});

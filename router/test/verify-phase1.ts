@@ -44,6 +44,7 @@ const cfgSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'config.local.
 const cfgTypesSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'types.ts'), 'utf8');
 const guardSrc = fs.readFileSync(path.join(ROUTER, 'src', 'tools', 'scaffoldGuard.ts'), 'utf8');
 const toolEngineSrc = fs.readFileSync(path.join(ROUTER, 'src', 'tools', 'toolEngine.ts'), 'utf8');
+const intentClassifierSrc = fs.readFileSync(path.join(ROUTER, 'src', 'routing', 'intentClassifier.ts'), 'utf8');
 
 /** Strip comments so a doc string is never read as code. */
 function stripComments(src: string): string {
@@ -159,10 +160,10 @@ check('garbage still returns null', () =>
 	parseAdvisorJson('not json at all') === null ? true : 'garbage did not return null');
 
 check('both advisor parsers use the tolerant parser', () => {
-	const a = indexSrc.indexOf('function parseAdvisorIntent');
-	const b = indexSrc.indexOf('function parseAdvisorV2');
-	return indexSrc.slice(a, a + 1200).includes('parseAdvisorJson(stripped)')
-		&& indexSrc.slice(b, b + 1200).includes('parseAdvisorJson(stripped)')
+	const a = intentClassifierSrc.indexOf('function parseAdvisorIntent');
+	const b = intentClassifierSrc.indexOf('function parseAdvisorV2');
+	return intentClassifierSrc.slice(a, a + 1200).includes('parseAdvisorJson(stripped)')
+		&& intentClassifierSrc.slice(b, b + 1200).includes('parseAdvisorJson(stripped)')
 		? true : 'a parser still uses the strict parse';
 });
 

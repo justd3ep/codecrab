@@ -43,6 +43,7 @@ function check(name: string, fn: () => true | string): void {
 
 const indexSrc = fs.readFileSync(path.join(ROUTER, 'src', 'index.ts'), 'utf8');
 const classifierSrc = fs.readFileSync(path.join(ROUTER, 'src', 'routing', 'intentClassifier.ts'), 'utf8');
+const intentClassifierSrc = fs.readFileSync(path.join(ROUTER, 'src', 'routing', 'intentClassifier.ts'), 'utf8');
 
 /**
  * The REAL parser, imported from the module. It is a pure function, so it
@@ -125,17 +126,17 @@ check('an empty string returns null', () =>
 
 console.log('\n=== 4. the tolerant parser is wired into both parsers ===');
 
-check('index.ts: parseAdvisor uses parseAdvisorJson', () => {
-	const i = indexSrc.indexOf('function parseAdvisorIntent');
+check('intentClassifier: parseAdvisor uses parseAdvisorJson', () => {
+	const i = intentClassifierSrc.indexOf('function parseAdvisorIntent');
 	if (i < 0) return 'parseAdvisorIntent not found';
-	const blk = indexSrc.slice(i, i + 1200);
+	const blk = intentClassifierSrc.slice(i, i + 1200);
 	return blk.includes('parseAdvisorJson(stripped)') ? true : 'parseAdvisorIntent still uses the strict parse';
 });
 
-check('index.ts: parseAdvisorV2 uses parseAdvisorJson', () => {
-	const i = indexSrc.indexOf('function parseAdvisorV2');
+check('intentClassifier: parseAdvisorV2 uses parseAdvisorJson', () => {
+	const i = intentClassifierSrc.indexOf('function parseAdvisorV2');
 	if (i < 0) return 'parseAdvisorV2 not found';
-	const blk = indexSrc.slice(i, i + 1200);
+	const blk = intentClassifierSrc.slice(i, i + 1200);
 	return blk.includes('parseAdvisorJson(stripped)') ? true : 'parseAdvisorV2 still uses the strict parse';
 });
 
@@ -161,8 +162,8 @@ check('index.ts imports the shared parser', () =>
 check('no advisor parser still requires a closing brace', () => {
 	// The old pattern required `}`. It must be gone from the parse blocks.
 	const blocks = [
-		indexSrc.slice(indexSrc.indexOf('function parseAdvisorIntent'), indexSrc.indexOf('function parseAdvisorIntent') + 1200),
-		indexSrc.slice(indexSrc.indexOf('function parseAdvisorV2'), indexSrc.indexOf('function parseAdvisorV2') + 1200),
+		indexSrc.slice(intentClassifierSrc.indexOf('function parseAdvisorIntent'), intentClassifierSrc.indexOf('function parseAdvisorIntent') + 1200),
+		indexSrc.slice(intentClassifierSrc.indexOf('function parseAdvisorV2'), intentClassifierSrc.indexOf('function parseAdvisorV2') + 1200),
 	];
 	const bad = blocks.filter(b => b.includes('const match = stripped.match'));
 	return bad.length === 0 ? true : 'a strict match() is still in use';

@@ -73,8 +73,12 @@ const WRITE_PATTERNS = [
 
 export function classifyIntent(userMessage: string): 'read' | 'write' {
 	const msg = userMessage.toLowerCase();
+
+	// WRITE wins if any write pattern matches — explicit mutation intent
 	if (WRITE_PATTERNS.some(p => p.test(msg))) return 'write';
+	// READ wins if any read pattern matches
 	if (READ_PATTERNS.some(p => p.test(msg))) return 'read';
+	// Default to write so existing behavior is preserved for ambiguous prompts
 	return 'write';
 }
 
@@ -99,7 +103,8 @@ export function parseAdvisorIntent(raw: string): AdvisorIntent | null {
 	if (!obj) { console.warn('[Advisor] No JSON found.'); return null; }
 	try {
 		const intent = obj.intent as string;
-		if (!VALID_INTENTS.includes(intent as AdvisorIntent)) {
+		const valid: AdvisorIntent[] = ['create_fe', 'edit_fe', 'create_be', 'edit_be', 'create_fullstack', 'edit_fullstack', 'general', 'unknown'];
+		if (!valid.includes(intent as AdvisorIntent)) {
 			console.warn(`[Advisor] Unknown intent value: "${intent}"`);
 			return null;
 		}
@@ -111,16 +116,15 @@ export function parseAdvisorIntent(raw: string): AdvisorIntent | null {
 	}
 }
 
-export 
-
-function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: AdvisorV2Result } | null {
+export function parseAdvisorV2(raw: string): { intent: AdvisorIntent; v2: AdvisorV2Result } | null {
 	const stripped = raw.replace(/```json?\s*/gi, '').replace(/```\s*/g, '').trim();
 	// Tolerant parse: a truncated Advisor response still yields its fields.
 	const obj = parseAdvisorJson(stripped);
 	if (!obj) { console.warn('[AdvisorV2] No JSON found.'); return null; }
 	try {
 		const intentRaw = obj.intent as string;
-		if (!VALID_INTENTS.includes(intentRaw as AdvisorIntent)) {
+		const valid: AdvisorIntent[] = ['create_fe', 'edit_fe', 'create_be', 'edit_be', 'create_fullstack', 'edit_fullstack', 'general', 'unknown'];
+		if (!valid.includes(intentRaw as AdvisorIntent)) {
 			console.warn(`[AdvisorV2] Unknown intent: "${intentRaw}"`);
 			return null;
 		}
@@ -407,6 +411,8 @@ export function scoreKeywords(msg: string): { feScore: number; beScore: number }
 	if (UI_INTERACTION_PATTERN.test(msg)) feScore += 1;
 	if (UI_DESIGN_PATTERN.test(msg)) feScore += 2;
 	if (UI_FRAMEWORK_PATTERN.test(msg)) feScore += 2;
+
+	// High-signal UI keywords / phrases
 	if (/\b(?:kanban|trello|drag\s+and\s+drop|dark\s+mode|dashboard|responsive)\b/i.test(msg)) feScore += 2;
 
 	if (BE_DB_PATTERN.test(beMsg)) beScore += 2;
