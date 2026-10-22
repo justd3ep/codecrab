@@ -356,6 +356,22 @@ app.use(express.json());
 
 const PORT = config.server.port;
 
+// A crash must be DIAGNOSABLE.
+//
+// Without these, an unhandled rejection or an uncaught exception
+// terminates the router with exit code 1 and the reason goes
+// nowhere. That happened: the supervisor's log showed the config
+// lines and then 'router exited with code 1', with no explanation.
+process.on('uncaughtException', (err: any) => {
+	console.error(`[Router] UNCAUGHT EXCEPTION: ${err?.stack ?? err?.message ?? String(err)}`);
+	process.exit(1);
+});
+
+process.on('unhandledRejection', (reason: any) => {
+	console.error(`[Router] UNHANDLED REJECTION: ${reason?.stack ?? reason?.message ?? String(reason)}`);
+	process.exit(1);
+});
+
 const IDLE_UNLOAD_MS = config.generation.requestTimeoutMs; // 5 min idle → unload model
 
 // GPU VRAM budget per model key
@@ -4498,8 +4514,24 @@ _recovery.scan().catch(e => console.error('[RecoveryManager] Scan failed:', e));
 app.use('/v1/jobs', makeJobRoutes(_jobService, _asyncLogger.child('JobRoutes')));
 app.use('/', makeHealthRoutes(_asyncMM));
 
-app.listen(PORT, () => {
+// The server object is KEPT so a bind failure can be reported.
+//
+// Without a reference, a failed bind (EADDRINUSE — another router
+// already on the port) is an unhandled 'error' event: Node throws it,
+// and with no handler the process exits 1 with NOTHING logged. The
+// only trace was a silent 'router exited with code 1' in the
+// supervisor's log, which is undiagnosable.
+const server = app.listen(PORT, () => {
 	console.log(`CodeCrab Native Model Router running on http://localhost:${PORT}`);
 	console.log(`Engine: node-llama-cpp`);
 	console.log(`Runtime Directory: ${config.runtime.root}`);
+});
+
+server.on('error', (err: NodeJS.ErrnoException) => {
+	console.error(`[Router] FAILED TO LISTEN on port ${PORT}: ${err.code ?? ''} ${err.message}`);
+	if (err.code === 'EADDRINUSE') {
+		console.error('[Router] Another process is already listening on this port.');
+		console.error('[Router] Stop it (taskkill /F /PID <pid>) or change config.server.port.');
+	}
+	process.exit(1);
 });
