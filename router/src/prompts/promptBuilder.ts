@@ -7,6 +7,7 @@
  */
 
 import path from 'path';
+import config from '@/config/index.js';
 import fs from 'fs';
 import type { AgentMode } from '../routing/agentMode.js';
 import { getGitLogSummarySync } from '../gitHarness.js';
@@ -31,16 +32,20 @@ export function loadPrompt(name: string): string {
 // Routing failure logger — Stage 7 dataset collection
 // ---------------------------------------------------------------------------
 
-let _failureLogPath = '';
-export function setFailureLogPath(p: string) { _failureLogPath = p; }
+// The routing-failure log lives under the runtime directory.
+//
+// It is computed here rather than injected, because an injection
+// step is a step someone can forget: the previous
+// `setFailureLogPath()` was never called, so the log path was never
+// set and the function would have written nowhere.
+const FAILURE_LOG_PATH = path.join(config.runtime.root, 'logs/routing_failures.jsonl');
 
 export function logRoutingFailure(prompt: string, predicted: string, expected: string): void {
-	if (!_failureLogPath) return;
 	try {
-		const dir = path.dirname(_failureLogPath);
+		const dir = path.dirname(FAILURE_LOG_PATH);
 		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 		const entry = JSON.stringify({ prompt, predicted, expected, ts: new Date().toISOString() });
-		fs.appendFileSync(_failureLogPath, entry + '\n');
+		fs.appendFileSync(FAILURE_LOG_PATH, entry + '\n');
 		console.log(`[Router] Failure logged: ${predicted} → expected ${expected}`);
 	} catch (e: any) {
 		console.warn('[Router] Failed to write routing failure log:', e.message);

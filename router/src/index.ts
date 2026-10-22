@@ -33,11 +33,11 @@ import { makeHealthRoutes } from './router/healthRoutes.js';
 import config from '@/config/index.js';
 import { activeContextUsage, updateContextUsage, setEffectiveContextSize, effectiveContextSize } from './telemetry/contextUsage.js';
 import { ensureFrontendScaffold, ensureBackendScaffold, mergePackageJson, mergeInitSh } from './frontendScaffold.js';
-import { classifyIntent, classifyOpenFile, detectAppType, detectBackendIntent, inferPreviousRoute, parseAdvisorIntent, parseAdvisorV2, runAdvisor, runAdvisorLoopDecomposition, runAdvisorProjectSummary, scoreKeywords } from './routing/intentClassifier.js';
+import { classifyIntent, classifyOpenFile, detectAppType, detectBackendIntent, detectFrontendIntent, inferPreviousRoute, parseAdvisorIntent, parseAdvisorV2, runAdvisor, runAdvisorLoopDecomposition, runAdvisorProjectSummary, scoreKeywords } from './routing/intentClassifier.js';
 import { detectStackProfile } from './routing/stackProfile.js';
 import type { StackProfile } from './routing/stackProfile.js';
 import { diagnoseResponse, buildTruncationContinuationPrompt, buildProseOutputPrompt } from './generation/responseDiagnosis.js';
-import { cleanCodeBlock, detectRepetitionLoop, escapeRegExp, extractBackendSummary, extractFallbackEdits, extractRawCode, streamChunk, streamEvent } from './generation/pipelineHelpers.js';
+import { cleanCodeBlock, detectRepetitionLoop, escapeRegExp, extractBackendSummary, extractFallbackEdits, extractRawCode, isExplicitCodeRequest, streamChunk, streamEvent } from './generation/pipelineHelpers.js';
 import { buildNoOutputPrompt } from './generation/pipelineHelpers.js';
 import { validateJsxSymbols, buildJsxRepairPrompt, type JsxSymbolIssue } from './generation/pipelineHelpers.js';
 import { parseAdvisorJson } from './routing/advisorJson.js';
@@ -45,7 +45,7 @@ import { parseAdvisorJson } from './routing/advisorJson.js';
 import { wouldClobberScaffold } from './tools/scaffoldGuard.js';
 import { determineMode } from './routing/agentMode.js';
 
-import { buildBESystemPrompt, buildFESystemPrompt, buildSystemPrompt, loadPrompt, workspaceHasTsx } from './prompts/promptBuilder.js';
+import { buildBESystemPrompt, buildFESystemPrompt, buildSystemPrompt, loadPrompt, logRoutingFailure, workspaceHasTsx } from './prompts/promptBuilder.js';
 
 import { ensembleRoute, isCreatePrompt, promptNeedsFrontend, shouldRunFrontend } from './routing/ensembleRouter.js';
 import { applyPendingSession, buildDirectoryTree, buildLCS, createPendingSession, executeToolCall, extractReferencedFiles, generateUnifiedDiff, inferFilePath, parseToolCall, readFileSafe, validateContentForExtension, validateTargetPath } from './tools/toolEngine.js';
@@ -228,16 +228,7 @@ export const BE_SERVER_PATTERN = /\b(?:backend|back-end|api|rest(?:ful)?|graphql
 export const BE_AUTH_INFRA_PATTERN = /\b(?:jwt|bearer|oauth|bcrypt|hash(?:ing)?|auth(?:entication|orization)?|session|cookie|rbac|queue|bullmq|kafka|rabbitmq|cron|worker|microservice|docker)\b/i;
 
 // Helpers for Dynamic Routing
-function detectFrontendIntent(messages: any[]): boolean {
-	if (!messages || messages.length === 0) return false;
-	const lastMessage = messages[messages.length - 1]?.content || '';
-	return (
-		UI_COMPONENT_PATTERN.test(lastMessage) ||
-		UI_INTERACTION_PATTERN.test(lastMessage) ||
-		UI_DESIGN_PATTERN.test(lastMessage) ||
-		UI_FRAMEWORK_PATTERN.test(lastMessage)
-	);
-}
+
 
 
 
@@ -282,7 +273,6 @@ app.get('/health', (req, res) => {
 	});
 });
 
-let lastCpuInfo = os.cpus();
 
 
 // Stats Telemetry Endpoint
@@ -372,17 +362,7 @@ app.get('/v1/models', (req, res) => {
 // Collect 500–2000 failures before finetuning the advisor.
 // ---------------------------------------------------------------------------
 const FAILURE_LOG_PATH = path.join(config.runtime.root, 'logs/routing_failures.jsonl');
-function logRoutingFailure(prompt: string, predicted: string, expected: string): void {
-	try {
-		const dir = path.dirname(FAILURE_LOG_PATH);
-		if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-		const entry = JSON.stringify({ prompt, predicted, expected, ts: new Date().toISOString() });
-		fs.appendFileSync(FAILURE_LOG_PATH, entry + '\n');
-		console.log(`[Router] Failure logged: ${predicted} → expected ${expected}`);
-	} catch (e: any) {
-		console.warn('[Router] Failed to write routing failure log:', e.message);
-	}
-}
+
 
 // ---------------------------------------------------------------------------
 // Advisor — stateless 0.6B intent classifier
@@ -597,13 +577,7 @@ interface PipelineEvent {
 
 
 
-/** Detect whether the user is explicitly requesting to view generated code.
- *  When true, raw model output is shown rather than suppressed. */
-function isExplicitCodeRequest(msg: string): boolean {
-	return /\b(show|display|print|output|give me|return|see)\b.{0,30}\b(code|implementation|diff|changes|output|result|file)\b/i.test(msg)
-		|| /\bshow (the )?(generated|full|complete|entire|updated)\b/i.test(msg)
-		|| /\b(explain|walk me through|describe)\b.{0,20}\b(implementation|code|changes)\b/i.test(msg);
-}
+
 
 // ---------------------------------------------------------------------------
 // Chat Completions — Agentic Tool-Calling Loop & Hardening Settings
