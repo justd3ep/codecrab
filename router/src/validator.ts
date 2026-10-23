@@ -41,6 +41,7 @@ import { fileURLToPath } from 'url';
 import { classifyDependency, DependencyStatus, isImportError } from './dependencyStatus.js';
 import type { ExecutionGraph } from './planner.js';
 import type { StackProfile, StackKind } from './routing/stackProfile.js';
+import { FRONTEND_FEATURE_WEIGHTS } from './parsing/frontendFeatures.js';
 
 const execPromise = util.promisify(exec);
 
@@ -1100,7 +1101,14 @@ function pass7RequirementCoverage(
 	let maxScore = 0;
 
 	for (const featureKey of contract.requiredFeatures) {
-		const spec = FEATURE_WEIGHTS[featureKey];
+		// The feature may be a BACKEND feature or a FRONTEND one.
+		//
+		// Before the frontend table existed, a frontend request's
+		// requiredFeatures was empty — the detection table was
+		// entirely backend — so the coverage was 0/0 and this loop
+		// never ran. A 0/0 score is no measurement at all.
+		const spec = FEATURE_WEIGHTS[featureKey]
+			?? FRONTEND_FEATURE_WEIGHTS[featureKey];
 		if (!spec) continue;
 		maxScore += spec.weight;
 		const matched = spec.patterns.some(p => p.test(allContent));

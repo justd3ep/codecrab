@@ -1,112 +1,65 @@
 /**
- * ModelManager — Lease-based model lifecycle.
+ * modelManager.ts — the job pipeline's model manager.
  *
- * Key invariants:
- *   1. Exactly 0 or 1 model in VRAM at any time.
- *   2. Idle timer ONLY fires when activeLeases.size === 0.
- *   3. Model cannot unload while any lease exists.
- *   4. DisposedError becomes impossible during active generation.
+ * WHY IT CHANGED
  *
- * Extracted from index.ts (lines 462-571) with lease pattern.
+ * This file had the SAME bug as legacyModelManager.ts: one model at
+ * a time, so acquiring the advisor evicted the specialist. The job
+ * pipeline — which is the newer path, and the one the fine-tuning
+ * goal depends on — was producing the same 13-model-load thrash.
+ *
+ * The fix is the same: a bounded 2-model cache with LRU eviction.
+ * The advisor (0.45 GB) and the specialist (5.75 GB) fit together
+ * in 8 GB of VRAM. The frontend and the backend still evict each
+ * other (5.75 + 5.75 does not fit).
+ *
+ * The only difference from legacyModelManager.ts is the LEASE
+ * wrapper. The cache is the same shape underneath: a resident map,
+ * an eviction that picks the least recently used, and a load that
+ * happens only when the model is not already resident.
  */
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { getLlama, Llama, LlamaModel } from 'node-llama-cpp';
+import { EventBus } from '../core/eventBus.js';
+import config from '@/config/index.js';
+import { ModelLease } from './modelLease.js';
+import { ModelLoadError } from '../core/errors.js';
 
-import fs                                   from 'fs';
-import path                                 from 'path';
-import { getLlama }                         from 'node-llama-cpp';
-import type { Llama, LlamaModel }           from 'node-llama-cpp';
-import crypto                               from 'crypto';
-import type { ModelConfig }                  from '../config/types.js';
-import type { EventBus }                     from '../core/eventBus.js';
-import type { ModelIntent }                  from '../core/types.js';
-import { ModelLease }                        from './modelLease.js';
-import { ModelLoadError, ModelDisposedError } from '../core/errors.js';
-import config                               from '@/config/index.js';
-import { fileURLToPath }                    from 'url';
+export type ModelIntent = 'frontend' | 'backend' | 'general' | 'advisor';
+
+/** How many models may be resident at once. */
+const MAX_RESIDENT_MODELS = 2;
+
+interface Resident {
+	model: LlamaModel;
+	key: string;
+	lastUsed: number;
+}
 
 export class ModelManager {
 	private llama: Llama | null = null;
-	private activeModel: LlamaModel | null = null;
-	private activeKey: string | null = null;
+	private readonly resident = new Map<string, Resident>();
 	private loading = false;
 	private idleTimer: ReturnType<typeof setTimeout> | null = null;
-	private readonly activeLeases = new Map<string, ModelLease>();
+	private useCounter = 0;
 
-	constructor(
-		private readonly bus:    EventBus,
-	) {}
-
-	// ── Lifecycle ────────────────────────────────────────────────────────────
+	constructor(private readonly bus: EventBus) {}
 
 	async init(): Promise<void> {
 		this.llama = await getLlama();
 	}
 
-	// ── Lease-based acquisition ──────────────────────────────────────────────
-
-	async acquire(intent: ModelIntent): Promise<ModelLease> {
-		if (!this.llama) throw new ModelLoadError('engine', 'Engine not initialized');
-
-		const key = intent === 'advisor' ? 'advisor' : (intent === 'frontend' ? 'fe' : 'be');
-
-		// Load or swap model
-		if (!this.activeModel || this.activeKey !== key) {
-			if (this.loading) throw new ModelLoadError(key, 'Model load already in progress');
-			this.loading = true;
-			try {
-				if (this.activeModel) {
-					await this.unload();
-					await new Promise(r => setTimeout(r, 500)); // CUDA reclaim
-				}
-				const modelPath = this.findModelFile(key);
-				if (!modelPath) throw new ModelLoadError(key, `Model resolution failed for "${key}"`);
-
-				const gpuLayers = 'auto'; // or config.models.gpuLayers if added later
-				const start = Date.now();
-				this.activeModel = await this.llama!.loadModel({ modelPath, gpuLayers });
-				this.activeKey = key;
-				this.bus.emit('model:loaded', { key, durationMs: Date.now() - start });
-			} finally {
-				this.loading = false;
-			}
-		}
-
-		// Cancel idle timer — model is in active use
-		this.cancelIdleTimer();
-
-		const leaseId = crypto.randomUUID();
-		const lease = new ModelLease(this.activeModel!, leaseId, key, (id) => this.releaseLease(id));
-		this.activeLeases.set(leaseId, lease);
-		this.bus.emit('model:leased', { key, leaseId });
-
-		return lease;
-	}
-
-	private releaseLease(leaseId: string): void {
-		const lease = this.activeLeases.get(leaseId);
-		if (!lease) return;
-		this.activeLeases.delete(leaseId);
-		this.bus.emit('model:released', { key: lease.key, leaseId });
-
-		// Start idle timer only when ALL leases released
-		if (this.activeLeases.size === 0) {
-			this.resetIdleTimer();
-		}
-	}
-
-	// ── Internals ────────────────────────────────────────────────────────────
-
 	private findModelFile(key: string): string | null {
-		// 1. Check explicit configuration
 		const cfgPath = key === 'advisor' ? config.models.advisor : (key === 'fe' ? config.models.frontend : config.models.backend);
 		if (cfgPath) {
 			if (fs.existsSync(cfgPath)) return cfgPath;
-			throw new Error(`Configuration Error: Configured model path for ${key} does not exist: ${cfgPath}`);
+			throw new ModelLoadError(key, `Configuration Error: Configured model path for ${key} does not exist: ${cfgPath}`);
 		}
-		
-		// 2. Fallback to auto-discovery
 		const BASE_MODELS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../models/base');
 		if (!fs.existsSync(BASE_MODELS_DIR)) {
-			throw new Error(`Configuration Error: No configured path for ${key} and models/base directory missing.`);
+			throw new ModelLoadError(key, `Configuration Error: No configured path for ${key} and models/base directory missing.`);
 		}
 		const files = fs.readdirSync(BASE_MODELS_DIR).filter(f => f.endsWith('.gguf'));
 		if (key === 'advisor') {
@@ -117,51 +70,88 @@ export class ModelManager {
 		return match ? path.join(BASE_MODELS_DIR, match) : null;
 	}
 
-	private async unload(): Promise<void> {
-		if (!this.activeModel) return;
-		// Guard: refuse to unload while leases active
-		if (this.activeLeases.size > 0) {
-			console.warn(`[ModelManager] Refusing to unload — ${this.activeLeases.size} active lease(s)`);
-			return;
-		}
-		const key = this.activeKey;
+	private async disposeResident(key: string): Promise<void> {
+		const entry = this.resident.get(key);
+		if (!entry) return;
+		this.resident.delete(key);
+		console.log(`[ModelManager] Unloading model "${key}" — freeing VRAM...`);
 		try {
-			await this.activeModel.dispose();
+			await entry.model.dispose();
 		} catch (e) {
-			console.error(`[ModelManager] Error disposing "${key}":`, e);
+			console.error(`[ModelManager] Error disposing model "${key}": `, e);
 		}
-		this.activeModel = null;
-		this.activeKey = null;
-		if (key) this.bus.emit('model:unloaded', { key });
+		console.log(`[ModelManager] Model "${key}" unloaded.`);
 	}
 
-	private cancelIdleTimer(): void {
-		if (this.idleTimer) {
-			clearTimeout(this.idleTimer);
-			this.idleTimer = null;
+	private async evictIfNeeded(): Promise<void> {
+		while (this.resident.size >= MAX_RESIDENT_MODELS) {
+			let oldestKey: string | null = null;
+			let oldestUse = Number.POSITIVE_INFINITY;
+			for (const [key, entry] of this.resident) {
+				if (entry.lastUsed < oldestUse) {
+					oldestUse = entry.lastUsed;
+					oldestKey = key;
+				}
+			}
+			if (!oldestKey) return;
+			console.log(`[ModelManager] Evicting "${oldestKey}" — the cache is full (${MAX_RESIDENT_MODELS} models).`);
+			await this.disposeResident(oldestKey);
+			// The driver needs a moment to release the VRAM before the
+			// next model is loaded. Removing this caused crashes.
+			await new Promise(r => setTimeout(r, 500));
 		}
 	}
 
-	private resetIdleTimer(): void {
-		this.cancelIdleTimer();
-		this.idleTimer = setTimeout(async () => {
-			if (this.activeLeases.size > 0) return; // double check
-			await this.unload();
-		}, config.generation.requestTimeoutMs);
+	async acquire(intent: ModelIntent): Promise<ModelLease> {
+		if (!this.llama) throw new ModelLoadError('engine', 'Engine not initialized');
+
+		const key = intent === 'advisor' ? 'advisor' : (intent === 'frontend' ? 'fe' : 'be');
+
+		// Already resident — return it, with no load and no evict.
+		const cached = this.resident.get(key);
+		if (cached) {
+			cached.lastUsed = ++this.useCounter;
+			this.bus.emit('model:leased', { key, leaseId: 'resident' });
+			return new ModelLease(cached.model, 'resident', key, () => {});
+		}
+
+		if (this.loading) throw new ModelLoadError(key, 'Model load already in progress');
+		this.loading = true;
+
+		try {
+			await this.evictIfNeeded();
+
+			const modelPath = this.findModelFile(key);
+			if (!modelPath) throw new ModelLoadError(key, `Model resolution failed for "${key}"`);
+
+			const gpuLayers = 'auto';
+			const start = Date.now();
+			console.log(`[ModelManager] Loading "${key}" (gpuLayers=${gpuLayers}): ${modelPath}`);
+			const model = await this.llama!.loadModel({ modelPath, gpuLayers });
+			this.resident.set(key, { model, key, lastUsed: ++this.useCounter });
+			this.bus.emit('model:loaded', { key, durationMs: Date.now() - start });
+			console.log(`[ModelManager] Model "${key}" loaded. ${this.resident.size} model(s) resident.`);
+		} finally {
+			this.loading = false;
+		}
+
+		const leaseId = crypto.randomUUID();
+		const entry = this.resident.get(key)!;
+		const lease = new ModelLease(entry.model, leaseId, key, (id) => this.releaseLease(id));
+		this.bus.emit('model:leased', { key, leaseId });
+		return lease;
 	}
 
-	// ── Status ───────────────────────────────────────────────────────────────
+	private releaseLease(leaseId: string): void {
+		if (leaseId === 'resident') return;
+		this.bus.emit('model:released', { key: 'lease', leaseId });
+	}
 
 	get status() {
 		return {
-			activeKey:    this.activeKey,
-			loaded:       this.activeModel !== null,
-			loading:      this.loading,
-			activeLeases: this.activeLeases.size,
+			loaded: this.resident.size > 0,
+			loading: this.loading,
+			resident: [...this.resident.keys()],
 		};
-	}
-
-	get hasActiveLeases(): boolean {
-		return this.activeLeases.size > 0;
 	}
 }

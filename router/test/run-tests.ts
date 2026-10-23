@@ -159,13 +159,21 @@ const SUITE: Array<{ file: string; what: string }> = [
 		what: 'there is one health route, and it is complete',
 	},
 	{
-		file: 'verify-shared-abort-route.ts',
-		what: 'both chat routes share one abort route',
-	},
-	{
-		file: 'verify-which-pipeline-runs.ts',
-		what: 'the monolithic loop is the live path for frontend requests',
-	},
+			file: 'verify-shared-abort-route.ts',
+			what: 'both chat routes share one abort route',
+		},
+		{
+			file: 'verify-which-pipeline-runs.ts',
+			what: 'the monolithic loop is the live path for frontend requests',
+		},
+		{
+			file: 'verify-model-cache.ts',
+			what: 'the model manager keeps the advisor resident',
+		},
+		{
+			file: 'verify-frontend-coverage.ts',
+			what: 'the frontend scope has a scored feature table',
+		},
 	// The guard self-test COMMITS to the repo and takes ~80s. It is NOT
 	// in the default suite for two reasons:
 	//   1. It is a diagnostic, not a regression test — it proves the hook

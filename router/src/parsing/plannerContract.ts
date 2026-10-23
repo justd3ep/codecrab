@@ -10,6 +10,7 @@ import type { ValidationContract } from '../validator.js';
 import type { UserScope } from './constraintParser.js';
 import { parseUserScope } from './constraintParser.js';
 import type { StackProfile } from '../routing/stackProfile.js';
+import { detectFrontendFeatures } from './frontendFeatures.js';
 
 export const FEATURE_DETECTION: Array<{ key: string; re: RegExp }> = [
 	{ key: 'jwt', re: /\bjwt\b|json.?web.?token|access.?token/i },
@@ -125,15 +126,60 @@ export function buildPlannerContract(msg: string, advisorIntent: string, userSco
 		/\bjavascript\b|\.js\b/i.test(msg) && !/\btypescript\b|\.ts\b/i.test(msg) ? 'javascript' : 'typescript';
 
 	// Required features
-	const requiredFeatures = FEATURE_DETECTION.filter(f => f.re.test(msg)).map(f => f.key);
+	//
+	// The FEATURE_DETECTION table is entirely backend — jwt,
+	// repository, rbac, bcrypt. A frontend request matched NONE of
+	// them, so its feature contract was empty and its coverage score
+	// was 0/0. A 0/0 score is no measurement at all.
+	//
+	// So the frontend scope gets the FRONTEND table: the same
+	// signals as the requirement probes — which are proven to catch
+	// a missing drag-and-drop — but with weights, so the score is
+	// a real number.
+	const requiredFeatures = scope === 'frontend'
+		? detectFrontendFeatures(msg)
+		: FEATURE_DETECTION.filter(f => f.re.test(msg)).map(f => f.key);
+
+	// A fullstack request can want both.
+	if (scope === 'fullstack') {
+		for (const key of detectFrontendFeatures(msg)) {
+			if (!requiredFeatures.includes(key)) requiredFeatures.push(key);
+		}
+	}
 
 	// Required folders from architecture
 	const requiredFolders = ARCH_FOLDERS_MAP[architecture] ?? [];
 
 	// Rough file estimate: (features * 2) + (folders * 2) + 3 base files
+	//
+	// A FRONTEND request needs its own floor. The generic one is 5,
+	// which comes from a formula that never saw the request — and
+	// the frontend scaffold ALREADY created 13 foundation files
+	// (package.json, index.html, vite.config.ts, tsconfig.json,
+	// tailwind.config.js, postcss.config.js, src/main.tsx,
+	// src/App.tsx, src/style.css, init.sh, features.json,
+	// progress.txt).
+	//
+	// So for "a kanban board with drag and drop", the model is
+	// expected to produce ONE component file. The old estimate said
+	// 5, so the completeness check called a correct answer
+	// incomplete — and the model was sent round the repair loop
+	// until it produced an identical response and the request died:
+	//
+	//     Only 1 files generated — expected ~5 (min 2).
+	//     Generation incomplete.
+	//
+	//     [Router] Identical response detected from the model across
+	//     iterations. Stopping to prevent infinite retry loop.
+	//
+	// The frontend estimate is now: one file per requested feature,
+	// plus one for the app shell, with a floor of 1. The scaffold's
+	// own files do not count — they are not model output.
 	const estimatedFiles = scope === 'fullstack'
 		? Math.max(10, requiredFeatures.length * 2 + requiredFolders.length * 2 + 5)
-		: Math.max(5, requiredFeatures.length * 2 + requiredFolders.length * 2 + 3);
+		: scope === 'frontend'
+			? Math.max(1, requiredFeatures.length + 1)
+			: Math.max(5, requiredFeatures.length * 2 + requiredFolders.length * 2 + 3);
 
 	console.log(`[PlannerContract] scope=${scope} arch=${architecture} fw=${framework} features=[${requiredFeatures.join(',')}] est=${estimatedFiles}`);
 	return { scope, architecture, framework, language, requiredFeatures, requiredFolders, estimatedFiles };
