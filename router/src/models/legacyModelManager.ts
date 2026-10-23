@@ -34,7 +34,6 @@
  * resident, and a model that is already loaded is returned
  * immediately.
  *
- * The cache is bounded — see MAX_RESIDENT_MODELS — and it evicts
  * the LEAST RECENTLY USED model when it is full. The advisor, being
  * small and used constantly, is the last one evicted.
  *
@@ -52,22 +51,17 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { getLlama, Llama, LlamaModel } from 'node-llama-cpp';
 import config from '../config/index.js';
+import { budgetForVram } from './vramBudget.js';
 
 export const IDLE_UNLOAD_MS = config.generation.requestTimeoutMs;
 
 /**
  * How many models may be resident at once.
  *
- * TWO is right for this machine: the specialist (5.75 GB) and the
- * advisor (0.45 GB) together are 6.2 GB, which fits in 8 GB of
- * VRAM with room for the context.
- *
- * The frontend and the backend models are 5.75 GB EACH — they
- * cannot be resident together, so they still evict each other. The
- * LRU eviction handles that: whichever was used least recently goes
- * first.
+ * This is NOT a constant. It is set at init from the detected VRAM,
+ * because the design target is a 4 GB box where the specialist needs
+ * every MB for offloading. See src/models/vramBudget.ts.
  */
-export const MAX_RESIDENT_MODELS = 2;
 
 /**
  * The GPU layers per model.
@@ -91,10 +85,10 @@ interface Resident {
 
 class LegacyModelManager {
 	private llama: Llama | null = null;
-
 	/** The resident models, by key. */
 	private readonly resident = new Map<string, Resident>();
-
+	/** How many models may be resident — set at init from the VRAM. */
+	private maxResident: number = 1;
 	/** The model the request path is currently generating with. */
 	private activeModel: LlamaModel | null = null;
 	private activeKey: string | null = null;
@@ -152,7 +146,7 @@ class LegacyModelManager {
 	 * them must leave.
 	 */
 	private async evictIfNeeded(): Promise<void> {
-		while (this.resident.size >= MAX_RESIDENT_MODELS) {
+		while (this.resident.size >= this.maxResident) {
 			let oldestKey: string | null = null;
 			let oldestUse = Number.POSITIVE_INFINITY;
 			for (const [key, entry] of this.resident) {
@@ -162,7 +156,7 @@ class LegacyModelManager {
 				}
 			}
 			if (!oldestKey) return;
-			console.log(`[ModelManager] Evicting "${oldestKey}" — the cache is full (${MAX_RESIDENT_MODELS} models).`);
+			console.log(`[ModelManager] Evicting "${oldestKey}" — the cache is full (${this.maxResident} models).`);
 			await this.disposeResident(oldestKey);
 			// The driver needs a moment to release the VRAM before
 			// the next model is loaded. Removing this caused crashes.
@@ -181,8 +175,25 @@ class LegacyModelManager {
 	async init(): Promise<void> {
 		console.log('[ModelManager] Initializing llama engine (no models pre-loaded)...');
 		this.llama = await getLlama();
-		console.log('[ModelManager] Engine ready. VRAM: 0 models loaded.');
-	}
+
+		// The resident-model budget is set from the detected VRAM, so
+		// a 4 GB box keeps one model in VRAM (the specialist needs
+		// every MB for offloading) while an 8 GB box keeps two.
+		this.maxResident = await this.detectBudget();
+		console.log(`[ModelManager] Engine ready. VRAM budget: ${this.maxResident} model(s) resident.`);
+		}
+
+		private async detectBudget(): Promise<number> {
+		try {
+			const state = await this.llama!.getVramState?.();
+			if (state && typeof state.total === 'number' && state.total > 0) {
+				return budgetForVram(state.total);
+			}
+		} catch {
+			// Fall through to the conservative default.
+		}
+		return 1; // unknown — the design target
+		}
 
 	/** Dispose every resident model. */
 	async unloadAll(): Promise<void> {

@@ -69,15 +69,66 @@ check('there is a resident map', () =>
 		: 'there is no resident map');
 
 check('the cache is bounded', () =>
-	/export const MAX_RESIDENT_MODELS/.test(mmSrc) &&
-	/while \(this\.resident\.size >= MAX_RESIDENT_MODELS\)/.test(mmSrc)
+	/private maxResident: number = 1/.test(mmSrc) &&
+	/while \(this\.resident\.size >= this\.maxResident\)/.test(mmSrc)
 		? true
 		: 'the cache is not bounded');
 
-check('the bound is 2 — the specialist and the advisor fit', () =>
-	/export const MAX_RESIDENT_MODELS = 2/.test(mmSrc)
+check('the constant is gone, so the budget is detected at init', () =>
+	!/MAX_RESIDENT_MODELS/.test(mmSrc)
 		? true
-		: 'the bound is not 2');
+		: 'the constant is still there, so the budget is not detected');
+
+check('the budget is detected at init in both managers', () => {
+	const a = /this\.maxResident = await this\.detectBudget\(\)/.test(mmSrc);
+	const job = fs.readFileSync(path.join(SRC, 'models', 'modelManager.ts'), 'utf8');
+	const b = /this\.maxResident = await this\.detectBudget\(\)/.test(job);
+	return a && b ? true : 'the budget is not detected at init in both managers';
+});
+
+check('the eviction uses the instance budget, not the constant', () =>
+	/this\.resident\.size >= this\.maxResident/.test(mmSrc)
+		? true
+		: 'the eviction uses the constant, not the detected budget');
+
+check('the same budget is used in the job pipeline', () => {
+	const job = fs.readFileSync(path.join(SRC, 'models', 'modelManager.ts'), 'utf8');
+	return /this\.maxResident = await this\.detectBudget\(\)/.test(job)
+		? true
+		: 'the job pipeline does not use the detected budget';
+});
+
+check('the same budget is used in the job pipeline', () => {
+	const job = fs.readFileSync(path.join(SRC, 'models', 'modelManager.ts'), 'utf8');
+	return /this\.maxResident = await this\.detectBudget\(\)/.test(job)
+		? true
+		: 'the job pipeline does not use the detected budget';
+});
+
+check('the budget is set from the detected VRAM at init', () =>
+	/this\.maxResident = await this\.detectBudget\(\)/.test(mmSrc)
+		? true
+		: 'the budget is not set at init from the VRAM');
+
+check('the eviction uses the instance budget, not the constant', () =>
+	/this\.resident\.size >= this\.maxResident/.test(mmSrc)
+		? true
+		: 'the eviction uses the constant, not the detected budget');
+
+check('the budget is 1 when the VRAM is unknown', () => {
+	const t = fs.readFileSync(path.join(SRC, 'models', 'vramBudget.ts'), 'utf8');
+	return /return 1; \/\/ unknown/.test(t) ? true : 'the unknown-VRAM default is not 1';
+});
+
+check('the budget is 1 at 4 GB', () => {
+	const t = fs.readFileSync(path.join(SRC, 'models', 'vramBudget.ts'), 'utf8');
+	return /gb <= 5.*return 1/.test(t) ? true : 'a 4 GB box does not get the 1-model budget';
+});
+
+check('the budget is 2 at 8 GB', () => {
+	const t = fs.readFileSync(path.join(SRC, 'models', 'vramBudget.ts'), 'utf8');
+	return /gb <= 9.*return 2/.test(t) ? true : 'an 8 GB box does not get the 2-model budget';
+});
 
 console.log('\n=== an already-resident model is returned WITHOUT a load ===');
 

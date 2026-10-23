@@ -4,19 +4,29 @@
  * WHY IT CHANGED
  *
  * This file had the SAME bug as legacyModelManager.ts: one model at
- * a time, so acquiring the advisor evicted the specialist. The job
- * pipeline — which is the newer path, and the one the fine-tuning
- * goal depends on — was producing the same 13-model-load thrash.
+ * a time, so acquiring the advisor EVICTED the specialist and the
+ * loop re-acquired it — a measured 11.5 s reload plus a 500 ms
+ * sleep, per loop recovery. The job pipeline — which is the newer
+ * path and the one the fine-tuning goal depends on — was producing
+ * the same 13-model-load thrash.
  *
- * The fix is the same: a bounded 2-model cache with LRU eviction.
- * The advisor (0.45 GB) and the specialist (5.75 GB) fit together
- * in 8 GB of VRAM. The frontend and the backend still evict each
- * other (5.75 + 5.75 does not fit).
+ * THE 4 GB TARGET
  *
- * The only difference from legacyModelManager.ts is the LEASE
- * wrapper. The cache is the same shape underneath: a resident map,
- * an eviction that picks the least recently used, and a load that
- * happens only when the model is not already resident.
+ * The cache size is NOT a constant. It is set at init from the
+ * detected VRAM, because the design target is a 4 GB box where the
+ * specialist needs every MB for offloading:
+ *
+ *   <= 5 GB   1 model   the specialist needs the VRAM
+ *   6-9 GB    2 models the advisor fits alongside
+ *   > 9 GB    3 models FE + BE + advisor
+ *
+ * On a 4 GB box the 0.45 GB advisor must NOT stay resident — it
+ * steals VRAM from the specialist and makes its offloading less
+ * rigorous. The original one-model-at-a-time design was correct
+ * there.
+ *
+ * The eviction is still LRU: whichever model was used least
+ * recently goes first.
  */
 import fs from 'fs';
 import path from 'path';
@@ -26,11 +36,9 @@ import { EventBus } from '../core/eventBus.js';
 import config from '@/config/index.js';
 import { ModelLease } from './modelLease.js';
 import { ModelLoadError } from '../core/errors.js';
+import { budgetForVram } from './vramBudget.js';
 
 export type ModelIntent = 'frontend' | 'backend' | 'general' | 'advisor';
-
-/** How many models may be resident at once. */
-const MAX_RESIDENT_MODELS = 2;
 
 interface Resident {
 	model: LlamaModel;
@@ -41,14 +49,28 @@ interface Resident {
 export class ModelManager {
 	private llama: Llama | null = null;
 	private readonly resident = new Map<string, Resident>();
+	private maxResident: number = 1;
 	private loading = false;
-	private idleTimer: ReturnType<typeof setTimeout> | null = null;
 	private useCounter = 0;
 
 	constructor(private readonly bus: EventBus) {}
 
 	async init(): Promise<void> {
 		this.llama = await getLlama();
+		this.maxResident = await this.detectBudget();
+		console.log(`[ModelManager] Engine ready. VRAM budget: ${this.maxResident} model(s) resident.`);
+	}
+
+	private async detectBudget(): Promise<number> {
+		try {
+			const state = await this.llama!.getVramState?.();
+			if (state && typeof state.total === 'number' && state.total > 0) {
+				return budgetForVram(state.total);
+			}
+		} catch {
+			// Fall through to the conservative default.
+		}
+		return 1; // unknown — the design target
 	}
 
 	private findModelFile(key: string): string | null {
@@ -84,7 +106,7 @@ export class ModelManager {
 	}
 
 	private async evictIfNeeded(): Promise<void> {
-		while (this.resident.size >= MAX_RESIDENT_MODELS) {
+		while (this.resident.size >= this.maxResident) {
 			let oldestKey: string | null = null;
 			let oldestUse = Number.POSITIVE_INFINITY;
 			for (const [key, entry] of this.resident) {
@@ -94,7 +116,7 @@ export class ModelManager {
 				}
 			}
 			if (!oldestKey) return;
-			console.log(`[ModelManager] Evicting "${oldestKey}" — the cache is full (${MAX_RESIDENT_MODELS} models).`);
+			console.log(`[ModelManager] Evicting "${oldestKey}" — the cache is full (${this.maxResident} models).`);
 			await this.disposeResident(oldestKey);
 			// The driver needs a moment to release the VRAM before the
 			// next model is loaded. Removing this caused crashes.
