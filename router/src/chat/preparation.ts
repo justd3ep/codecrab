@@ -44,7 +44,7 @@ import config from '@/config/index.js';
 import { randomUUID } from 'crypto';
 import { buildBrief } from '../brief/buildBrief.js';
 import { writeBrief } from '../brief/serialize.js';
-import { normaliseIntent } from '../brief/buildBrief.js';
+import { decodeAdvisorIntent } from '../brief/decode.js';
 import type { TurnBrief } from '../brief/types.js';
 
 // ── Return type ──────────────────────────────────────────────────────
@@ -262,27 +262,18 @@ export async function prepareRequest(
 		intent = ensembledIntent as 'frontend' | 'backend' | 'general';
 	}
 
-	const rawAdvisorIntent: string = advisorIntent ?? ensembledIntent;
+	// --- DECODE CONTRACT (R3) ---
+	// Only a schema-valid decode may act. The advisor's vocabulary
+	// (`create_fullstack`) and the schema's (`fullstack`) are reconciled in
+	// one place; the literal "unknown" that used to survive the `??`
+	// null-check now fails explicitly, and the ensemble's verdict takes
+	// over instead of the contract's ternary defaulting to fullstack.
+	const decode = decodeAdvisorIntent(advisorIntent);
+	const rawAdvisorIntent: string = decode.ok ? String(advisorIntent) : ensembledIntent;
 
-	// --- PLANNER CONTRACT (deterministic, no model call) ---
-	const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent, userScope);
-	const validationContract = plannerContractToValidationContract(plannerContract, userScope, stackProfile);
-
-	// --- TURN BRIEF (Phase 2: recorded, not yet consumed) ---
-	// One object reconciles what five deciders just concluded: the advisor
-	// decode, the ensemble scores, the planner contract's scope, the user's
-	// scope mask, and the detected stack. Nothing reads it yet — it is
-	// built and written so the decision can be replayed and diffed against
-	// what the pipeline actually does, BEFORE any consumer depends on it.
-	//
-	// The decode is "ok" only when the advisor returned a real intent.
-	// Today it usually does not: the failed advisor returns the literal
-	// string "unknown", which survives the `??` null-check above and
-	// reaches the contract. Recording that as `decode.failed` is what makes
-	// the scope drift visible instead of silent.
 	const briefScores = scoreKeywords(lastUserMsg);
 	const briefNow = new Date().toISOString();
-	const brief = buildBrief({
+	const briefBase = {
 		requestId: randomUUID(),
 		lastUserMsg,
 		// 'unknown' already returned above, so this is narrowed to the three
@@ -295,16 +286,14 @@ export async function prepareRequest(
 			// The advisor does not report token usage; 0 is honest here.
 			promptTokens: 0,
 			raw: JSON.stringify(advisorV2Result ?? advisorIntent ?? null),
-			ok: normaliseIntent(advisorIntent) !== 'unknown',
+			ok: decode.ok,
 		},
 		stack: {
 			framework: stackProfile?.framework,
 			language: stackProfile?.language,
 			singleFile: stackProfile?.singleFile,
 		},
-		contractScope: plannerContract?.scope,
 		userScope,
-		features: Array.isArray(plannerContract?.requiredFeatures) ? plannerContract.requiredFeatures : [],
 		modules: Array.isArray(advisorV2Result?.modules) ? advisorV2Result!.modules! : [],
 		// Phase 4 fills the index; zeros until then, never invented values.
 		fileKnowledge: {
@@ -316,10 +305,30 @@ export async function prepareRequest(
 		},
 		targets: [],
 		now: briefNow,
+	};
+
+	// --- TURN BRIEF (Phase 3: it owns the routing decision) ---
+	// Pass 1 resolves intent and scope. The planner contract is then a
+	// projection of that result — it is never consulted while producing it,
+	// so the two can no longer disagree (the measured bug: ensemble FE=8/BE=0,
+	// contract fullstack).
+	const draftBrief = buildBrief({ ...briefBase, features: [] });
+
+	// --- PLANNER CONTRACT (deterministic, no model call) ---
+	const plannerContract = buildPlannerContract(lastUserMsg, {
+		scope: draftBrief.scope,
+		framework: draftBrief.stack.framework,
 	});
+	const validationContract = plannerContractToValidationContract(plannerContract, userScope, stackProfile);
+
+	// Pass 2 records the contract's feature list. `features` does not feed
+	// the scope, so the route cannot change between the two builds — the
+	// brief and the contract are guaranteed to agree by construction.
+	const brief: TurnBrief = buildBrief({ ...briefBase, features: plannerContract.requiredFeatures });
 	console.log(
 		`[Brief] intent=${brief.intent} scope=${brief.scope} specialist=${brief.route.specialist} decode=${brief.decode.ok ? 'ok' : 'FAILED'} scores=fe${brief.route.scores.fe}/be${brief.route.scores.be} reason=${brief.route.reason}`,
 	);
+	console.log(`[PlannerContract] projected scope=${plannerContract.scope} fw=${plannerContract.framework} est=${plannerContract.estimatedFiles}`);
 	if (hasWorkspace) {
 		const briefFile = writeBrief(brief, workspaceRoot);
 		if (briefFile) console.log(`[Brief] written: ${briefFile}`);

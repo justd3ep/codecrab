@@ -2,13 +2,28 @@
  * plannerContract.ts — Deterministic keyword extraction, no model call.
  *
  * Extracted from index.ts (lines 66–177).
- * Produces a PlannerContract from user message + advisor intent.
- * No async, no I/O.
+ * Produces a PlannerContract from the user message plus the scope the
+ * TurnBrief already resolved. No async, no I/O, and — as of Phase 3 — no
+ * scope decision of its own.
+ *
+ * WHY THE SCOPE IS AN INPUT
+ *
+ * This function used to derive the scope from the raw advisor string:
+ *
+ *     advisorIntent.includes('fe') ? 'frontend'
+ *       : advisorIntent.includes('be') ? 'backend'
+ *         : advisorIntent.includes('fullstack') ? 'fullstack'
+ *           : 'fullstack';   // <-- the fullstack fallthrough
+ *
+ * A failed advisor returns the literal string "unknown", matched none of
+ * the branches, and became the expensive two-model path. On the measured
+ * request the ensemble had already scored FE=8/BE=0. The brief resolves
+ * the scope once (mask > decode > ensemble > scores); this function now
+ * projects that decision instead of repeating it.
  */
 
 import type { ValidationContract } from '../validator.js';
 import type { UserScope } from './constraintParser.js';
-import { parseUserScope } from './constraintParser.js';
 import type { StackProfile } from '../routing/stackProfile.js';
 import { detectFrontendFeatures } from './frontendFeatures.js';
 
@@ -93,14 +108,22 @@ export function plannerContractToValidationContract(
 	};
 }
 
-export function buildPlannerContract(msg: string, advisorIntent: string, userScope?: UserScope): PlannerContract {
-	// Scope
-	const resolvedScope = userScope || parseUserScope(msg);
-	const scope: PlannerContract['scope'] =
-		resolvedScope === 'FRONTEND_ONLY' || advisorIntent.includes('fe') ? 'frontend'
-			: resolvedScope === 'BACKEND_ONLY' || advisorIntent.includes('be') ? 'backend'
-				: advisorIntent.includes('fullstack') ? 'fullstack'
-					: 'fullstack';
+export interface PlannerContractSeed {
+	/**
+	 * The scope the brief resolved. Authoritative — this function does not
+	 * re-derive it. The contract was the last place a scope could be
+	 * invented, and its final branch was `fullstack`.
+	 */
+	scope: PlannerContract['scope'];
+	/**
+	 * Framework the stack profile detected. `none` / `unknown` / empty means
+	 * the profile had no opinion, so the message is scanned instead.
+	 */
+	framework?: string;
+}
+
+export function buildPlannerContract(msg: string, seed: PlannerContractSeed): PlannerContract {
+	const scope: PlannerContract['scope'] = seed.scope;
 
 	// Architecture
 	let architecture: PlannerContract['architecture'] = 'unknown';
@@ -112,14 +135,20 @@ export function buildPlannerContract(msg: string, advisorIntent: string, userSco
 		if (/\bservice\b/i.test(msg) && /\bcontroller\b/i.test(msg)) architecture = 'repository';
 	}
 
-	// Framework
-	const framework =
+	// Framework — the detected stack wins; the message is the fallback.
+	// The old code scanned only the message, so `[StackProfile] framework=react`
+	// was followed by `[PlannerContract] fw=unknown` two lines later.
+	const fromMessage =
 		/\bnestjs\b/i.test(msg) ? 'nestjs'
 			: /\bexpress\b/i.test(msg) ? 'express'
 				: /\bnext\.?js\b/i.test(msg) ? 'nextjs'
 					: /\bvite\b/i.test(msg) ? 'vite'
 						: /\bfastify\b/i.test(msg) ? 'fastify'
 							: 'unknown';
+	const fromSeed = String(seed.framework ?? '').trim();
+	const framework = fromSeed && !['none', 'unknown'].includes(fromSeed.toLowerCase())
+		? fromSeed
+		: fromMessage;
 
 	// Language
 	const language: 'typescript' | 'javascript' =

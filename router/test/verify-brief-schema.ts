@@ -102,7 +102,6 @@ check('a built brief passes (build -> validate round trip)', () => {
 		scores: { fe: 8, be: 0 },
 		decode: { ms: 900, raw: '{"intent":"create_fe"}', ok: true },
 		stack: { framework: 'react', language: 'typescript', singleFile: false },
-		contractScope: 'frontend',
 		features: ['form_validation'],
 		now: '2026-10-24T00:00:00.000Z',
 	});
@@ -234,7 +233,6 @@ check('failed decode + contract fullstack records frontend, not fullstack', () =
 		scores: { fe: 8, be: 0 },
 		decode: { ms: 12, raw: '"unknown"', ok: false },
 		stack: { framework: 'react', language: 'typescript', singleFile: false },
-		contractScope: 'fullstack',
 		userScope: 'UNSPECIFIED',
 		now: '2026-10-24T00:00:00.000Z',
 	});
@@ -254,7 +252,6 @@ check('a valid decode is obeyed over the ensemble', () => {
 		scores: { fe: 0, be: 7 },
 		decode: { ms: 800, raw: '{"intent":"create_be"}', ok: true },
 		stack: { framework: 'none', language: 'typescript' },
-		contractScope: 'backend',
 		now: '2026-10-24T00:00:00.000Z',
 	});
 	return b.scope === 'backend' && b.route.specialist === 'be' && isValidBrief(b)
@@ -271,7 +268,6 @@ check('fullstack intent without backend evidence is downgraded', () => {
 		scores: { fe: 6, be: 0 },
 		decode: { ms: 700, raw: '{"intent":"fullstack"}', ok: true },
 		stack: { framework: 'react', language: 'typescript' },
-		contractScope: 'fullstack',
 		now: '2026-10-24T00:00:00.000Z',
 	});
 	return b.route.phases.length === 1 && b.route.specialist === 'fe' && isValidBrief(b)
@@ -288,7 +284,6 @@ check('fullstack intent WITH backend evidence keeps two phases', () => {
 		scores: { fe: 5, be: 5 },
 		decode: { ms: 700, raw: '{"intent":"fullstack"}', ok: true },
 		stack: { framework: 'react', language: 'typescript' },
-		contractScope: 'fullstack',
 		now: '2026-10-24T00:00:00.000Z',
 	});
 	const phases = JSON.stringify(b.route.phases);
@@ -320,7 +315,6 @@ check('the user scope mask beats a fullstack contract', () => {
 		scores: { fe: 5, be: 5 },
 		decode: { ms: 700, raw: '{}', ok: true },
 		stack: { framework: 'react', language: 'typescript' },
-		contractScope: 'fullstack',
 		userScope: 'FRONTEND_ONLY',
 		now: '2026-10-24T00:00:00.000Z',
 	});
@@ -338,7 +332,6 @@ check('the user scope mask beats the scores too', () => {
 		scores: { fe: 9, be: 0 },
 		decode: { ms: 700, raw: '{}', ok: true },
 		stack: { framework: 'react', language: 'typescript' },
-		contractScope: 'frontend',
 		userScope: 'BACKEND_ONLY',
 		now: '2026-10-24T00:00:00.000Z',
 	});

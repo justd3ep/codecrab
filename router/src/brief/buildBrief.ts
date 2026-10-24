@@ -39,7 +39,8 @@ import type {
 	StackFacts,
 	TurnBrief,
 } from './types.js';
-import { BRIEF_INTENTS, BRIEF_VERSION } from './types.js';
+import { BRIEF_VERSION } from './types.js';
+import { decodeAdvisorIntent } from './decode.js';
 import { hasBackendEvidence, routeFromBrief, winningSpecialist } from './routeFromBrief.js';
 
 export const ADVISOR_MODEL_ID = 'qwen-advisor-v1';
@@ -57,8 +58,6 @@ export interface BriefInput {
 	decode: { model?: string; ms: number; promptTokens?: number; raw: string; ok: boolean };
 	/** Detected stack profile (or null when there is no workspace). */
 	stack?: { framework?: string; language?: string; singleFile?: boolean } | null;
-	/** Scope the planner contract produced, if any. Advisory until Phase 3. */
-	contractScope?: string | null;
 	/** Constraint parser's scope mask. */
 	userScope?: string | null;
 	features?: string[];
@@ -75,11 +74,15 @@ export interface BriefInput {
 	now?: string;
 }
 
-/** Coerce raw advisor text into a schema intent. Anything else is unknown. */
+/**
+ * Coerce raw advisor text into a schema intent. Anything else is unknown.
+ *
+ * Delegates to the decode contract so there is exactly one mapping. This
+ * used to be membership-only, which scored a valid `create_fullstack`
+ * decode as a failure and sent the request to the ensemble fallback.
+ */
 export function normaliseIntent(raw: string | null | undefined): BriefIntent {
-	if (!raw) return 'unknown';
-	const v = String(raw).trim().toLowerCase().replace(/\s+/g, '_');
-	return (BRIEF_INTENTS as readonly string[]).includes(v) ? (v as BriefIntent) : 'unknown';
+	return decodeAdvisorIntent(raw).intent;
 }
 
 function normaliseScope(raw: string | null | undefined): BriefScope | null {
@@ -88,28 +91,55 @@ function normaliseScope(raw: string | null | undefined): BriefScope | null {
 	return v === 'frontend' || v === 'backend' || v === 'fullstack' ? (v as BriefScope) : null;
 }
 
-/**
- * Which scope the brief should record.
- *
- * Order of authority: explicit user constraint > valid decode's contract
- * scope > the ensemble's verdict. A failed decode skips the contract
- * entirely (R3) — that is the whole defect this pipeline exists to kill.
- */
-function resolveScope(input: BriefInput, decodedOk: boolean): BriefScope {
-	const userScope = (input.userScope || '').toUpperCase();
-	if (userScope === 'FRONTEND_ONLY') return 'frontend';
-	if (userScope === 'BACKEND_ONLY') return 'backend';
-
-	if (decodedOk) {
-		const fromContract = normaliseScope(input.contractScope);
-		if (fromContract) return fromContract;
+/** The scope a decoded intent names, or null when it names none. */
+export function scopeForIntent(intent: BriefIntent): BriefScope | null {
+	switch (intent) {
+		case 'create_fe':
+		case 'edit_fe':
+			return 'frontend';
+		case 'create_be':
+		case 'edit_be':
+			return 'backend';
+		case 'fullstack':
+			return 'fullstack';
+		default:
+			// `question` and `unknown` name no generation scope.
+			return null;
 	}
+}
+
+export interface ScopeSignals {
+	/** Explicit `undefined` is allowed: callers pass the parser result straight through. */
+	userScope?: string | null | undefined;
+	/** The decode's schema intent; `unknown` when the decode failed. */
+	intent: BriefIntent;
+	ensembleIntent: 'frontend' | 'backend' | 'general';
+	scores: { fe: number; be: number };
+}
+
+/**
+ * Which scope the brief records — and, in Phase 3, the only scope the
+ * planner contract is allowed to report.
+ *
+ * Order of authority: explicit user constraint > the decoded intent > the
+ * ensemble's verdict > the scores. The old chain went through the planner
+ * contract, whose scope was derived from the same advisor string and whose
+ * final branch was `fullstack` — so an undecodable request silently became
+ * the expensive two-model path. There is no fullstack fallthrough here.
+ */
+export function resolveBriefScope(input: ScopeSignals): { scope: BriefScope; pinned: boolean } {
+	const userScope = (input.userScope || '').toUpperCase();
+	if (userScope === 'FRONTEND_ONLY') return { scope: 'frontend', pinned: true };
+	if (userScope === 'BACKEND_ONLY') return { scope: 'backend', pinned: true };
+
+	const fromIntent = scopeForIntent(input.intent);
+	if (fromIntent) return { scope: fromIntent, pinned: false };
 
 	const fromEnsemble = normaliseScope(input.ensembleIntent);
-	if (fromEnsemble) return fromEnsemble;
+	if (fromEnsemble) return { scope: fromEnsemble, pinned: false };
 
 	// 'general' — no textual signal either way. Never default to fullstack.
-	return input.scores.be > input.scores.fe ? 'backend' : 'frontend';
+	return { scope: input.scores.be > input.scores.fe ? 'backend' : 'frontend', pinned: false };
 }
 
 function resolveStack(stack: BriefInput['stack']): StackFacts {
@@ -143,12 +173,16 @@ export function buildBrief(input: BriefInput): TurnBrief {
 		raw: String(input.decode.raw ?? ''),
 	};
 
-	let scope = resolveScope(input, decode.ok);
-
-	// A user mask is an instruction, not a vote. `resolveScope` already
-	// honoured it; this flag tells the router the scope is not negotiable.
-	const mask = (input.userScope || '').toUpperCase();
-	const scopePinned = mask === 'FRONTEND_ONLY' || mask === 'BACKEND_ONLY';
+	// The brief owns the routing decision. The planner contract is derived
+	// FROM this result (Phase 3) — it is never consulted while producing it.
+	const scopeInfo = resolveBriefScope({
+		userScope: input.userScope,
+		intent,
+		ensembleIntent: input.ensembleIntent,
+		scores: input.scores,
+	});
+	const scopePinned = scopeInfo.pinned;
+	let scope = scopeInfo.scope;
 
 	// R2 — fullstack is opt-in. Without backend evidence the brief records
 	// the single specialist the scores support.

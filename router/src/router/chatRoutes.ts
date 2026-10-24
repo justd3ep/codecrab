@@ -39,6 +39,8 @@ import {
 	buildPlannerContract,
 	plannerContractToValidationContract,
 } from '../parsing/plannerContract.js';
+import { decodeAdvisorIntent } from '../brief/decode.js';
+import { resolveBriefScope } from '../brief/buildBrief.js';
 import {
 	RepairMode,
 	classifyRepairMode,
@@ -423,10 +425,25 @@ export function makeChatRoutes(): Router {
 			// Preserve the raw advisor intent string (create_fullstack / edit_be / etc.)
 			// for cross-specialist skip decision. The ensembled intent collapses to 'general'
 			// for fullstack, losing the create vs edit distinction — store raw here.
-			const rawAdvisorIntent: string = advisorIntent ?? ensembledIntent;
+			// A failed decode does not survive: the ensemble's verdict replaces the
+			// literal "unknown" that used to reach the contract (R3, as in preparation.ts).
+			const decode = decodeAdvisorIntent(advisorIntent);
+			const rawAdvisorIntent: string = decode.ok ? String(advisorIntent) : ensembledIntent;
 
-			// --- PLANNER CONTRACT (deterministic, no model call) ---
-			const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent, userScope);
+			// --- PLANNER CONTRACT (projection of the routed decision) ---
+			// The scope comes from the same resolver the brief uses, so the two
+			// routes cannot disagree about it — and there is no fullstack fallthrough.
+			const routeScores = scoreKeywords(lastUserMsg);
+			const decidedScope = resolveBriefScope({
+				userScope,
+				intent: decode.intent,
+				ensembleIntent: ensembledIntent,
+				scores: { fe: routeScores.feScore, be: routeScores.beScore },
+			}).scope;
+			const plannerContract = buildPlannerContract(lastUserMsg, {
+				scope: decidedScope,
+				framework: stackProfile?.framework,
+			});
 			const validationContract = plannerContractToValidationContract(plannerContract, userScope, stackProfile);
 
 			// filesModified is shared between incremental engine and the monolithic fallback loop
