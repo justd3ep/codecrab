@@ -37,10 +37,15 @@ import { buildExecutionGraph } from '../planner.js';
 import type { AdvisorV2Result } from '../planner.js';
 import { buildCapabilitySystemPrompt } from '../capabilityResolver.js';
 import { determineMode } from '../routing/agentMode.js';
-import { classifyIntent, detectBackendIntent, detectFrontendIntent, runAdvisor } from '../routing/intentClassifier.js';
+import { classifyIntent, detectBackendIntent, detectFrontendIntent, runAdvisor, scoreKeywords } from '../routing/intentClassifier.js';
 import { extractBackendSummary, extractFallbackEdits, streamChunk, streamEvent } from '../generation/pipelineHelpers.js';
 import { MAX_AGENT_ITERATIONS, REPEAT_PENALTY, REPEAT_PENALTY_TOKENS } from '../generation/limits.js';
 import config from '@/config/index.js';
+import { randomUUID } from 'crypto';
+import { buildBrief } from '../brief/buildBrief.js';
+import { writeBrief } from '../brief/serialize.js';
+import { normaliseIntent } from '../brief/buildBrief.js';
+import type { TurnBrief } from '../brief/types.js';
 
 // ── Return type ──────────────────────────────────────────────────────
 
@@ -79,6 +84,12 @@ export interface PreparationResult {
 	inspection: any;
 	v2ForGraph: AdvisorV2Result;
 	advisorV2Result: AdvisorV2Result | null;
+	/**
+	 * The reconciled turn brief. Phase 2 records it; no consumer reads it
+	 * yet, so routing behaviour is unchanged. Serialized per request to
+	 * `<workspace>/.crabcode/briefs/<id>.json` for replay, diffing, and SFT.
+	 */
+	brief: TurnBrief | null;
 }
 
 // ── The preparation function ─────────────────────────────────────────
@@ -216,7 +227,9 @@ export async function prepareRequest(
 
 	// --- ADVISOR PASS + ENSEMBLE SCORING ---
 	console.log('[Router] Running Advisor V2 pass...');
+	const advisorStart = Date.now();
 	const advisorResult = await runAdvisor(lastUserMsg, true);
+	const advisorMs = Date.now() - advisorStart;
 	const advisorIntent: any = advisorResult.intent;
 	const advisorV2Result: AdvisorV2Result | null = advisorResult.v2Result;
 
@@ -255,6 +268,63 @@ export async function prepareRequest(
 	const plannerContract = buildPlannerContract(lastUserMsg, rawAdvisorIntent, userScope);
 	const validationContract = plannerContractToValidationContract(plannerContract, userScope, stackProfile);
 
+	// --- TURN BRIEF (Phase 2: recorded, not yet consumed) ---
+	// One object reconciles what five deciders just concluded: the advisor
+	// decode, the ensemble scores, the planner contract's scope, the user's
+	// scope mask, and the detected stack. Nothing reads it yet — it is
+	// built and written so the decision can be replayed and diffed against
+	// what the pipeline actually does, BEFORE any consumer depends on it.
+	//
+	// The decode is "ok" only when the advisor returned a real intent.
+	// Today it usually does not: the failed advisor returns the literal
+	// string "unknown", which survives the `??` null-check above and
+	// reaches the contract. Recording that as `decode.failed` is what makes
+	// the scope drift visible instead of silent.
+	const briefScores = scoreKeywords(lastUserMsg);
+	const briefNow = new Date().toISOString();
+	const brief = buildBrief({
+		requestId: randomUUID(),
+		lastUserMsg,
+		// 'unknown' already returned above, so this is narrowed to the three
+		// routable verdicts.
+		ensembleIntent: ensembledIntent as 'frontend' | 'backend' | 'general',
+		rawAdvisorIntent: advisorIntent,
+		scores: { fe: Number(briefScores.feScore) || 0, be: Number(briefScores.beScore) || 0 },
+		decode: {
+			ms: advisorMs,
+			// The advisor does not report token usage; 0 is honest here.
+			promptTokens: 0,
+			raw: JSON.stringify(advisorV2Result ?? advisorIntent ?? null),
+			ok: normaliseIntent(advisorIntent) !== 'unknown',
+		},
+		stack: {
+			framework: stackProfile?.framework,
+			language: stackProfile?.language,
+			singleFile: stackProfile?.singleFile,
+		},
+		contractScope: plannerContract?.scope,
+		userScope,
+		features: Array.isArray(plannerContract?.requiredFeatures) ? plannerContract.requiredFeatures : [],
+		modules: Array.isArray(advisorV2Result?.modules) ? advisorV2Result!.modules! : [],
+		// Phase 4 fills the index; zeros until then, never invented values.
+		fileKnowledge: {
+			indexedAt: briefNow,
+			fileCount: backendFileCount + frontendFileCount,
+			edges: 0,
+			files: [],
+			retrieved: [],
+		},
+		targets: [],
+		now: briefNow,
+	});
+	console.log(
+		`[Brief] intent=${brief.intent} scope=${brief.scope} specialist=${brief.route.specialist} decode=${brief.decode.ok ? 'ok' : 'FAILED'} scores=fe${brief.route.scores.fe}/be${brief.route.scores.be} reason=${brief.route.reason}`,
+	);
+	if (hasWorkspace) {
+		const briefFile = writeBrief(brief, workspaceRoot);
+		if (briefFile) console.log(`[Brief] written: ${briefFile}`);
+	}
+
 	// --- V2 GRAPH CONSTRUCTION (deferred to index.ts for VNext path)
 	// The VNext block will construct v2ForGraph, inspection, plannedModules
 	// from advisorV2Result and plannerContract.
@@ -279,5 +349,6 @@ export async function prepareRequest(
 		enrichedLastMessage, features: null, architecture: null,
 		plannedModules: [], inspection: { analyzed: [], missing: [], existing: [] },
 		v2ForGraph: {} as AdvisorV2Result, advisorV2Result,
+		brief,
 	};
 }
