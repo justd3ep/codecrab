@@ -145,26 +145,22 @@ if (m4 === helpersOriginal) {
 		r.status !== 0 ? true : 'the test stayed green');
 }
 
-console.log('\n=== 5. re-introducing a local copy in index.ts must FAIL the test ===');
+console.log('\n=== 5. re-introducing a local copy must FAIL the test ===');
 
-// The import may be on its own line or merged into a multi-name
-// import, so the anchor is the NAMES, not the whole line.
+// The caller moved out of index.ts (chat/phaseRunner.ts runs the loop,
+// router/chatRoutes.ts is the shadow route), so the old mutation — pull
+// the import out of index.ts — no longer applies: there is no such
+// import left to remove.
 //
-// The replace must be GLOBAL: there are three pipelineHelpers
-// imports, and only the third carries validateJsxSymbols. A
-// non-global replace stops at the first one and never reaches it.
-const m5 = indexOriginal.replace(
-	/import \{([^}]*)\} from '\.\/generation\/pipelineHelpers\.js';/g,
-	(full: string, names: string) => {
-		if (!names.includes('validateJsxSymbols')) return full;
-		return full.replace(
-			'import {',
-			'function validateJsxSymbols(a: any, b: any): any { return []; }\nimport {',
-		);
-	},
-);
+// The anchor is now ANY file: a second definition anywhere in src/ is
+// exactly the drift this test exists to catch. So the mutation appends a
+// local copy to index.ts. Where it lives does not matter; that a second
+// copy exists does.
+const m5 = indexOriginal + `
+function validateJsxSymbols(a: any, b: any): any { return []; }
+`;
 if (m5 === indexOriginal) {
-	check('the mutation applies', () => 'the import line was not found');
+	check('the mutation applies', () => 'the append did nothing');
 } else {
 	fs.writeFileSync(INDEX, m5, 'utf8');
 	const r = runParity();

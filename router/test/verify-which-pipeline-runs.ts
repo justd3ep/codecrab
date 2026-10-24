@@ -103,17 +103,29 @@ check('the function is the one index.ts imports', () =>
 		? true
 		: 'index.ts imports something else');
 
-console.log('\n=== so the monolithic loop is the live path ===');
+console.log('\n=== so the unified phase loop is the live path ===');
 
-check('the monolithic BE loop exists', () =>
-	/for\s*\(let\s+iteration\s*=/.test(indexSrc)
-		? true
-		: 'it does not');
+// POST-REFACTOR: the two monolithic loops (BE `iteration`, FE `feIter`)
+// are gone from index.ts — both phases now run through ONE loop in
+// chat/phaseRunner.ts. The question this test answers ("which pipeline
+// actually runs?") is unchanged, so the anchors follow the loop instead
+// of the file that used to hold it.
+const phaseSrc = read('chat/phaseRunner.ts');
 
-check('the monolithic FE loop exists', () =>
-	/for\s*\(let\s+feIter\s*=/.test(indexSrc)
+check('index.ts imports the unified phase runner', () =>
+	/from '\.\/chat\/phaseRunner\.js'/.test(indexSrc) && indexSrc.includes('runSpecialistPhase')
 		? true
-		: 'it does not');
+		: 'index.ts does not import runSpecialistPhase');
+
+check('the unified loop lives in chat/phaseRunner.ts', () =>
+	/for\s*\(let\s+iteration\s*=/.test(phaseSrc)
+		? true
+		: 'chat/phaseRunner.ts has no iteration loop');
+
+check('index.ts runs a BE and an FE phase through it', () =>
+	(indexSrc.match(/runSpecialistPhase\(/g) ?? []).length >= 2
+		? true
+		: 'only one phase is wired');
 
 check('the incremental path returns early — it does not fall through', () => {
 	// The incremental branch must end the request, or the

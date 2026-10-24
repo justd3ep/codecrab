@@ -89,30 +89,25 @@ for (const name of ['buildSystemPrompt', 'buildFESystemPrompt']) {
 			? 'it still defines its own copy' : true);
 }
 
-check('index.ts imports them from prompts/promptBuilder', () => {
-	// The names may be in any order.
-	const m = /import\s*\{([^}]*)\}\s*from\s*'\.\/prompts\/promptBuilder\.js'/.exec(indexSrc);
-	if (!m) return 'the import is missing';
-	const names = m[1]!.split(',').map(s => s.trim());
-	// buildSystemPrompt is the GENERAL prompt builder — it takes the
-	// specialist and dispatches to buildFESystemPrompt or
-	// buildBESystemPrompt internally. So index.ts imports
-	// buildSystemPrompt and buildBESystemPrompt (which it calls
-	// directly for the backend create prompt), and NOT
-	// buildFESystemPrompt.
-	//
-	// The check used to require buildFESystemPrompt in the import,
-	// which asserted a STALE FACT: the function is not called from
-	// index.ts, so the import was removed as dead — correctly.
-	const hasGeneral = names.includes('buildSystemPrompt');
-	const hasBackend = names.includes('buildBESystemPrompt');
-	if (hasGeneral && hasBackend) return true;
-	const missing = [
-		...(!hasGeneral ? ['buildSystemPrompt'] : []),
-		...(!hasBackend ? ['buildBESystemPrompt'] : []),
-	];
-	return `the import is missing them: ${missing.join(', ')}`;
-});
+// LOCATION-INDEPENDENT SINCE THE PHASE REFACTOR.
+//
+// These used to assert "index.ts imports them". The callers moved to
+// chat/phaseRunner.ts, chat/preparation.ts and router/chatRoutes.ts, so
+// pinning index.ts tested the refactor rather than the property. What
+// must hold: ONE definition in promptBuilder.ts, imported by every user,
+// and no second copy anywhere (which is what drifted before).
+const anchor = await import(
+	pathToFileURL(path.join(ROUTER, 'test', 'srcAnchor.ts')).href
+) as {
+	singleSourceViolations: (root: string, name: string, moduleRel: string) => string[];
+};
+
+for (const name of ['buildSystemPrompt', 'buildBESystemPrompt', 'buildFESystemPrompt']) {
+	check(`only promptBuilder.ts defines ${name}, and every user imports it`, () => {
+		const v = anchor.singleSourceViolations(ROUTER, name, 'prompts/promptBuilder.ts');
+		return v.length === 0 ? true : v.join('; ');
+	});
+}
 
 check('index.ts does NOT import buildFESystemPrompt — it is called by buildSystemPrompt', () => {
 	// It is reached through buildSystemPrompt, so importing it here
@@ -132,10 +127,10 @@ check('index.ts does NOT define ensembleRoute', () =>
 	/^function ensembleRoute\(/m.test(indexSrc)
 		? 'it still defines its own copy' : true);
 
-check('index.ts imports ensembleRoute', () =>
-	/import\s*\{[^}]*ensembleRoute[^}]*\}\s*from\s*'\.\/routing\/ensembleRouter\.js'/.test(indexSrc)
-		? true : 'the import is missing');
-
+check('only ensembleRouter.ts defines ensembleRoute, and every user imports it', () => {
+	const v = anchor.singleSourceViolations(ROUTER, 'ensembleRoute', 'routing/ensembleRouter.ts');
+	return v.length === 0 ? true : v.join('; ');
+});
 console.log('\n=== 2. the live FE prompt rules are present ===');
 
 const LIVE_RULES = [

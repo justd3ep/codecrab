@@ -88,9 +88,27 @@ check('the module exports buildJsxRepairPrompt', () =>
 check('the module exports the JsxSymbolIssue interface', () =>
 	/export interface JsxSymbolIssue/.test(helpersSrc) || 'not exported');
 
-check('index.ts imports the pair from the module', () =>
-	/import \{[^}]*validateJsxSymbols[^}]*\} from '\.\/generation\/pipelineHelpers\.js'/.test(indexSrc)
-		? true : 'the import is missing');
+// LOCATION-INDEPENDENT SINCE THE PHASE REFACTOR.
+//
+// This used to assert "index.ts imports the pair". The caller moved —
+// the generation loop now lives in chat/phaseRunner.ts and the shadow
+// route in router/chatRoutes.ts — so pinning index.ts failed on correct
+// code. What actually matters is unchanged: ONE definition, and every
+// file that uses it imports it from there. A re-introduced local copy
+// (the original drift: 10,465 chars in index.ts vs a stale 3,301 in the
+// module) still fails.
+const anchor = await import(
+	pathToFileURL(path.join(ROUTER, 'test', 'srcAnchor.ts')).href
+) as {
+	singleSourceViolations: (root: string, name: string, moduleRel: string) => string[];
+};
+
+for (const name of ['validateJsxSymbols', 'buildJsxRepairPrompt', 'JsxSymbolIssue']) {
+	check(`only pipelineHelpers.ts defines ${name}, and every user imports it`, () => {
+		const v = anchor.singleSourceViolations(ROUTER, name, 'generation/pipelineHelpers.ts');
+		return v.length === 0 ? true : v.join('; ');
+	});
+}
 
 console.log('\n=== 2. the module has the LIVE capabilities ===');
 

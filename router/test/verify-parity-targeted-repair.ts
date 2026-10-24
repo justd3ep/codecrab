@@ -69,9 +69,18 @@ check('index.ts does NOT define it', () =>
 	/^function buildTargetedRepairPrompt\(/m.test(indexSrc)
 		? 'it still defines its own copy' : true);
 
-check('index.ts imports it from repairEngine', () =>
-	/import\s*\{[^}]*buildTargetedRepairPrompt[^}]*\}\s*from\s*'\.\/repairEngine\.js'/.test(indexSrc)
-		? true : 'the import is missing');
+// LOCATION-INDEPENDENT SINCE THE PHASE REFACTOR: the caller moved, so
+// pinning index.ts tested the refactor. ONE definition, imported by
+// every user, is the property.
+{
+	const anchor = await import(
+		pathToFileURL(path.join(ROUTER, 'test', 'srcAnchor.ts')).href
+	) as { singleSourceViolations: (root: string, name: string, moduleRel: string) => string[] };
+	check('only repairEngine.ts defines buildTargetedRepairPrompt, and every user imports it', () => {
+		const v = anchor.singleSourceViolations(ROUTER, 'buildTargetedRepairPrompt', 'repairEngine.ts');
+		return v.length === 0 ? true : v.join('; ');
+	});
+}
 
 check('the live wording is in the module', () =>
 	modSrc.includes('### COMPILE ERRORS (fix type errors — do not restructure)')

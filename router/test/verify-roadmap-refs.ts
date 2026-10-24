@@ -80,6 +80,14 @@ function at(file: string, lineNo: number, needle: string): true | string {
 		: `${path.basename(file)}:${lineNo} does not contain ${JSON.stringify(needle)}; got ${JSON.stringify(actual.trim().slice(0, 90))}`;
 }
 
+// plans/ is GITIGNORED by project convention, so a fresh clone and any CI
+// run have no roadmap to check. Skipping is honest; failing would report a
+// missing local scratch document as a broken codebase.
+if (!fs.existsSync(DOC)) {
+	console.log('SKIP: plans/CODE_CRAB_ROADMAP.md is not present (plans/ is gitignored).');
+	process.exit(0);
+}
+
 console.log('\n=== 1. the roadmap doc exists and is non-trivial ===');
 
 check('plans/CODE_CRAB_ROADMAP.md exists', () =>
@@ -130,8 +138,8 @@ check('Pattern 4 exists and is no longer gated on create mode', () => {
 	return !live.includes("mode !== 'create'") ? true : 'the P4 create-mode guard is BACK';
 });
 
-check('index.ts:4168 — responseTokenCount is computed', () =>
-	find(indexTs, 'responseTokenCount'));
+check('chatRoutes.ts — responseTokenCount is computed', () =>
+	find(chatRoutes, 'responseTokenCount'));
 
 // The token cap is COMPUTED, not a constant. The dead MAX_TOKENS
 // constant (4096) was declared in index.ts and chatRoutes.ts and
@@ -165,17 +173,17 @@ check('index.ts:3485 — filesModified is declared', () =>
 check('index.ts:3739 — scaffold push (beBootstrapped)', () =>
 	find(indexTs, 'beBootstrapped'));
 
-check('index.ts:3745 — scaffold push (feBootstrapped)', () =>
-	find(indexTs, 'feBootstrapped'));
+check('chatRoutes.ts — scaffold push (feBootstrapped)', () =>
+	find(chatRoutes, 'feBootstrapped'));
 
-check('index.ts:4365 — extractedForValidation', () =>
-	find(indexTs, 'extractedForValidation'));
+check('chatRoutes.ts — extractedForValidation', () =>
+	find(chatRoutes, 'extractedForValidation'));
 
-check('index.ts:4366 — validateJsxSymbols(extractedForValidation)', () =>
-	find(indexTs, 'validateJsxSymbols'));
+check('chatRoutes.ts — validateJsxSymbols(extractedForValidation)', () =>
+	find(chatRoutes, 'validateJsxSymbols'));
 
-check('index.ts:4938 — validateJsxSymbols(feExtracted)', () =>
-	find(indexTs, 'validateJsxSymbols'));
+check('chatRoutes.ts — validateJsxSymbols(feExtracted)', () =>
+	find(chatRoutes, 'validateJsxSymbols'));
 
 check('validator.ts:1365 — the callRe regex', () =>
 	find(validatorTs, 'const callRe'));

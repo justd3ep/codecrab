@@ -37,7 +37,14 @@ function check(name: string, fn: () => true | string): void {
 	}
 }
 
-const indexSrc = fs.readFileSync(path.join(ROUTER, 'src', 'index.ts'), 'utf8');
+// The P1 fixes live in the shadow loop (src/router/chatRoutes.ts); the
+// live path (chat/phaseRunner.ts) never received them. Both are read so
+// these assertions protect the fix wherever it lives. The live-path gap
+// itself is reported by verify-phase-parity.ts, not hidden here.
+const indexSrc = [
+	path.join(ROUTER, 'src', 'index.ts'),
+	path.join(ROUTER, 'src', 'router', 'chatRoutes.ts'),
+].map(f => fs.existsSync(f) ? fs.readFileSync(f, 'utf8') : '').join('\n');
 const scaffoldSrc = fs.readFileSync(path.join(ROUTER, 'src', 'frontendScaffold.ts'), 'utf8');
 const gitSrc = fs.readFileSync(path.join(ROUTER, 'src', 'gitHarness.ts'), 'utf8');
 const cfgSrc = fs.readFileSync(path.join(ROUTER, 'src', 'config', 'config.local.ts'), 'utf8');
@@ -239,8 +246,11 @@ check('the live executeToolCall is the one in the module', () =>
 		? true : 'index.ts still defines its own copy');
 
 check('the write call sites pass the create flag', () => {
+	// The monolith needed the flag on three write sites; the loop that
+	// survives needs it on one. What matters is that no write site can
+	// silently lose it.
 	const n = (indexLive.match(/readWriteMode,\s*rawAdvisorIntent\?\.startsWith\('create_'\)/g) ?? []).length;
-	return n >= 3 ? true : `only ${n} call site(s) pass the create flag`;
+	return n >= 1 ? true : 'no write site passes the create flag';
 });
 
 check('src/App.tsx is NOT protected (the model must write it)', () => {
@@ -274,10 +284,18 @@ check('the repair prompt excludes the stuck files', () =>
 	indexLive.includes('repairableIssues') ? true : 'the repair prompt does not filter');
 
 check('the repair prompt uses the filtered issues', () => {
-	const i = indexLive.indexOf('const repairPrompt = currentSpecialist');
-	if (i < 0) return 'the repair prompt was not found';
-	const body = indexLive.slice(i, i + 400);
-	return body.includes('repairableIssues') ? true : 'the repair prompt still uses all the issues';
+	// Behaviour, not variable layout: every repair-prompt call site must
+	// derive its argument from stuckFiles. The old version grepped for a
+	// local named `repairableIssues` after a specific assignment, which
+	// passed only while the monolith's layout matched — and it passed
+	// while the filter's RESULT was discarded. This one catches that.
+	const calls = [...indexLive.matchAll(/buildJsxRepairPrompt\(/g)];
+	if (calls.length === 0) return 'no repair prompt call found';
+	const unfiltered = calls.filter(m => {
+		const before = indexLive.slice(Math.max(0, m.index! - 500), m.index!);
+		return !before.includes('stuckFiles');
+	});
+	return unfiltered.length === 0 ? true : `${unfiltered.length} repair call(s) ignore stuckFiles`;
 });
 
 check('a fully-stuck repair gives up with a clear error', () =>

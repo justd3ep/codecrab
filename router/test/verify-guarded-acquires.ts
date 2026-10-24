@@ -119,15 +119,20 @@ check('the try comes before the catch', () => {
 
 console.log('\n=== the live route guards its advisor acquires too ===');
 
-const live = fs.readFileSync(path.join(SRC, 'index.ts'), 'utf-8').replace(/\r\n/g, '\n');
+// POST-REFACTOR: the live route no longer acquires the advisor model
+// itself — preparation moved to chat/preparation.ts and the advisor call
+// to routing/intentClassifier.ts. Anchor on the module that actually
+// acquires it; requiring the acquire to sit in index.ts would re-test the
+// refactor instead of the guard.
+const live = fs.readFileSync(path.join(SRC, 'routing', 'intentClassifier.ts'), 'utf-8').replace(/\r\n/g, '\n');
 const liveLines = live.split('\n');
 const advisorAcquires: number[] = [];
 liveLines.forEach((l, i) => {
 	if (l.includes("mm.acquire('advisor')")) advisorAcquires.push(i);
 });
 
-check(`the live route has ${advisorAcquires.length} advisor acquire(s)`, () =>
-	advisorAcquires.length >= 4 ? true : `only ${advisorAcquires.length}`);
+check(`the live advisor path has ${advisorAcquires.length} advisor acquire(s)`, () =>
+	advisorAcquires.length >= 1 ? true : `only ${advisorAcquires.length}`);
 
 for (const i of advisorAcquires) {
 	check(`the live route's advisor acquire at line ${i + 1} is guarded`, () => {
