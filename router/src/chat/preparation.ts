@@ -45,6 +45,7 @@ import { randomUUID } from 'crypto';
 import { buildBrief } from '../brief/buildBrief.js';
 import { writeBrief } from '../brief/serialize.js';
 import { decodeAdvisorIntent } from '../brief/decode.js';
+import { buildFileKnowledge } from '../rag/fileKnowledge.js';
 import type { TurnBrief } from '../brief/types.js';
 
 // ── Return type ──────────────────────────────────────────────────────
@@ -271,6 +272,17 @@ export async function prepareRequest(
 	const decode = decodeAdvisorIntent(advisorIntent);
 	const rawAdvisorIntent: string = decode.ok ? String(advisorIntent) : ensembledIntent;
 
+	// --- FILE KNOWLEDGE (Phase 4) ---
+	// Built before the route so the brief carries facts, not zeros. The index
+	// is keyed by (path, contentHash): a repeat request re-parses only what
+	// actually changed, and an unchanged file is not even read.
+	const fileKnowledge = buildFileKnowledge(hasWorkspace ? workspaceRoot : '', lastUserMsg);
+	if (hasWorkspace) {
+		console.log(
+			`[INDEX] ${fileKnowledge.knowledge.fileCount} files (${fileKnowledge.reindexed.length} re-indexed, ${fileKnowledge.reused} cached) edges=${fileKnowledge.knowledge.edges} retrieved=${fileKnowledge.knowledge.retrieved.length}`,
+		);
+	}
+
 	const briefScores = scoreKeywords(lastUserMsg);
 	const briefNow = new Date().toISOString();
 	const briefBase = {
@@ -295,14 +307,7 @@ export async function prepareRequest(
 		},
 		userScope,
 		modules: Array.isArray(advisorV2Result?.modules) ? advisorV2Result!.modules! : [],
-		// Phase 4 fills the index; zeros until then, never invented values.
-		fileKnowledge: {
-			indexedAt: briefNow,
-			fileCount: backendFileCount + frontendFileCount,
-			edges: 0,
-			files: [],
-			retrieved: [],
-		},
+		fileKnowledge: fileKnowledge.knowledge,
 		targets: [],
 		now: briefNow,
 	};

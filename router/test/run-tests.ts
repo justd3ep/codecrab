@@ -36,6 +36,7 @@ const SUITE: Array<{ file: string; what: string }> = [
 	{ file: 'verify-phase1.ts',       what: 'Phase 1 — the router is safe to run' },
 	{ file: 'verify-brief-schema.ts',  what: 'Phase 2 — the turn brief is a contract, not a suggestion' },
 	{ file: 'verify-decode-contract.ts', what: 'Phase 3 — one decode vocabulary, one scope owner' },
+	{ file: 'verify-file-knowledge.ts', what: 'Phase 4 — the router knows the workspace before it routes' },
 	{ file: 'verify-p0-rescue.ts',    what: 'P0.1 — the create-mode rescue path' },
 	{ file: 'verify-p0-validator.ts', what: 'P0.6 — the undefined_symbol false positives' },
 	{ file: 'verify-p1-advisor.ts',   what: 'P1.4 — the Advisor survives truncated JSON' },
