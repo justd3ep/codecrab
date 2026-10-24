@@ -1289,10 +1289,17 @@ export function makeChatRoutes(): Router {
 							}
 							throw new Error('The model produced no file blocks at all, and could not be recovered within the iteration limit.');
 						}
+						// P1.8 — never re-ask the model to fix a file it has already
+						// failed to change on repeated attempts. The filter used to be
+						// computed and thrown away, so a stuck file was re-sent every
+						// iteration despite the log claiming it was excluded.
+						const repairableMain = stuckFiles.size > 0
+							? jsxIssues.filter(i => !i.file || !stuckFiles.has(i.file))
+							: jsxIssues;
 						if (jsxIssues.length > 0 && iteration < MAX_AGENT_ITERATIONS - 1 && !controller.signal.aborted) {
 							jsxRepairDoneMain = true;
-							console.log(`[Validator] repairing ${jsxIssues.length} JSX issue(s) in main loop`);
-							currentPrompt = buildJsxRepairPrompt(jsxIssues);
+							console.log(`[Validator] repairing ${repairableMain.length} of ${jsxIssues.length} JSX issue(s) in main loop`);
+							currentPrompt = buildJsxRepairPrompt(repairableMain.length > 0 ? repairableMain : jsxIssues);
 							continue;
 						}
 					}
@@ -1791,10 +1798,14 @@ Continue with your task. If you need another tool, use it. Otherwise provide you
 						if (workspaceRoot && !feJsxRepairDone && readWriteMode !== 'read' && filesModified.length > feInitialFilesCount) {
 							const feExtracted = extractFallbackEdits(feResponse, openFiles, workspaceRoot, lastUserMsg, mode);
 							const jsxIssues = validateJsxSymbols(feExtracted, workspaceRoot);
+							// P1.8 — same stuck-file filter as the main loop.
+							const repairableFe = stuckFiles.size > 0
+								? jsxIssues.filter(i => !i.file || !stuckFiles.has(i.file))
+								: jsxIssues;
 							if (jsxIssues.length > 0 && feIter < MAX_AGENT_ITERATIONS - 1) {
 								feJsxRepairDone = true;
-								console.log(`[Validator] repairing ${jsxIssues.length} JSX issue(s) in FE loop`);
-								fePrompt = buildJsxRepairPrompt(jsxIssues);
+								console.log(`[Validator] repairing ${repairableFe.length} of ${jsxIssues.length} JSX issue(s) in FE loop`);
+								fePrompt = buildJsxRepairPrompt(repairableFe.length > 0 ? repairableFe : jsxIssues);
 								continue;
 							}
 						}
