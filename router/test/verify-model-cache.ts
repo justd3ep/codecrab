@@ -136,7 +136,10 @@ check('the cache is checked BEFORE the load', () => {
 	const i = mmSrc.indexOf('async acquire(');
 	if (i < 0) return 'acquire was not found';
 	const body = mmSrc.slice(i, i + 2500);
-	const cachedAt = body.indexOf('this.resident.get(key)');
+	// The hit path may be inline (`this.resident.get(key)`) or a helper
+	// (`takeResident`, which is the same check). What matters is that a
+	// resident model is found BEFORE any load is attempted.
+	const cachedAt = body.search(/takeResident\(|this\.resident\.get\(key\)/);
 	const loadAt = body.indexOf('loadModel(');
 	return cachedAt > 0 && loadAt > 0 && cachedAt < loadAt
 		? true

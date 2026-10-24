@@ -47,6 +47,10 @@ const SUITE: Array<{ file: string; what: string }> = [
 		what: 'the parity of the buildNoOutputPrompt extraction',
 	},
 	{
+		file: 'verify-engine-readiness.ts',
+		what: 'the engine race — acquire waits for startup',
+	},
+	{
 		file: 'verify-parity-jsx-pair.ts',
 		what: 'the parity of the JSX pair extraction',
 	},

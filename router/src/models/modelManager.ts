@@ -50,15 +50,42 @@ export class ModelManager {
 	private llama: Llama | null = null;
 	private readonly resident = new Map<string, Resident>();
 	private maxResident: number = 1;
+	/** Resolves when init() has finished; acquire() awaits it. */
+	private ready: Promise<void> | null = null;
+	/** True while a model file is being loaded. */
 	private loading = false;
+	/** Serialises loads so a concurrent acquire queues instead of throwing. */
+	private loadLock: Promise<unknown> = Promise.resolve();
 	private useCounter = 0;
 
 	constructor(private readonly bus: EventBus) {}
 
 	async init(): Promise<void> {
-		this.llama = await getLlama();
-		this.maxResident = await this.detectBudget();
-		console.log(`[ModelManager] Engine ready. VRAM budget: ${this.maxResident} model(s) resident.`);
+		// Idempotent: init() runs at startup AND is awaited by requests
+		// that arrive while the engine is still coming up.
+		if (this.ready) return this.ready;
+		this.ready = (async () => {
+			this.llama = await getLlama();
+			this.maxResident = await this.detectBudget();
+			console.log(`[ModelManager] Engine ready. VRAM budget: ${this.maxResident} model(s) resident.`);
+		})();
+		return this.ready;
+	}
+
+	/** Wait for init(). Only a never-initialised manager throws. */
+	private async ensureReady(): Promise<void> {
+		if (this.ready) return this.ready;
+		throw new ModelLoadError('engine', 'Engine not initialized — init() was never called');
+	}
+
+	/**
+	 * Run a load while holding the load lock. A rejected load does not
+	 * poison the queue; the next waiter still runs.
+	 */
+	private async withLoadLock<T>(fn: () => Promise<T>): Promise<T> {
+		const run = this.loadLock.then(fn, fn);
+		this.loadLock = run.then(() => undefined, () => undefined);
+		return run;
 	}
 
 	private async detectBudget(): Promise<number> {
@@ -125,7 +152,9 @@ export class ModelManager {
 	}
 
 	async acquire(intent: ModelIntent): Promise<ModelLease> {
-		if (!this.llama) throw new ModelLoadError('engine', 'Engine not initialized');
+		// A request can arrive before init() finishes. Wait for the engine
+		// instead of throwing 'Engine not initialized' at a live request.
+		await this.ensureReady();
 
 		const key = intent === 'advisor' ? 'advisor' : (intent === 'frontend' ? 'fe' : 'be');
 
@@ -137,25 +166,29 @@ export class ModelManager {
 			return new ModelLease(cached.model, 'resident', key, () => {});
 		}
 
-		if (this.loading) throw new ModelLoadError(key, 'Model load already in progress');
-		this.loading = true;
+		// Loads are serialised. A second caller used to throw 'Model load
+		// already in progress' — a retry nobody performs — and fail.
+		await this.withLoadLock(async () => {
+			if (this.resident.has(key)) return; // the waiter ahead of us loaded it
+			this.loading = true;
+			try {
+				await this.evictIfNeeded();
 
-		try {
-			await this.evictIfNeeded();
+				const modelPath = this.findModelFile(key);
+				if (!modelPath) throw new ModelLoadError(key, `Model resolution failed for "${key}"`);
 
-			const modelPath = this.findModelFile(key);
-			if (!modelPath) throw new ModelLoadError(key, `Model resolution failed for "${key}"`);
+				const gpuLayers = 'auto';
+				const start = Date.now();
+				console.log(`[ModelManager] Loading "${key}" (gpuLayers=${gpuLayers}): ${modelPath}`);
+				const model = await this.llama!.loadModel({ modelPath, gpuLayers });
+				this.resident.set(key, { model, key, lastUsed: ++this.useCounter });
+				this.bus.emit('model:loaded', { key, durationMs: Date.now() - start });
+				console.log(`[ModelManager] Model "${key}" loaded. ${this.resident.size} model(s) resident.`);
+			} finally {
+				this.loading = false;
+			}
+		});
 
-			const gpuLayers = 'auto';
-			const start = Date.now();
-			console.log(`[ModelManager] Loading "${key}" (gpuLayers=${gpuLayers}): ${modelPath}`);
-			const model = await this.llama!.loadModel({ modelPath, gpuLayers });
-			this.resident.set(key, { model, key, lastUsed: ++this.useCounter });
-			this.bus.emit('model:loaded', { key, durationMs: Date.now() - start });
-			console.log(`[ModelManager] Model "${key}" loaded. ${this.resident.size} model(s) resident.`);
-		} finally {
-			this.loading = false;
-		}
 
 		const leaseId = crypto.randomUUID();
 		const entry = this.resident.get(key)!;
@@ -173,6 +206,10 @@ export class ModelManager {
 		return {
 			loaded: this.resident.size > 0,
 			loading: this.loading,
+			/** Whether init() has finished — the chat path waits on this. */
+			engineReady: this.ready !== null && this.llama !== null,
+			/** Listening but not yet able to generate. */
+			initializing: this.ready !== null && this.llama === null,
 			resident: [...this.resident.keys()],
 		};
 	}
